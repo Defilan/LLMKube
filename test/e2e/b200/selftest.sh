@@ -333,6 +333,39 @@ assert_contains "$(cat "$stub/kubectl.args" 2>/dev/null)" "-n serving" "the live
 assert_eq "$(cat "$stub/llmkube.args" 2>/dev/null)" "benchmark b200-row-01 -n serving -o json --port-forward --iterations 3" "the benchmark gets the run namespace and B200_BENCHMARK_ARGS"
 assert_eq "$(jq -r '.status' "$tmp/live/1.json" 2>/dev/null)" "pass" "the stubbed live row records a pass"
 
+# Live row path: a row that never becomes Ready (a download still running, no
+# free GPU) is an infrastructure outcome, not a measurement. It returns
+# failure and publishes nothing, so the matrix row keeps its status. The row
+# runs inside "if !", where set -e is off, exactly as run-matrix.sh calls it.
+stub2="$tmp/stub-notready"
+mkdir -p "$stub2/bin" "$tmp/live2"
+cat > "$stub2/bin/kubectl" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "wait" ]; then echo "error: timed out waiting for the condition" >&2; exit 1; fi
+cat > /dev/null
+EOF
+cat > "$stub2/bin/llmkube" <<'EOF'
+#!/usr/bin/env bash
+echo "Error: InferenceService 'b200-row-01' is not ready (phase: Pending)" >&2
+exit 1
+EOF
+chmod +x "$stub2/bin/kubectl" "$stub2/bin/llmkube"
+cp "$B200_DOC" "$tmp/live2/matrix.md"
+row1_before="$(grep -F '| 1 | ' "$tmp/live2/matrix.md" | head -n1)"
+notready() {
+  PATH="$stub2/bin:$PATH" B200_DRY_RUN=0 B200_OUT="$tmp/live2" B200_DOC="$tmp/live2/matrix.md" B200_NS=default \
+    b200_standard_row 1 b200-row-01 "$m1" 5
+}
+if notready >"$tmp/live2/out.log" 2>&1; then rc=0; else rc=1; fi
+assert_eq "$rc" "1" "a row that never becomes Ready returns failure"
+assert_eq "$(grep -F '| 1 | ' "$tmp/live2/matrix.md" | head -n1)" "$row1_before" "a row that never becomes Ready publishes nothing"
+assert_contains "$(cat "$tmp/live2/out.log")" "not Ready" "a row that never becomes Ready says so"
+if [ -e "$tmp/live2/1.json" ]; then
+  bad "a row that never becomes Ready records no result, so a re-run retries it"
+else
+  ok "a row that never becomes Ready records no result, so a re-run retries it"
+fi
+
 # Publish with overrides: the matrix row carries the substitution once, even
 # after a re-run, so a substituted pass is never read as the stock row.
 cp "$B200_DOC" "$tmp/matrix-ov.md"

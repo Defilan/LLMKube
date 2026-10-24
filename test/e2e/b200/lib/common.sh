@@ -243,14 +243,28 @@ b200_standard_row() {
   fi
 
   b200_require_cmd kubectl llmkube jq
-  printf '%s\n' "$rendered" | kubectl apply -f -
-  kubectl wait --for=jsonpath='{.status.phase}'=Ready "inferenceservice/$isvc" \
-    -n "$B200_NS" --timeout=1800s
+  # A row that cannot be applied, never becomes Ready, or cannot be benchmarked
+  # measured nothing: it returns failure and publishes nothing, and records no
+  # result, so a re-run retries it. run-matrix.sh calls rows inside "if !",
+  # where set -e is off, so each step checks its own exit status.
+  if ! printf '%s\n' "$rendered" | kubectl apply -f -; then
+    b200_log "row $row: apply failed; nothing published"
+    return 1
+  fi
+  if ! kubectl wait --for=jsonpath='{.status.phase}'=Ready "inferenceservice/$isvc" \
+    -n "$B200_NS" --timeout=1800s; then
+    b200_log "row $row: not Ready within 1800s; nothing published, re-run to retry"
+    return 1
+  fi
   # B200_BENCHMARK_ARGS adds benchmark flags, such as --port-forward when the
   # harness runs outside the cluster and cannot reach the service endpoint.
   local -a bench_args=()
   read -r -a bench_args <<< "${B200_BENCHMARK_ARGS:-}"
-  llmkube benchmark "$isvc" -n "$B200_NS" -o json ${bench_args[@]+"${bench_args[@]}"} > "$out-benchmark.json"
+  if ! llmkube benchmark "$isvc" -n "$B200_NS" -o json ${bench_args[@]+"${bench_args[@]}"} > "$out-benchmark.json"; then
+    b200_log "row $row: benchmark did not run; nothing published, re-run to retry"
+    rm -f "$out-benchmark.json"
+    return 1
+  fi
 
   if [ "$(jq -r '.successful_runs' "$out-benchmark.json")" -lt 1 ]; then
     b200_log "row $row: FAIL: benchmark reported no successful runs"
