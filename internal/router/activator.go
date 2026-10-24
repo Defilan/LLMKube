@@ -85,8 +85,22 @@ type Activator struct {
 	// adding an API round-trip to the hot path.
 	resyncInterval time.Duration
 
+	// beforePublishFailure, when non-nil, runs in the swap goroutine on a failed
+	// swap just before it takes mu to record the outcome and wake the waiters.
+	// It exists so a test can hold that window open and drive a request into it.
+	// Always nil in production.
+	beforePublishFailure func()
+
 	mu    sync.Mutex
 	pools map[string]*poolRuntime
+}
+
+// swapFailure is one failed swap's outcome. gen is the swapGen of the swap that
+// produced it, so a caller can tell its own swap's outcome from one recorded
+// before it registered. Guarded by Activator.mu.
+type swapFailure struct {
+	gen uint64
+	err error
 }
 
 // poolRuntime is the per-pool swap state, guarded by Activator.mu.
@@ -119,10 +133,10 @@ type poolRuntime struct {
 	swapGen uint64
 
 	// swapErr records the outcome of the most recent failed swap, keyed by the
-	// target member, so the waiter that requested that member surfaces the
-	// error instead of hanging. It is cleared when a request for that member
-	// arrives, so only a caller already waiting on the swap can observe it.
-	swapErr map[string]error
+	// target member. An entry is never consumed on read, only superseded by the
+	// next failure for that member: the generation it carries is what tells a
+	// caller that waited on the failed swap from one that arrived afterwards.
+	swapErr map[string]swapFailure
 
 	// inflight counts in-flight blocking requests per member. waiting counts
 	// callers currently held open for a member that is not yet resident.
@@ -163,7 +177,7 @@ func (a *Activator) runtime(p *BackendPool) *poolRuntime {
 			namespace: p.Namespace,
 			pool:      p.Name,
 			members:   append([]string(nil), p.Members...),
-			swapErr:   make(map[string]error),
+			swapErr:   make(map[string]swapFailure),
 			inflight:  make(map[string]int),
 			waiting:   make(map[string]int),
 			change:    make(chan struct{}),
@@ -211,9 +225,13 @@ func (a *Activator) AcquireWithMode(ctx context.Context, p *BackendPool, mode st
 
 	pr.waiting[member]++
 	a.observeWaiting(pr, member)
-	// Only a caller that was already inside the failed swap sees its outcome; a
-	// request arriving afterwards starts a fresh load instead.
-	delete(pr.swapErr, member)
+	// arrivalGen is the swap this caller will wait through, or the one it will
+	// start itself. The comparison against a recorded failure is >= because a
+	// caller waits through every swap that begins after it registers.
+	arrivalGen := pr.swapGen
+	if !pr.swapping {
+		arrivalGen++
+	}
 	holdStart := time.Now()
 
 	release := func() {
@@ -252,12 +270,12 @@ func (a *Activator) AcquireWithMode(ctx context.Context, p *BackendPool, mode st
 	}()
 
 	for {
-		// A swap this caller requested may have failed; surface it instead of
-		// waiting forever.
-		if err := pr.swapErr[member]; err != nil {
-			delete(pr.swapErr, member)
+		// A swap this caller waited on may have failed. Every caller registered
+		// before the failure gets it, so this read must not consume the entry; a
+		// caller that arrived afterwards starts a fresh load instead.
+		if f, ok := pr.swapErr[member]; ok && f.gen >= arrivalGen {
 			a.mu.Unlock()
-			return nil, err
+			return nil, f.err
 		}
 
 		// Fast path: our member already owns the slot and no swap is unwinding
@@ -321,7 +339,9 @@ func (a *Activator) startSwap(pr *poolRuntime, incumbent, target string, holdSta
 	pr.swapTarget = target
 	pr.swapGen++
 	gen := pr.swapGen
-	delete(pr.swapErr, target)
+	// A recorded failure stays: it belongs to an earlier swap whose waiters may
+	// not have read it yet, and its generation keeps this swap's callers from
+	// taking it as their own.
 	pr.notify()
 
 	go func() {
@@ -332,6 +352,9 @@ func (a *Activator) startSwap(pr *poolRuntime, incumbent, target string, holdSta
 			err = a.ctrl.WaitReady(swapCtx, pr.namespace, target)
 		}
 
+		if err != nil && a.beforePublishFailure != nil {
+			a.beforePublishFailure()
+		}
 		a.mu.Lock()
 		defer a.mu.Unlock()
 		if pr.swapGen != gen {
@@ -357,8 +380,8 @@ func (a *Activator) startSwap(pr *poolRuntime, incumbent, target string, holdSta
 					"from", incumbent, "to", target, "elapsed", elapsed.String())
 				prommetrics.ModelPoolSwapFailuresTotal.
 					WithLabelValues(a.router, pr.pool, target, "deadline").Inc()
-				pr.swapErr[target] = fmt.Errorf("%w: member %s not resident after %s",
-					ErrSwapDeadlineExceeded, target, elapsed)
+				pr.swapErr[target] = swapFailure{gen: gen, err: fmt.Errorf("%w: member %s not resident after %s",
+					ErrSwapDeadlineExceeded, target, elapsed)}
 				// Scale the abandoned target back down. Done while still holding
 				// mu, so a waiter that is about to start a fresh swap for the
 				// same member cannot have its Activate undone by this patch.
@@ -375,13 +398,16 @@ func (a *Activator) startSwap(pr *poolRuntime, incumbent, target string, holdSta
 				"from", incumbent, "to", target, "error", err)
 			prommetrics.ModelPoolSwapFailuresTotal.
 				WithLabelValues(a.router, pr.pool, target, "error").Inc()
-			pr.swapErr[target] = errors.New("model pool swap failed for member " + target + ": " + err.Error())
+			pr.swapErr[target] = swapFailure{gen: gen,
+				err: errors.New("model pool swap failed for member " + target + ": " + err.Error())}
 			// The target may already be scaled up: Activate patches replicas
 			// before WaitReady runs. Nothing cancels the swap any more, so a
 			// failed swap whose callers have all left would keep the slot with
-			// no traffic. Scale it back when no caller is waiting; a caller that
-			// still is schedules its own deactivate when it gives up.
-			if a.ctrl != nil && pr.waiting[target] == 0 {
+			// no traffic. Scale it back down here, symmetric with the deadline
+			// branch above, and because this is the call that is guaranteed to
+			// land: the scale-down a waiter schedules when it leaves is skipped
+			// whenever another caller registers for the member in between.
+			if a.ctrl != nil {
 				if derr := a.ctrl.Deactivate(a.baseCtx, pr.namespace, target); derr != nil {
 					a.logger.Warn("model pool deactivate after failed swap failed",
 						"pool", pr.pool, "member", target, "error", derr)
