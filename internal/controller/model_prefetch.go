@@ -77,6 +77,14 @@ import (
 // the field (tests); production wiring always sets InitContainerImage.
 const defaultPrefetchImage = "docker.io/curlimages/curl:8.18.0"
 
+// initContainerUID is the numeric uid under which the default init image runs:
+// curlimages/curl:8.18.0 declares the named user curl_user, uid 101, gid 102.
+// Under --model-cache-prep=never the prefetch containers set runAsNonRoot with
+// this uid explicitly, because the kubelet refuses runAsNonRoot on an image
+// whose USER is a name it cannot resolve
+// (pkg/kubelet/kuberuntime/security_context_others.go, verifyRunAsNonRoot).
+const initContainerUID = 101
+
 // Annotations the prefetch Job carries so a later reconcile can tell whether
 // it was built for the current spec and target.
 const (
@@ -1209,6 +1217,11 @@ func (r *ModelReconciler) completePrefetch(ctx context.Context, model *inference
 // unset) and adds a no-op completion container, since a Job pod must have at
 // least one non-init container.
 //
+// Under --model-cache-prep=never the Job carries a Pod Security restricted
+// security context instead: the prep is the only root container, so its
+// absence is what lets the pod set a pod-level seccompProfile, which no
+// serving-side context can be borrowed for. runAsNonRoot is per container.
+//
 // ctx is needed only to read HF_ENDPOINT from the Model's sourceSecretRef, so
 // a prefetch from a mirror carries the bearer token as the serving pod does
 // (#1900).
@@ -1224,7 +1237,7 @@ func (r *ModelReconciler) buildPrefetchJob(ctx context.Context, model *inference
 		}
 	}
 	storage := buildModelStorageConfig(model, target, model.Namespace, true, ModelCacheModeShared,
-		r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.AllowedHostPathRoots, hfEndpointFromSecret(ctx, r.Client, model))
+		r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.ModelCachePrep, r.AllowedHostPathRoots, hfEndpointFromSecret(ctx, r.Client, model))
 	if len(storage.initContainers) == 0 {
 		return nil, fmt.Errorf("prefetch: source %q produced no downloader containers", model.Spec.Source)
 	}
@@ -1236,6 +1249,21 @@ func (r *ModelReconciler) buildPrefetchJob(ctx context.Context, model *inference
 	if r.DefaultFSGroup > 0 {
 		fs := r.DefaultFSGroup
 		podSecurity = &corev1.PodSecurityContext{FSGroup: &fs, FSGroupChangePolicy: fsGroupChangeOnRootMismatch()}
+	}
+
+	initContainers := storage.initContainers
+	doneSecurity := (*corev1.SecurityContext)(nil)
+	if !cachePrepIncluded(r.ModelCachePrep) {
+		// Nothing in this pod runs as root any more, so the pod itself can
+		// carry the restricted-level fields the prep forbade.
+		if podSecurity == nil {
+			podSecurity = &corev1.PodSecurityContext{}
+		}
+		podSecurity.SeccompProfile = &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}
+		for i := range initContainers {
+			initContainers[i].SecurityContext = restrictedPrefetchSecurityContext()
+		}
+		doneSecurity = restrictedPrefetchSecurityContext()
 	}
 
 	image := r.InitContainerImage
@@ -1281,17 +1309,37 @@ func (r *ModelReconciler) buildPrefetchJob(ctx context.Context, model *inference
 					// off the GPU nodes, or a preference (#2136).
 					NodeSelector:   model.Spec.PrefetchNodeSelector,
 					Affinity:       model.Spec.PrefetchAffinity,
-					InitContainers: storage.initContainers,
+					InitContainers: initContainers,
 					Containers: []corev1.Container{{
-						Name:    "prefetch-done",
-						Image:   image,
-						Command: []string{"sh", "-c", "echo prefetch complete"},
+						Name:            "prefetch-done",
+						Image:           image,
+						Command:         []string{"sh", "-c", "echo prefetch complete"},
+						SecurityContext: doneSecurity,
 					}},
 					Volumes: storage.volumes,
 				},
 			},
 		},
 	}, nil
+}
+
+// restrictedPrefetchSecurityContext is the container security context every
+// container in a prefetch Job carries under --model-cache-prep=never. It is
+// applied to the downloaders and to prefetch-done only when the prep is
+// absent: the prep runs as uid 0, and a pod-level runAsNonRoot cannot coexist
+// with it.
+//
+// RunAsUser is set explicitly because the default init image declares a named
+// user, and the kubelet refuses runAsNonRoot on one (verifyRunAsNonRoot).
+func restrictedPrefetchSecurityContext() *corev1.SecurityContext {
+	return &corev1.SecurityContext{
+		RunAsNonRoot:             boolPtr(true),
+		RunAsUser:                int64Ptr(initContainerUID),
+		AllowPrivilegeEscalation: boolPtr(false),
+		Capabilities: &corev1.Capabilities{
+			Drop: []corev1.Capability{"ALL"},
+		},
+	}
 }
 
 // prefetchTargetName returns the PVC name prefetch will stage into, for status

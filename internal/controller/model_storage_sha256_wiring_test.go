@@ -120,8 +120,7 @@ func TestModelStorageConfig_SHA256Wiring(t *testing.T) {
 			isvc := &inferencev1alpha1.InferenceService{
 				ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
 			}
-			cfg := buildModelStorageConfig(model, isvc, "default", tc.useCache, ModelCacheModeShared,
-				"", "img:latest", 0, []string{"/data/models"}, "")
+			cfg := buildModelStorageConfig(model, isvc, "default", tc.useCache, ModelCacheModeShared, "", "img:latest", 0, ModelCachePrepAlways, []string{"/data/models"}, "")
 
 			downloader, cmd := downloaderFrom(cfg)
 			if downloader.Name == "" {
@@ -169,8 +168,7 @@ func TestModelStorageConfig_NoDigestStaysUnwired(t *testing.T) {
 				isvc := &inferencev1alpha1.InferenceService{
 					ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
 				}
-				cfg := buildModelStorageConfig(model, isvc, "default", useCache, ModelCacheModeShared,
-					"", "img:latest", 0, []string{"/data/models"}, "")
+				cfg := buildModelStorageConfig(model, isvc, "default", useCache, ModelCacheModeShared, "", "img:latest", 0, ModelCachePrepAlways, []string{"/data/models"}, "")
 				downloader, cmd := downloaderFrom(cfg)
 				if downloader.Name == "" {
 					t.Fatalf("no model-downloader container (source=%s useCache=%v policy=%s)", source, useCache, policy)
@@ -262,8 +260,7 @@ func TestModelStorageConfig_MultiFileDigestWiring(t *testing.T) {
 					isvc := &inferencev1alpha1.InferenceService{
 						ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
 					}
-					cfg := buildModelStorageConfig(model, isvc, "default", useCache, ModelCacheModeShared,
-						"", "img:latest", 0, []string{"/data/models"}, "")
+					cfg := buildModelStorageConfig(model, isvc, "default", useCache, ModelCacheModeShared, "", "img:latest", 0, ModelCachePrepAlways, []string{"/data/models"}, "")
 					downloader, cmd := downloaderFrom(cfg)
 					if downloader.Name == "" {
 						t.Fatalf("no multi-file model-downloader container")
@@ -333,8 +330,7 @@ func TestModelStorageConfig_MultiFileNoDigestStaysUnwired(t *testing.T) {
 		isvc := &inferencev1alpha1.InferenceService{
 			ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
 		}
-		cfg := buildModelStorageConfig(model, isvc, "default", useCache, ModelCacheModeShared,
-			"", "img:latest", 0, []string{"/data/models"}, "")
+		cfg := buildModelStorageConfig(model, isvc, "default", useCache, ModelCacheModeShared, "", "img:latest", 0, ModelCachePrepAlways, []string{"/data/models"}, "")
 		downloader, cmd := downloaderFrom(cfg)
 		if downloader.Name == "" {
 			t.Fatalf("no multi-file model-downloader container (useCache=%v)", useCache)
@@ -366,7 +362,7 @@ func TestPVCStorageConfig_SHA256Wiring(t *testing.T) {
 				SHA256: sha,
 			},
 		}
-		return buildModelStorageConfig(model, nil, "default", true, ModelCacheModeShared, "", "img:latest", 0, nil, "")
+		return buildModelStorageConfig(model, nil, "default", true, ModelCacheModeShared, "", "img:latest", 0, ModelCachePrepAlways, nil, "")
 	}
 
 	t.Run("digest set", func(t *testing.T) {

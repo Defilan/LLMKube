@@ -171,6 +171,10 @@ type ModelReconciler struct {
 	// prefetch. StoragePath is the same flag but defaults itself, so it
 	// cannot carry that signal.
 	ModelCachePath string
+	// ModelCachePrep is the InferenceService reconciler's --model-cache-prep
+	// policy, so the prefetch Job stages into the cache with the same
+	// ownership handling the serving pods expect (#2057).
+	ModelCachePrep string
 
 	// Recorder emits Warning events on the Model (a prefetch held on a
 	// missing CA ConfigMap, a prefetch skipped on an unstageable source).

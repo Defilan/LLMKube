@@ -80,6 +80,7 @@ spec:
         - --model-cache-storage-class={{ .Values.modelCache.storageClass }}
         {{- end }}
         - --model-cache-access-mode={{ .Values.modelCache.accessMode }}
+        - --model-cache-prep={{ .Values.modelCache.prep }}
         {{- else }}
         # Empty path disables caching (the flag defaults to /models otherwise).
         - --model-cache-path=

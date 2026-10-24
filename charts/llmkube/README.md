@@ -384,6 +384,18 @@ skips this check; `--dry-run=server` exercises it. The Helm caller needs
 StorageClass list permission. Set the toggle to `false` for manually bound
 chart-managed claims or restricted Helm callers, and verify binding yourself.
 This checks the default annotation, not provisioner health or PV capacity.
+
+`modelCache.prep` defaults to `always`: every cache-backed pod and prefetch Job
+gets the root `model-cache-prep` init container, which chowns the cache root so
+the non-root downloader can write. Set it to `never` on storage that applies
+the pod `fsGroup` itself (a CSI driver with `fsGroupPolicy: File`) or on a
+cache you pre-provisioned with the downloader's ownership. A namespace that
+enforces Pod Security `restricted` then accepts the cache, provided each
+InferenceService sets `spec.podSecurityContext` with `fsGroup` (a supplied
+context replaces the operator default), `runAsNonRoot: true`, a numeric
+`runAsUser`, and `seccompProfile: RuntimeDefault`. See `docs/MODEL-CACHE.md`
+under "Turning the prep off".
+
 See the [air-gapped guide](../../docs/site/guides/air-gapped.md#clusters-without-dynamic-provisioning)
 for a static-PV example.
 

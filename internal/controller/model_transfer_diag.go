@@ -83,6 +83,13 @@ const (
 	// ephemeral storage, or an emptyDir sizeLimit smaller than the model.
 	ReasonModelTransferOutOfSpace = "ModelTransferOutOfSpace"
 
+	// ReasonModelCacheNotWritable: the cache volume refused a write the
+	// downloader made (mkdir of the model's cache directory, or the download
+	// itself). On a cache-backed pod the usual cause is that the prep was
+	// turned off for storage that does not apply fsGroup, or a cache root the
+	// downloader's uid does not own.
+	ReasonModelCacheNotWritable = "ModelCacheNotWritable"
+
 	// ReasonStagedFilesNotCurrent: a pod was built before the Model controller
 	// recorded the glob expansion in status.stagedFiles, so the downloader
 	// refused to stage a pattern it cannot expand. The cause is the Model's
@@ -205,6 +212,25 @@ var modelTransferSignatures = []modelTransferSignature{
 			"connection timed out",
 		},
 	},
+	{
+		// Captured from curl 8.18.0 (the pinned init image) with a cache root
+		// the downloader cannot write: "mkdir: can't create directory
+		// '/models/<key>': Permission denied". A write failure inside curl
+		// prints only "curl: (23) ... on write", which is also a full disk, so
+		// that spelling is deliberately not matched on its own.
+		//
+		// It comes last so a more specific cause wins when a message carries
+		// both. It only fires for a container that writes the cache
+		// (writesModelCache): the prefetched serving pod mounts the same claim
+		// read-only and this remedy does not apply to it.
+		reason: ReasonModelCacheNotWritable,
+		remedy: "the downloader cannot write to the model cache. The cache-prep init container fixes ownership, " +
+			"and it is off when the operator runs with --model-cache-prep=never (chart value modelCache.prep): " +
+			"that setting is only right for storage that applies the pod fsGroup itself (a CSI driver with " +
+			"fsGroupPolicy File). Either turn the prep back on (modelCache.prep: always) or chown the cache root " +
+			"to the downloader's uid, for example with `llmkube cache prep`",
+		matches: []string{"permission denied"},
+	},
 }
 
 // matchModelTransferFailure classifies an init container's termination message.
@@ -256,6 +282,9 @@ func isGeneratedInitContainer(name string) bool {
 func findModelTransferFailure(pods []corev1.Pod) (nodeName, reason, matchedLine string, found bool) {
 	for i := range pods {
 		pod := &pods[i]
+		// One pod-level answer, reused per container: does anything here
+		// mount a model cache at all.
+		cacheBacked := podMountsModelCache(pod)
 		for j := range pod.Status.InitContainerStatuses {
 			cs := &pod.Status.InitContainerStatuses[j]
 			if !isGeneratedInitContainer(cs.Name) {
@@ -276,12 +305,40 @@ func findModelTransferFailure(pods []corev1.Pod) (nodeName, reason, matchedLine 
 					continue
 				}
 				if r, line, ok := matchModelTransferFailure(term.Message); ok {
+					// The cache remedy needs both: a container that writes
+					// the cache (model-verify only reads it) and a pod that
+					// mounts one (an emptyDir store has no cache-prep to
+					// turn on).
+					if r == ReasonModelCacheNotWritable && !(writesModelCache(cs.Name) && cacheBacked) {
+						continue
+					}
 					return pod.Spec.NodeName, r, line, true
 				}
 			}
 		}
 	}
 	return "", "", "", false
+}
+
+// podMountsModelCache reports whether the pod mounts the model-cache PVC, the
+// only mount a cache-prep init container ever prepared.
+func podMountsModelCache(pod *corev1.Pod) bool {
+	for i := range pod.Spec.Volumes {
+		if pod.Spec.Volumes[i].Name == "model-cache" && pod.Spec.Volumes[i].PersistentVolumeClaim != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// writesModelCache reports whether a generated init container writes the model
+// cache, so a cache-write failure can only come from it. model-verify is the
+// exception among the containers that mount the cache: it runs on the
+// read-only prefetched mount and never creates anything. The draft-prefixed
+// names are absent because isGeneratedInitContainer filters them out before
+// this is consulted.
+func writesModelCache(name string) bool {
+	return name == "model-cache-prep" || name == "model-downloader"
 }
 
 // initContainersCompleted reports whether any pod has got past every generated

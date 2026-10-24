@@ -510,7 +510,7 @@ func TestModelStorageConfig_StagedFilesNotCurrent(t *testing.T) {
 	}
 
 	for _, useCache := range []bool{true, false} {
-		cfg := buildModelStorageConfig(stale, nil, "default", useCache, "", "", "curl:8.18.0", 0, nil, "")
+		cfg := buildModelStorageConfig(stale, nil, "default", useCache, "", "", "curl:8.18.0", 0, ModelCachePrepAlways, nil, "")
 		if len(cfg.initContainers) != 1 {
 			t.Fatalf("useCache=%v: got %d init containers, want the single fail-closed one", useCache, len(cfg.initContainers))
 		}
@@ -533,7 +533,7 @@ func TestModelStorageConfig_StagedFilesNotCurrent(t *testing.T) {
 	bad.Spec.Files = []string{"../../etc/passwd"}
 	bad.Status.StagedFiles = nil
 	for _, useCache := range []bool{true, false} {
-		cfg := buildModelStorageConfig(bad, nil, "default", useCache, "", "", "curl:8.18.0", 0, nil, "")
+		cfg := buildModelStorageConfig(bad, nil, "default", useCache, "", "", "curl:8.18.0", 0, ModelCachePrepAlways, nil, "")
 		cmd := strings.Join(cfg.initContainers[0].Command, " ")
 		if !strings.Contains(cmd, "InvalidFileSet") || strings.Contains(cmd, "StagedFilesNotCurrent") {
 			t.Errorf("useCache=%v: command = %q; a directory escape must keep the InvalidFileSet message", useCache, cmd)
@@ -545,7 +545,7 @@ func TestModelStorageConfig_StagedFilesNotCurrent(t *testing.T) {
 	// rendered line is the message with the name printed literally.
 	hostile := stale.DeepCopy()
 	hostile.Name = "x'; rm -rf / #"
-	cfg := buildModelStorageConfig(hostile, nil, "default", true, "", "", "curl:8.18.0", 0, nil, "")
+	cfg := buildModelStorageConfig(hostile, nil, "default", true, "", "", "curl:8.18.0", 0, ModelCachePrepAlways, nil, "")
 	hc := cfg.initContainers[0]
 	script := hc.Command[2]
 	if strings.Contains(script, hostile.Name) {

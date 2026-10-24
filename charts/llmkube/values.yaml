@@ -493,6 +493,21 @@ modelCache:
   # ReadWriteOnce (single-node) or ReadWriteMany (multi-node with NFS/EFS).
   # perService caches are always ReadWriteOnce.
   accessMode: ReadWriteOnce
+  # Whether to inject the root model-cache-prep init container into cache-backed
+  # pods and prefetch Jobs:
+  #   always (default): chown the cache root so the non-root downloader can
+  #     write. Required on storage that does not apply the pod fsGroup (a CSI
+  #     driver with fsGroupPolicy None, or an unset policy on an RWX volume).
+  #     The prep runs as uid 0 and cannot pass Pod Security `restricted`.
+  #   never: omit it. Only for storage that applies the pod fsGroup itself (a
+  #     CSI driver with fsGroupPolicy File, see
+  #     `kubectl get csidriver <name> -o jsonpath='{.spec.fsGroupPolicy}'`), or a
+  #     cache pre-provisioned with the downloader's ownership. Owned by the
+  #     operator, not the workload: a namespace that enforces `restricted`
+  #     still needs each InferenceService to set spec.podSecurityContext with
+  #     runAsNonRoot: true, a numeric runAsUser, and
+  #     seccompProfile: RuntimeDefault (see docs/MODEL-CACHE.md, `PSA restricted`).
+  prep: always
   # Logical model cache path inside inference pods (passed to the operator as
   # --model-cache-path; not an operator-pod mount).
   mountPath: /models
