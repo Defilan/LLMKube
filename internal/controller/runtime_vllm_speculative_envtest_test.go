@@ -211,6 +211,12 @@ var _ = Describe("vLLM speculative decoding", func() {
 		// the staging plan gives a multi-file draft, not a fixed prefix.
 		Expect(modelValue).To(ContainSubstring(effectiveModelCacheKey(draft)),
 			"the rendered path must be the draft's staged directory, got %q (args %v)", modelValue, args)
+
+		// The path is only loadable if the serving container actually mounts
+		// it, which a remount under a colliding claim is exactly what breaks.
+		Expect(pathIsMounted(dep, "vllm", modelValue)).To(BeTrue(),
+			"the rendered draft path %q is not under any volume the vllm container mounts: %v",
+			modelValue, servingMounts(dep, "vllm"))
 		Expect(got["method"]).To(Equal("draft_model"), "args: %v", args)
 		Expect(got["num_speculative_tokens"]).To(Equal(float64(4)), "args: %v", args)
 		Expect(args).NotTo(ContainElement("--speculative-model"), "args: %v", args)
@@ -378,8 +384,9 @@ var _ = Describe("vLLM speculative decoding", func() {
 		Expect(rendered).To(ContainSubstring(vllmKey),
 			"the rendered path must be the vLLM block's draft, got %q (args %v)", rendered, args)
 
-		// The llama field still mounts too (base behavior), but only the vLLM
-		// draft's path may reach the argv.
+		// The llama field no longer stages its draft on this service: only one
+		// Model can be resolved, and the vLLM block's wins, so exactly one
+		// draft is downloaded.
 		names := make([]string, 0, len(dep.Spec.Template.Spec.InitContainers))
 		for _, c := range dep.Spec.Template.Spec.InitContainers {
 			names = append(names, c.Name)
@@ -452,4 +459,30 @@ func countString(in []string, s string) int {
 		}
 	}
 	return n
+}
+
+// servingMounts returns the mount paths of the named container.
+func servingMounts(dep *appsv1.Deployment, container string) []string {
+	for _, c := range dep.Spec.Template.Spec.Containers {
+		if c.Name != container {
+			continue
+		}
+		out := make([]string, 0, len(c.VolumeMounts))
+		for _, m := range c.VolumeMounts {
+			out = append(out, m.MountPath)
+		}
+		return out
+	}
+	return nil
+}
+
+// pathIsMounted reports whether p is one of the container's mount paths or
+// sits under one.
+func pathIsMounted(dep *appsv1.Deployment, container, p string) bool {
+	for _, m := range servingMounts(dep, container) {
+		if p == m || strings.HasPrefix(p, strings.TrimSuffix(m, "/")+"/") {
+			return true
+		}
+	}
+	return false
 }

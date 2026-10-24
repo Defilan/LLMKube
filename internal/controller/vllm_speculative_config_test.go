@@ -178,6 +178,41 @@ func TestAppendSpeculativeConfig(t *testing.T) {
 			extraArgs: []string{`--speculative-config={"method":"dspark"}`},
 		},
 		{
+			name: "extraArgs --spec-tokens wins, because vLLM merges it into the same document",
+			cfg: &inferencev1alpha1.SpeculativeConfig{
+				Enabled: ptrBool(true),
+				Model:   "my-draft-cr",
+			},
+			draftPath: "/models/abc123",
+			extraArgs: []string{"--spec-tokens", "8"},
+		},
+		{
+			name: "extraArgs --spec-model wins",
+			cfg: &inferencev1alpha1.SpeculativeConfig{
+				Enabled: ptrBool(true),
+				Method:  "eagle3",
+			},
+			extraArgs: []string{"--spec-model", "org/draft"},
+		},
+		{
+			name: "extraArgs --spec-method wins",
+			cfg: &inferencev1alpha1.SpeculativeConfig{
+				Enabled: ptrBool(true),
+				Model:   "my-draft-cr",
+			},
+			draftPath: "/models/abc123",
+			extraArgs: []string{"--spec-method", "ngram"},
+		},
+		{
+			name: "extraArgs short alias -sc wins",
+			cfg: &inferencev1alpha1.SpeculativeConfig{
+				Enabled: ptrBool(true),
+				Model:   "my-draft-cr",
+			},
+			draftPath: "/models/abc123",
+			extraArgs: []string{"-sc", `{"method":"dspark"}`},
+		},
+		{
 			name: "a draft that nothing staged is an error, not an empty model",
 			cfg: &inferencev1alpha1.SpeculativeConfig{
 				Enabled: ptrBool(true),

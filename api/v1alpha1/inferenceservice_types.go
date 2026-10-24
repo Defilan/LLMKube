@@ -1726,9 +1726,12 @@ type SpeculativeConfig struct {
 	// InferenceService) holding the draft weights. The operator stages and
 	// mounts it exactly like the target model, and vLLM receives its
 	// in-container path as the --speculative-config "model" key, never the
-	// CR name. Required for the methods that load separate weights
-	// (draft_model, eagle, eagle3); omit it for methods whose drafter ships
-	// in the target checkpoint (mtp, dspark) or needs none (ngram, suffix).
+	// CR name. The draft must declare a directory format (safetensors, and
+	// specs files): Model.spec.format defaults to gguf, and a single-file
+	// draft is staged as one file rather than the model tree vLLM loads.
+	// Required for the methods that load separate weights (draft_model,
+	// eagle, eagle3); omit it for methods whose drafter ships in the target
+	// checkpoint (mtp, dspark) or needs none (ngram, suffix).
 	// +optional
 	Model string `json:"model,omitempty"`
 
@@ -1736,8 +1739,8 @@ type SpeculativeConfig struct {
 	// rendered as the --speculative-config "num_speculative_tokens" key.
 	// Typical sweet spot is 3-5; higher values increase wasted work when the
 	// draft disagrees with the target model. Always emitted: 4 when unset, the
-	// same value the CRD defaults the field to, because vLLM refuses a draft
-	// model without one.
+	// same value the CRD defaults the field to, because vLLM requires one
+	// whenever a speculative model is provided.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=16
 	// +kubebuilder:default=4

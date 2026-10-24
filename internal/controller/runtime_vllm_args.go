@@ -186,11 +186,25 @@ func appendMaxNumSeqsArgs(args []string, parallelSlots *int32, extraArgs []strin
 // (draft_sample_method, prompt_lookup_max, ...) therefore belong in
 // spec.extraArgs as --speculative-config, which wins over this block, rather
 // than in typed fields this operator cannot version-check.
+// vllmSpeculativeArgSpellings are every extraArgs spelling that writes the same
+// speculative document the typed block renders: vLLM registers these flags as
+// descriptions of one SpeculativeConfig and raises when a key appears both in
+// --speculative-config and in one of the shorthands, so a user setting any of
+// them owns the argument (vllm/engine/arg_utils.py at v0.25.1, the -sc alias at
+// 1514 and the mutual-exclusion check at 1724).
+var vllmSpeculativeArgSpellings = []string{"speculative-config", "-sc", "spec-method", "spec-model", "spec-tokens"}
+
+// extraArgsSetsVLLMSpeculative reports whether the user configures speculative
+// decoding themselves, in any of vLLM's spellings.
+func extraArgsSetsVLLMSpeculative(extraArgs []string) bool {
+	return hasMatchingExtraArgAny(extraArgs, vllmSpeculativeArgSpellings...)
+}
+
 func appendSpeculativeConfig(args []string, cfg *inferencev1alpha1.SpeculativeConfig, draftPath string, extraArgs []string) ([]string, error) {
 	if cfg == nil || cfg.Enabled == nil || !*cfg.Enabled {
 		return args, nil
 	}
-	if hasMatchingExtraArg(extraArgs, "speculative-config") {
+	if extraArgsSetsVLLMSpeculative(extraArgs) {
 		return args, nil
 	}
 	if cfg.Model != "" && draftPath == "" {
