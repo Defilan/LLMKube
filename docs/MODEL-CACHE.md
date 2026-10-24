@@ -625,9 +625,10 @@ spec:
 Behavior:
 
 - The named PVC becomes the writable model cache for this workload only: the
-  same `model-cache-prep` and `model-downloader` init containers run against
-  it, weights land under the usual `<cacheKey>/` subdirectory, and the serving
-  container mounts it read-only. `RefreshPolicy` and cache-key semantics are
+  same `model-downloader` init container runs against it, and, under
+  `modelCache.prep: always`, the `model-cache-prep` one before it. Weights land
+  under the usual `<cacheKey>/` subdirectory, and the serving container mounts
+  it read-only. `RefreshPolicy` and cache-key semantics are
   unchanged, so multiple models can safely share one claim.
 - The block can live on the Model instead: a service with no `modelCache`
   of its own resolves `Model.spec.modelCache`, so a claim shared by every
@@ -962,16 +963,41 @@ Whether Kubernetes applies the pod `fsGroup` to a volume depends on the CSI driv
 
 The automatic shared-model-cache workflow is a first-class supported path, **including** on `fsGroupPolicy: None` CSIs. On those backends Kubernetes does not apply the pod `fsGroup` to the volume, so the PVC root stays `root:root` and the non-root model downloader cannot write to it. The `model-cache-prep` init container fixes the ownership for you so the cache just works. You do not need to pre-stage models or hand-manage a PVC.
 
-The prep is the **compatibility implementation** for these backends. Today the operator adds it on every cache-backed pod, whatever the driver's policy: on a `File` driver kubelet has already applied the ownership and the prep only re-asserts it, so it is redundant there (tracked in #2057). It runs as **non-privileged root (uid 0)** with `ALL` capabilities dropped and only `CHOWN`+`FOWNER` added (no privilege escalation, read-only rootfs, seccomp `RuntimeDefault`). Root here is a backend-driven requirement, not an avoidable misconfiguration: chowning a root-owned mount needs `CAP_CHOWN`, the prep shells out to `chown`, and a non-root process loses its capabilities across `execve` (Kubernetes has no ambient-capability field), so the exec'd `chown` would fail `EPERM`. Root retains its capabilities across exec. (Running the prep non-root broke the shared cache on these backends in 0.8.20; reverted in 0.8.21. A future change may move the chown into a small dedicated helper that performs the syscall in its own entrypoint, which would let the prep run non-root again without the exec capability loss.)
+The prep is the **compatibility implementation** for these backends, and the operator adds it on every cache-backed pod and prefetch Job by default (`modelCache.prep: always`). On a `File` driver kubelet has already applied the ownership and the prep only re-asserts it, so it is redundant there: set `modelCache.prep: never` to drop it (see below). It runs as **non-privileged root (uid 0)** with `ALL` capabilities dropped and only `CHOWN`+`FOWNER` added (no privilege escalation, read-only rootfs, seccomp `RuntimeDefault`). Root here is a backend-driven requirement, not an avoidable misconfiguration: chowning a root-owned mount needs `CAP_CHOWN`, the prep shells out to `chown`, and a non-root process loses its capabilities across `execve` (Kubernetes has no ambient-capability field), so the exec'd `chown` would fail `EPERM`. Root retains its capabilities across exec. (Running the prep non-root broke the shared cache on these backends in 0.8.20; reverted in 0.8.21. A future change may move the chown into a small dedicated helper that performs the syscall in its own entrypoint, which would let the prep run non-root again without the exec capability loss.)
+
+### Turning the prep off (`modelCache.prep`)
+
+`modelCache.prep` (controller flag `--model-cache-prep`) selects whether the prep is injected:
+
+| Value | Effect |
+|-------|--------|
+| `always` (default) | The prep runs in every cache-backed pod and every prefetch Job. |
+| `never` | The prep is never injected. The downloader still runs non-root; if the volume's ownership is wrong it fails with `Permission denied` and the `ModelCacheNotWritable` diagnosis names this setting. |
+
+Use `never` only when you know the cache's ownership is right without the prep: a CSI driver with `fsGroupPolicy: File`, or a claim you pre-provisioned with the downloader's uid. Then the cache-backed pods contain no root container at all, which is what a `restricted` namespace needs, and the prefetch Job additionally carries `runAsNonRoot` with a numeric uid, `allowPrivilegeEscalation: false`, `ALL` dropped, and a pod-level `seccompProfile: RuntimeDefault`.
+
+Changing the value rolls every cache-backed serving pod once, because the pod template changes. A prefetch Job already running finishes under the setting it started with.
+
+`auto` (resolve the storage class and skip the prep only when the driver applies `fsGroup` itself) is a planned follow-up; the flag and the chart schema reject it today.
 
 ### PSA `restricted`
 
-Because the prep needs root plus `CHOWN`/`FOWNER`, it cannot satisfy Pod Security Admission `restricted` (which forbids running as root and adding any capability except `NET_BIND_SERVICE`). Only `fsGroupPolicy: None` backends actually need it, but since the operator currently adds it on every cache-backed pod (#2057), a namespace that enforces `restricted` rejects the shared cache on any backend. If you are in that case, the options are:
+The prep needs root plus `CHOWN`/`FOWNER`, so a cache-backed pod with `modelCache.prep: always` cannot satisfy Pod Security Admission `restricted` (which forbids running as root and adding any capability except `NET_BIND_SERVICE`). On storage that applies `fsGroup` itself, set `modelCache.prep: never`: the root container is gone and the pod can pass `restricted`.
 
-- Use an `emptyDir` model store (no shared persistent cache).
-- Relax the namespace policy to `baseline`.
+Each InferenceService sharing that cache must also supply, in `spec.podSecurityContext`:
 
-Once #2057 lands, an `fsGroupPolicy: File` driver will also work, because Kubernetes applies the ownership itself and the prep can be skipped.
+```yaml
+spec:
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 101        # numeric; the downloader inherits it
+    seccompProfile:
+      type: RuntimeDefault
+```
+
+A numeric `runAsUser` is required, not optional: the default init image (`curlimages/curl`) declares the *named* user `curl_user`, and the kubelet refuses `runAsNonRoot` on an image whose user it cannot resolve numerically (`container has runAsNonRoot and image has non-numeric user (curl_user)`).
+
+Inference pods deliberately do not get `runAsNonRoot` by default, because runtime images that run as root (vLLM, for example) would break. Without `never`, the alternatives are an `emptyDir` model store (no shared persistent cache) or a `baseline` namespace policy.
 
 ### `fsGroupChangePolicy` and pod start time on large caches
 
@@ -987,7 +1013,7 @@ securityContext:
     type: RuntimeDefault
 ```
 
-With `OnRootMismatch`, kubelet skips the walk when the volume root already has the `fsGroup` GID, group `rwx` and the setgid bit, which is the state the first full pass leaves and the `model-cache-prep` step (`chown 0:<fsGroup>`, `chmod g+rwX`) keeps. If anything changes the root's group, the next start does the full walk again. On `fsGroupPolicy: None` backends kubelet changes no ownership at all, so the setting has no effect there.
+With `OnRootMismatch`, kubelet skips the walk when the volume root already has the `fsGroup` GID, group `rwx` and the setgid bit, which is the state the first full pass leaves and, under `modelCache.prep: always`, the `model-cache-prep` step (`chown 0:<fsGroup>`, `chmod g+rwX`) keeps. If anything changes the root's group, the next start does the full walk again. On `fsGroupPolicy: None` backends kubelet changes no ownership at all, so the setting has no effect there.
 
 A user-supplied `spec.podSecurityContext` replaces the operator default entirely, so it does not get this setting. If you supply your own context on a large cache, add `fsGroupChangePolicy: OnRootMismatch` next to your `fsGroup`. When the default fsGroup is disabled (`--default-fsgroup=0`, the OpenShift preset), the operator sets neither field.
 
@@ -995,6 +1021,6 @@ One consequence of skipping the walk: kubelet no longer re-grants group write on
 
 ### Shared-cache group-write multi-tenancy
 
-In `shared` mode, the cache-prep init container sets `chmod g+rwX /models`, making the cache root writable by any pod in the same `fsGroup`. On a shared cache PVC, multiple InferenceServices share that `fsGroup` and can write to each other's cached model files.
+In `shared` mode, the cache-prep init container (with its default `modelCache.prep: always`) sets `chmod g+rwX /models`, making the cache root writable by any pod in the same `fsGroup`. On a shared cache PVC, multiple InferenceServices share that `fsGroup` and can write to each other's cached model files.
 
 Within one operator's trust domain this is fine. For a multi-tenant cache where distrusting tenants share the same namespace, this is a real consideration. Use per-service caches (`modelCache.mode: perService`) for isolation between distrusting tenants.

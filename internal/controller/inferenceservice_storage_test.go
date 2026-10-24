@@ -47,7 +47,7 @@ var _ = Describe("buildCachedStorageConfig", func() {
 				CacheKey: "abc123def456",
 			},
 		}
-		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102, "")
+		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102, ModelCachePrepAlways, "")
 
 		Expect(config.modelPath).To(Equal("/models/abc123def456/model.gguf"))
 		Expect(config.stagedDir).To(BeEmpty())
@@ -80,7 +80,7 @@ var _ = Describe("buildCachedStorageConfig", func() {
 				CacheKey: "abc123",
 			},
 		}
-		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102, "")
+		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102, ModelCachePrepAlways, "")
 
 		Expect(config.volumes).To(HaveLen(2))
 		Expect(config.volumes[1].Name).To(Equal("host-model"))
@@ -100,7 +100,7 @@ var _ = Describe("buildCachedStorageConfig", func() {
 				CacheKey: "abc123",
 			},
 		}
-		config := buildCachedStorageConfig(model, nil, "", "my-ca-certs", "curl:8.18.0", 102, "")
+		config := buildCachedStorageConfig(model, nil, "", "my-ca-certs", "curl:8.18.0", 102, ModelCachePrepAlways, "")
 
 		var found bool
 		for _, v := range config.volumes {
@@ -140,7 +140,7 @@ var _ = Describe("buildModelStorageConfig host-path allowlist (GHSA-jw3m-8q7m-f3
 	}
 
 	It("emits no hostPath volume when no roots are configured (secure default)", func() {
-		config := buildModelStorageConfig(newLocalModel(), nil, "default", true, "", "", "curl:8.18.0", 102, nil, "")
+		config := buildModelStorageConfig(newLocalModel(), nil, "default", true, "", "", "curl:8.18.0", 102, ModelCachePrepAlways, nil, "")
 
 		expectNoHostPath(config)
 		Expect(config.initContainers).To(HaveLen(1))
@@ -148,7 +148,7 @@ var _ = Describe("buildModelStorageConfig host-path allowlist (GHSA-jw3m-8q7m-f3
 	})
 
 	It("emits no hostPath volume when the source is outside the allowed roots", func() {
-		config := buildModelStorageConfig(newLocalModel(), nil, "default", true, "", "", "curl:8.18.0", 102,
+		config := buildModelStorageConfig(newLocalModel(), nil, "default", true, "", "", "curl:8.18.0", 102, ModelCachePrepAlways,
 			[]string{"/srv/models"}, "")
 
 		expectNoHostPath(config)
@@ -157,7 +157,7 @@ var _ = Describe("buildModelStorageConfig host-path allowlist (GHSA-jw3m-8q7m-f3
 	})
 
 	It("emits no hostPath volume on the emptyDir (useCache=false) path either", func() {
-		config := buildModelStorageConfig(newLocalModel(), nil, "default", false, "", "", "curl:8.18.0", 102, nil, "")
+		config := buildModelStorageConfig(newLocalModel(), nil, "default", false, "", "", "curl:8.18.0", 102, ModelCachePrepAlways, nil, "")
 
 		expectNoHostPath(config)
 		Expect(config.initContainers).To(HaveLen(1))
@@ -165,7 +165,7 @@ var _ = Describe("buildModelStorageConfig host-path allowlist (GHSA-jw3m-8q7m-f3
 	})
 
 	It("emits the host-model hostPath volume for a local source under an allowed root", func() {
-		config := buildModelStorageConfig(newLocalModel(), nil, "default", true, "", "", "curl:8.18.0", 102,
+		config := buildModelStorageConfig(newLocalModel(), nil, "default", true, "", "", "curl:8.18.0", 102, ModelCachePrepAlways,
 			[]string{"/mnt/models"}, "")
 
 		var hostPath *corev1.HostPathVolumeSource
@@ -184,7 +184,7 @@ var _ = Describe("buildModelStorageConfig host-path allowlist (GHSA-jw3m-8q7m-f3
 			Spec:       inferencev1alpha1.ModelSpec{Source: "https://example.com/model.gguf"},
 			Status:     inferencev1alpha1.ModelStatus{CacheKey: "abc123"},
 		}
-		config := buildModelStorageConfig(model, nil, "default", true, "", "", "curl:8.18.0", 102, nil, "")
+		config := buildModelStorageConfig(model, nil, "default", true, "", "", "curl:8.18.0", 102, ModelCachePrepAlways, nil, "")
 
 		expectNoHostPath(config)
 		Expect(config.initContainers).To(HaveLen(2))
@@ -208,7 +208,7 @@ var _ = Describe("buildCachedStorageConfig multi-file staging", func() {
 			Status: inferencev1alpha1.ModelStatus{CacheKey: "abc123"},
 		}
 
-		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102, "")
+		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102, ModelCachePrepAlways, "")
 
 		Expect(config.modelPath).To(Equal("/models/abc123/gemma-4-31B-it-UD-Q4_K_XL.gguf"))
 		cmd := config.initContainers[1].Command[2]
@@ -233,7 +233,7 @@ var _ = Describe("buildCachedStorageConfig multi-file staging", func() {
 			Status: inferencev1alpha1.ModelStatus{CacheKey: "abc123"},
 		}
 
-		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102, "")
+		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102, ModelCachePrepAlways, "")
 
 		Expect(config.stagedDir).To(Equal("/models/abc123"))
 		Expect(config.modelPath).To(Equal("/models/abc123/a.gguf"))
@@ -252,7 +252,7 @@ var _ = Describe("buildCachedStorageConfig multi-file staging", func() {
 			Status: inferencev1alpha1.ModelStatus{CacheKey: "key1"},
 		}
 
-		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102, "")
+		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102, ModelCachePrepAlways, "")
 		cmd := config.initContainers[1].Command[2]
 		Expect(cmd).To(ContainSubstring(`mkdir -p "$(dirname "$dest")"`))
 
@@ -271,7 +271,7 @@ var _ = Describe("buildCachedStorageConfig multi-file staging", func() {
 			Status: inferencev1alpha1.ModelStatus{CacheKey: "key2"},
 		}
 
-		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102, "")
+		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102, ModelCachePrepAlways, "")
 		env := config.initContainers[1].Env
 		source := getEnvVar(env, "MODEL_SOURCE")
 		Expect(source).To(Equal("https://huggingface.co/unsloth/gemma-4-31B-it-GGUF/resolve/main/"))
@@ -287,7 +287,7 @@ var _ = Describe("buildCachedStorageConfig multi-file staging", func() {
 			Status: inferencev1alpha1.ModelStatus{CacheKey: "key3"},
 		}
 
-		config := buildCachedStorageConfig(model, nil, "", "my-ca-certs", "curl:8.18.0", 102, "")
+		config := buildCachedStorageConfig(model, nil, "", "my-ca-certs", "curl:8.18.0", 102, ModelCachePrepAlways, "")
 
 		var foundCA bool
 		for _, v := range config.volumes {
@@ -315,7 +315,7 @@ var _ = Describe("buildCachedStorageConfig multi-file staging", func() {
 			Status: inferencev1alpha1.ModelStatus{CacheKey: "key4"},
 		}
 
-		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102, "")
+		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102, ModelCachePrepAlways, "")
 		cmd := config.initContainers[1].Command[2]
 		Expect(cmd).To(ContainSubstring("remote_size"))
 		Expect(cmd).To(ContainSubstring("skipped download"))
@@ -329,7 +329,7 @@ var _ = Describe("buildCachedStorageConfig multi-file staging", func() {
 			},
 			Status: inferencev1alpha1.ModelStatus{CacheKey: "abc123def456"},
 		}
-		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102, "")
+		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102, ModelCachePrepAlways, "")
 
 		Expect(config.modelPath).To(Equal("/models/abc123def456/model.gguf"))
 		env := config.initContainers[1].Env
@@ -545,7 +545,7 @@ var _ = Describe("buildCachedStorageConfig cache key fallback", func() {
 				Files:  []string{"model.gguf"},
 			},
 		}
-		config := buildCachedStorageConfig(model, nil, ModelCacheModeShared, "", "curl:8.18.0", 102, "")
+		config := buildCachedStorageConfig(model, nil, ModelCacheModeShared, "", "curl:8.18.0", 102, ModelCachePrepAlways, "")
 
 		// The staged primary must land under the key derived from the source,
 		// never a bare /models/ which would collide across every keyless model.
@@ -685,7 +685,7 @@ var _ = Describe("buildModelStorageConfig PVC dispatch", func() {
 			Spec:       inferencev1alpha1.ModelSpec{Source: "pvc://my-claim/model.gguf"},
 			Status:     inferencev1alpha1.ModelStatus{CacheKey: "abc123"},
 		}
-		config := buildModelStorageConfig(model, nil, "default", true, "", "", "curl:8.18.0", 102, nil, "")
+		config := buildModelStorageConfig(model, nil, "default", true, "", "", "curl:8.18.0", 102, ModelCachePrepAlways, nil, "")
 
 		// Should use PVC config, not cached config
 		Expect(config.volumes[0].Name).To(Equal("model-source"))
@@ -886,7 +886,7 @@ var _ = Describe("buildCachedStorageConfig cache mode selection (#728)", func() 
 		isvc := &inferencev1alpha1.InferenceService{
 			ObjectMeta: metav1.ObjectMeta{Name: "my-isvc"},
 		}
-		config := buildCachedStorageConfig(model, isvc, ModelCacheModePerService, "", "curl:8.18.0", 102, "")
+		config := buildCachedStorageConfig(model, isvc, ModelCacheModePerService, "", "curl:8.18.0", 102, ModelCachePrepAlways, "")
 		Expect(config.volumes[0].PersistentVolumeClaim.ClaimName).To(Equal("my-isvc-model-cache"))
 	})
 
@@ -894,7 +894,7 @@ var _ = Describe("buildCachedStorageConfig cache mode selection (#728)", func() 
 		isvc := &inferencev1alpha1.InferenceService{
 			ObjectMeta: metav1.ObjectMeta{Name: "my-isvc"},
 		}
-		config := buildCachedStorageConfig(model, isvc, ModelCacheModeShared, "", "curl:8.18.0", 102, "")
+		config := buildCachedStorageConfig(model, isvc, ModelCacheModeShared, "", "curl:8.18.0", 102, ModelCachePrepAlways, "")
 		Expect(config.volumes[0].PersistentVolumeClaim.ClaimName).To(Equal(ModelCachePVCName))
 	})
 
@@ -902,7 +902,7 @@ var _ = Describe("buildCachedStorageConfig cache mode selection (#728)", func() 
 		isvc := &inferencev1alpha1.InferenceService{
 			ObjectMeta: metav1.ObjectMeta{Name: "my-isvc"},
 		}
-		config := buildCachedStorageConfig(model, isvc, "", "", "curl:8.18.0", 102, "")
+		config := buildCachedStorageConfig(model, isvc, "", "", "curl:8.18.0", 102, ModelCachePrepAlways, "")
 		Expect(config.volumes[0].PersistentVolumeClaim.ClaimName).To(Equal(ModelCachePVCName))
 	})
 })
@@ -922,17 +922,17 @@ var _ = Describe("buildCachedStorageConfig user claimName override (#928)", func
 	}
 
 	It("mounts the user PVC instead of the shared PVC in shared mode", func() {
-		config := buildCachedStorageConfig(model, isvcWithClaim(), ModelCacheModeShared, "", "curl:8.18.0", 102, "")
+		config := buildCachedStorageConfig(model, isvcWithClaim(), ModelCacheModeShared, "", "curl:8.18.0", 102, ModelCachePrepAlways, "")
 		Expect(config.volumes[0].PersistentVolumeClaim.ClaimName).To(Equal("my-model-cache"))
 	})
 
 	It("mounts the user PVC instead of the per-isvc PVC in perService mode", func() {
-		config := buildCachedStorageConfig(model, isvcWithClaim(), ModelCacheModePerService, "", "curl:8.18.0", 102, "")
+		config := buildCachedStorageConfig(model, isvcWithClaim(), ModelCacheModePerService, "", "curl:8.18.0", 102, ModelCachePrepAlways, "")
 		Expect(config.volumes[0].PersistentVolumeClaim.ClaimName).To(Equal("my-model-cache"))
 	})
 
 	It("keeps the cache layout and init containers identical to the built-in cache path", func() {
-		config := buildCachedStorageConfig(model, isvcWithClaim(), "", "", "curl:8.18.0", 102, "")
+		config := buildCachedStorageConfig(model, isvcWithClaim(), "", "", "curl:8.18.0", 102, ModelCachePrepAlways, "")
 
 		// Weights still land under <cacheKey>/, not the PVC root.
 		Expect(config.modelPath).To(Equal("/models/abc123def456/model.gguf"))
@@ -954,13 +954,13 @@ var _ = Describe("buildCachedStorageConfig user claimName override (#928)", func
 				Files:  []string{"model-Q4_K_M.gguf"},
 			},
 		}
-		config := buildCachedStorageConfig(staged, isvcWithClaim(), "", "", "curl:8.18.0", 102, "")
+		config := buildCachedStorageConfig(staged, isvcWithClaim(), "", "", "curl:8.18.0", 102, ModelCachePrepAlways, "")
 		Expect(config.volumes[0].PersistentVolumeClaim.ClaimName).To(Equal("my-model-cache"))
 	})
 
 	It("does not affect an InferenceService without modelCache (shared PVC as before)", func() {
 		isvc := &inferencev1alpha1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "plain-isvc"}}
-		config := buildCachedStorageConfig(model, isvc, ModelCacheModeShared, "", "curl:8.18.0", 102, "")
+		config := buildCachedStorageConfig(model, isvc, ModelCacheModeShared, "", "curl:8.18.0", 102, ModelCachePrepAlways, "")
 		Expect(config.volumes[0].PersistentVolumeClaim.ClaimName).To(Equal(ModelCachePVCName))
 	})
 })
@@ -1718,7 +1718,7 @@ var _ = Describe("buildCachedStorageConfig RefreshPolicy plumbing", func() {
 			},
 			Status: inferencev1alpha1.ModelStatus{CacheKey: "abc123def456"},
 		}
-		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102, "")
+		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102, ModelCachePrepAlways, "")
 		cmd := config.initContainers[1].Command[2]
 		Expect(cmd).To(ContainSubstring("remote_size"))
 		Expect(cmd).To(ContainSubstring("kept cached copy"))
@@ -1729,7 +1729,7 @@ var _ = Describe("buildCachedStorageConfig RefreshPolicy plumbing", func() {
 			Spec:   inferencev1alpha1.ModelSpec{Source: "https://example.com/model.gguf"},
 			Status: inferencev1alpha1.ModelStatus{CacheKey: "abc123def456"},
 		}
-		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102, "")
+		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102, ModelCachePrepAlways, "")
 		cmd := config.initContainers[1].Command[2]
 		// Existence-only, not revalidation: the OnChange marker never appears.
 		// remote_size no longer discriminates the two paths, because the
@@ -1750,7 +1750,7 @@ var _ = Describe("cache prep init container (#855)", func() {
 	}
 
 	It("prep is present and ordered BEFORE model-downloader in the single-file path", func() {
-		config := buildCachedStorageConfig(cacheModel(), nil, "", "", "curl:8.18.0", 102, "")
+		config := buildCachedStorageConfig(cacheModel(), nil, "", "", "curl:8.18.0", 102, ModelCachePrepAlways, "")
 		Expect(config.initContainers).To(HaveLen(2))
 		Expect(config.initContainers[0].Name).To(Equal("model-cache-prep"))
 		Expect(config.initContainers[1].Name).To(Equal("model-downloader"))
@@ -1766,14 +1766,14 @@ var _ = Describe("cache prep init container (#855)", func() {
 			},
 			Status: inferencev1alpha1.ModelStatus{CacheKey: "abc123"},
 		}
-		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102, "")
+		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102, ModelCachePrepAlways, "")
 		Expect(config.initContainers).To(HaveLen(2))
 		Expect(config.initContainers[0].Name).To(Equal("model-cache-prep"))
 		Expect(config.initContainers[1].Name).To(Equal("model-downloader"))
 	})
 
 	It("DEFAULT case (no explicit podSecurityContext, defaultFSGroup 102): prep command is exactly 'chown 0:102 /models && chmod g+rwX /models'", func() {
-		config := buildCachedStorageConfig(cacheModel(), nil, "", "", "curl:8.18.0", 102, "")
+		config := buildCachedStorageConfig(cacheModel(), nil, "", "", "curl:8.18.0", 102, ModelCachePrepAlways, "")
 		prep := config.initContainers[0]
 		Expect(prep.Command).To(Equal([]string{"sh", "-c", "chown 0:102 /models && chmod g+rwX /models"}))
 		// No recursive flag anywhere in the command.
@@ -1788,7 +1788,7 @@ var _ = Describe("cache prep init container (#855)", func() {
 				},
 			},
 		}
-		config := buildCachedStorageConfig(cacheModel(), isvc, "", "", "curl:8.18.0", 102, "")
+		config := buildCachedStorageConfig(cacheModel(), isvc, "", "", "curl:8.18.0", 102, ModelCachePrepAlways, "")
 		prep := config.initContainers[0]
 		cmd := prep.Command[2]
 		Expect(cmd).To(ContainSubstring("chown 0:3000"))
@@ -1796,13 +1796,13 @@ var _ = Describe("cache prep init container (#855)", func() {
 	})
 
 	It("fsGroup<=0 case: prep command is 'chown 100:100 /models && chmod 770 /models'", func() {
-		config := buildCachedStorageConfig(cacheModel(), nil, "", "", "curl:8.18.0", 0, "")
+		config := buildCachedStorageConfig(cacheModel(), nil, "", "", "curl:8.18.0", 0, ModelCachePrepAlways, "")
 		prep := config.initContainers[0]
 		Expect(prep.Command).To(Equal([]string{"sh", "-c", "chown 100:100 /models && chmod 770 /models"}))
 	})
 
 	It("prep reuses initContainerImage (no hardcoded image)", func() {
-		config := buildCachedStorageConfig(cacheModel(), nil, "", "", "my-registry.io/init:v1.2.3", 102, "")
+		config := buildCachedStorageConfig(cacheModel(), nil, "", "", "my-registry.io/init:v1.2.3", 102, ModelCachePrepAlways, "")
 		prep := config.initContainers[0]
 		Expect(prep.Image).To(Equal("my-registry.io/init:v1.2.3"))
 		// And the downloader also uses the same image.
@@ -1811,7 +1811,7 @@ var _ = Describe("cache prep init container (#855)", func() {
 	})
 
 	It("prep SecurityContext: RunAsUser=0, AllowPrivilegeEscalation=false, Capabilities.Drop=[ALL], Capabilities.Add has CHOWN and FOWNER, ReadOnlyRootFilesystem=true, SeccompProfile.Type=RuntimeDefault", func() {
-		config := buildCachedStorageConfig(cacheModel(), nil, "", "", "curl:8.18.0", 102, "")
+		config := buildCachedStorageConfig(cacheModel(), nil, "", "", "curl:8.18.0", 102, ModelCachePrepAlways, "")
 		prep := config.initContainers[0]
 		sc := prep.SecurityContext
 		Expect(sc).NotTo(BeNil())
@@ -1843,7 +1843,7 @@ var _ = Describe("cache prep init container (#855)", func() {
 			},
 			Status: inferencev1alpha1.ModelStatus{CacheKey: "abc123"},
 		}
-		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102, "")
+		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102, ModelCachePrepAlways, "")
 		// The fail-closed path returns only the invalid-fileset init container,
 		// no prep.
 		Expect(config.initContainers).To(HaveLen(1))
@@ -1927,7 +1927,7 @@ var _ = Describe("buildOCIStorageConfig (#1379)", func() {
 
 	It("mounts the artifact as a read-only ImageVolume with no downloader and no cache PVC", func() {
 		ref := "oci://registry.defilan.net/models/qwen3-32b@sha256:" + strings.Repeat("a", 64)
-		config := buildModelStorageConfig(ociModel(ref), nil, "default", true, "", "", "curl:8.18.0", 102, nil, "")
+		config := buildModelStorageConfig(ociModel(ref), nil, "default", true, "", "", "curl:8.18.0", 102, ModelCachePrepAlways, nil, "")
 
 		Expect(config.initContainers).To(BeEmpty())
 		Expect(config.volumes).To(HaveLen(1))
@@ -1945,14 +1945,14 @@ var _ = Describe("buildOCIStorageConfig (#1379)", func() {
 	It("ignores the cache flag: an oci:// source never gets a cache PVC or a downloader even with useCache=true", func() {
 		config := buildModelStorageConfig(
 			ociModel("oci://registry.example.com/models/llama-3.1-8b:latest"),
-			nil, "default", true, ModelCacheModePerService, "", "curl:8.18.0", 102, nil, "")
+			nil, "default", true, ModelCacheModePerService, "", "curl:8.18.0", 102, ModelCachePrepAlways, nil, "")
 		Expect(config.initContainers).To(BeEmpty())
 		Expect(config.volumes[0].Image).NotTo(BeNil())
 	})
 
 	It("fails loudly with an init container when the reference is malformed", func() {
 		// No repository segment: parseOCISource rejects it.
-		config := buildModelStorageConfig(ociModel("oci://busybox:1.36"), nil, "default", true, "", "", "curl:8.18.0", 102, nil, "")
+		config := buildModelStorageConfig(ociModel("oci://busybox:1.36"), nil, "default", true, "", "", "curl:8.18.0", 102, ModelCachePrepAlways, nil, "")
 		Expect(config.volumes[0].Image).To(BeNil())
 		Expect(config.initContainers).To(HaveLen(1))
 		Expect(config.initContainers[0].Command).To(HaveLen(3))
@@ -1962,7 +1962,7 @@ var _ = Describe("buildOCIStorageConfig (#1379)", func() {
 	It("uses the primary file of a multi-file spec as the model path, with no per-file fetch", func() {
 		m := ociModel("oci://registry.example.com/models/sharded-gguf")
 		m.Spec.Files = []string{"weights/model-00001-of-00002.gguf", "weights/model-00002-of-00002.gguf"}
-		config := buildModelStorageConfig(m, nil, "default", true, "", "", "curl:8.18.0", 102, nil, "")
+		config := buildModelStorageConfig(m, nil, "default", true, "", "", "curl:8.18.0", 102, ModelCachePrepAlways, nil, "")
 
 		Expect(config.initContainers).To(BeEmpty())
 		Expect(config.modelPath).To(Equal("/model-source/weights/model-00001-of-00002.gguf"))

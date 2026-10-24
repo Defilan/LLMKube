@@ -83,6 +83,13 @@ const (
 	// ephemeral storage, or an emptyDir sizeLimit smaller than the model.
 	ReasonModelTransferOutOfSpace = "ModelTransferOutOfSpace"
 
+	// ReasonModelCacheNotWritable: the cache volume refused a write the
+	// downloader made (mkdir of the model's cache directory, or the download
+	// itself). On a cache-backed pod the usual cause is that the prep was
+	// turned off for storage that does not apply fsGroup, or a cache root the
+	// downloader's uid does not own.
+	ReasonModelCacheNotWritable = "ModelCacheNotWritable"
+
 	// ReasonStagedFilesNotCurrent: a pod was built before the Model controller
 	// recorded the glob expansion in status.stagedFiles, so the downloader
 	// refused to stage a pattern it cannot expand. The cause is the Model's
@@ -194,6 +201,20 @@ var modelTransferSignatures = []modelTransferSignature{
 		remedy: "raise spec.resources.ephemeralStorage (which also sizes the emptyDir) " +
 			"or give the model cache a larger volume",
 		matches: []string{"no space left on device", "disk quota exceeded"},
+	},
+	{
+		// Captured from curl 8.18.0 (the pinned init image) with a cache root
+		// the downloader cannot write: "mkdir: can't create directory
+		// '/models/<key>': Permission denied". A write failure inside curl
+		// prints only "curl: (23) ... on write", which is also a full disk, so
+		// that spelling is deliberately not matched on its own.
+		reason: ReasonModelCacheNotWritable,
+		remedy: "the downloader cannot write to the model cache. The cache-prep init container fixes ownership, " +
+			"and it is off when the operator runs with --model-cache-prep=never (chart value modelCache.prep): " +
+			"that setting is only right for storage that applies the pod fsGroup itself (a CSI driver with " +
+			"fsGroupPolicy File). Either turn the prep back on (modelCache.prep: always) or chown the cache root " +
+			"to the downloader's uid, for example with `llmkube cache prep`",
+		matches: []string{"permission denied"},
 	},
 	{
 		reason: ReasonModelSourceUnreachable,

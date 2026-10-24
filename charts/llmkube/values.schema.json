@@ -403,6 +403,11 @@
           "type": "string",
           "enum": ["ReadWriteOnce", "ReadOnlyMany", "ReadWriteMany", "ReadWriteOncePod"]
         },
+        "prep": {
+          "type": "string",
+          "enum": ["always", "never"],
+          "default": "always"
+        },
         "mountPath": { "type": "string", "pattern": "^/" },
         "annotations": {
           "type": "object",

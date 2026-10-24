@@ -67,6 +67,11 @@ type InferenceServiceReconciler struct {
 	ModelCacheMode     string
 	CACertConfigMap    string
 	InitContainerImage string
+	// ModelCachePrep is the operator-wide policy for the model-cache-prep init
+	// container (#2057): ModelCachePrepAlways (the default) injects it into
+	// every cache-backed pod, ModelCachePrepNever omits it for storage that
+	// applies the pod fsGroup itself. Set via --model-cache-prep.
+	ModelCachePrep string
 	// AllowedHostPathRoots is the operator-configured allowlist of absolute
 	// path prefixes under which local (/abs and file://) model sources — and
 	// therefore the HostPathVolumeSource they generate — are permitted. Empty

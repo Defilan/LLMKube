@@ -63,6 +63,43 @@ const (
 	ModelCacheModeShared     = "shared"
 )
 
+// ModelCachePrep is the operator-wide policy for the model-cache-prep init
+// container (#2057). The prep chowns the cache mount root so the non-root
+// downloader can write, which is the only root container in the model staging
+// path and the only reason a cache-backed pod needs more than Pod Security
+// `baseline`.
+const (
+	// ModelCachePrepAlways injects the prep into every cache-backed pod and
+	// prefetch Job. It is the default: without it the cache only works on
+	// storage where Kubernetes applies the pod fsGroup.
+	ModelCachePrepAlways = "always"
+	// ModelCachePrepNever never injects the prep. For storage that applies the
+	// pod fsGroup itself (a CSI driver with fsGroupPolicy File, or an FSGroup
+	// the operator set on an RWO volume), or a volume pre-provisioned with the
+	// downloader's ownership.
+	ModelCachePrepNever = "never"
+)
+
+// ValidateModelCachePrep rejects a policy value the operator does not know.
+// An unrecognized value must fail startup rather than fall back: an operator
+// asking for `never` and silently getting `always` would believe their cache
+// is restricted-compliant when it is not.
+func ValidateModelCachePrep(prep string) error {
+	switch prep {
+	case ModelCachePrepAlways, ModelCachePrepNever:
+		return nil
+	}
+	return fmt.Errorf("unknown cache prep policy %q: must be %q or %q", prep, ModelCachePrepAlways, ModelCachePrepNever)
+}
+
+// cachePrepIncluded reports whether the prep container belongs in a cache-backed
+// pod. The empty value renders the prep because a reconciler built without the
+// field (a test literal, or any embedding that constructs one by hand) must
+// render what it rendered before the setting existed.
+func cachePrepIncluded(prep string) bool {
+	return prep != ModelCachePrepNever
+}
+
 // resolveCacheMode maps an unset mode to the default (shared). An empty string
 // reaches the reconciler when the operator is run without --model-cache-mode
 // (e.g. ad-hoc envtest), so callers must funnel through this rather than
@@ -976,17 +1013,24 @@ func modelStagingErrorInitContainer(err error, model *inferencev1alpha1.Model, i
 }
 
 // cachePrepInitContainer returns the root-run prep init container that runs
-// BEFORE model-downloader in the cache-backed path. CSI drivers with
-// fsGroupPolicy=None (some NFS drivers, and CephFS when its driver is set that
-// way; ceph-csi defaults to File) never apply the pod fsGroup to the volume,
-// so the PVC root stays root:root 0755 and the non-root downloader (uid 100)
-// gets "permission denied" on mkdir. The prep chowns/chmods the mount root so
+// BEFORE model-downloader in the cache-backed path. Whether Kubernetes applies
+// the pod fsGroup to a volume is decided by the CSI driver's fsGroupPolicy:
+// None never applies it, so the PVC root stays root:root 0755 and the non-root
+// downloader (uid 101 in the default image) gets "permission denied" on mkdir;
+// an unset policy follows the ReadWriteOnceWithFSType default, which skips
+// ReadWriteMany volumes. File (ceph-csi's default) applies it and the prep only
+// re-asserts what kubelet already did. The prep chowns/chmods the mount root so
 // the downloader can write, without recursing over /models.
+//
+// The operator-wide --model-cache-prep=never policy (cachePrepIncluded) skips
+// this container entirely, which is how an operator on storage that applies
+// fsGroup, or a volume pre-provisioned with the downloader's ownership, runs
+// the cache under Pod Security restricted.
 //
 // When resolvedFSGroup > 0 the prep chowns to 0:<fsGroup> and grants group
 // rw on existing and future files/dirs (g+rwX). When resolvedFSGroup <= 0
-// (fsGroup disabled, e.g. OpenShift) the prep chowns to 100:100 (the
-// downloader's UID/GID) and sets 770 so only the downloader can write.
+// (fsGroup disabled, e.g. OpenShift) the prep chowns to 100:100 and sets 770
+// so only the downloader can write.
 //
 // Security: the prep runs as root (uid 0) with ALL capabilities dropped and
 // only CHOWN+FOWNER added, and is NOT privileged. Root is required, not
@@ -998,10 +1042,9 @@ func modelStagingErrorInitContainer(err error, model *inferencev1alpha1.Model, i
 // Running this init non-root broke model-cache-prep on fsGroupPolicy=None CSIs
 // in 0.8.20; see the regression note below. It still cannot satisfy PSA
 // "restricted" (which forbids adding any capability except NET_BIND_SERVICE,
-// and the chown of an unowned mount fundamentally needs CHOWN); see
-// docs/MODEL-CACHE.md "Security Considerations" for the restricted-PSA
-// alternatives (emptyDir store or a laxer policy; skipping the prep on
-// fsGroupPolicy=File drivers is #2057).
+// and the chown of an unowned mount fundamentally needs CHOWN), which is why
+// an operator whose storage does not need it sets --model-cache-prep=never
+// instead; see docs/MODEL-CACHE.md "PSA restricted".
 //
 // The prep reuses the configurable initContainerImage (no hardcoded busybox)
 // so air-gapped clusters that mirror initContainerImage are covered.
@@ -1257,7 +1300,7 @@ func applyInitContainerDiagnostics(containers []corev1.Container) {
 	}
 }
 
-func buildModelStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, namespace string, useCache bool, cacheMode string, caCertConfigMap string, initContainerImage string, defaultFSGroup int64, allowedHostPathRoots []string, hfEndpoint string) (cfg modelStorageConfig) {
+func buildModelStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, namespace string, useCache bool, cacheMode string, caCertConfigMap string, initContainerImage string, defaultFSGroup int64, prep string, allowedHostPathRoots []string, hfEndpoint string) (cfg modelStorageConfig) {
 	// Stamp crash diagnostics on whatever the branches below return. Done
 	// once here rather than at each construction site so a future storage
 	// path cannot be added without it (#1437).
@@ -1281,7 +1324,7 @@ func buildModelStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1al
 		return buildOCIStorageConfig(model, initContainerImage)
 	}
 	if useCache {
-		return buildCachedStorageConfig(model, isvc, cacheMode, caCertConfigMap, initContainerImage, defaultFSGroup, hfEndpoint)
+		return buildCachedStorageConfig(model, isvc, cacheMode, caCertConfigMap, initContainerImage, defaultFSGroup, prep, hfEndpoint)
 	}
 	return buildEmptyDirStorageConfig(model, isvc, namespace, caCertConfigMap, initContainerImage, hfEndpoint)
 }
@@ -1498,7 +1541,7 @@ func invalidFileSetStorageConfig(initImage string) modelStorageConfig {
 	}
 }
 
-func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, cacheMode string, caCertConfigMap string, initContainerImage string, defaultFSGroup int64, hfEndpoint string) modelStorageConfig {
+func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, cacheMode string, caCertConfigMap string, initContainerImage string, defaultFSGroup int64, prep string, hfEndpoint string) modelStorageConfig {
 	cacheDir := fmt.Sprintf("/models/%s", effectiveModelCacheKey(model))
 
 	// Resolve the fsGroup that the CSI will actually apply to the volume.
@@ -1558,18 +1601,19 @@ func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1a
 
 		addCACertVolume(&volumes, &initVolumeMounts, &cmd, caCertConfigMap)
 
-		initContainers := []corev1.Container{
-			cachePrepInitContainer(initContainerImage, resolvedFSGroup),
-			{
-				Name:            "model-downloader",
-				Image:           initContainerImage,
-				Command:         []string{"sh", "-c", cmd},
-				Env:             env,
-				EnvFrom:         modelEnvFrom(model),
-				VolumeMounts:    initVolumeMounts,
-				SecurityContext: initContainerSecurityContext(isvc),
-			},
+		initContainers := []corev1.Container{}
+		if cachePrepIncluded(prep) {
+			initContainers = append(initContainers, cachePrepInitContainer(initContainerImage, resolvedFSGroup))
 		}
+		initContainers = append(initContainers, corev1.Container{
+			Name:            "model-downloader",
+			Image:           initContainerImage,
+			Command:         []string{"sh", "-c", cmd},
+			Env:             env,
+			EnvFrom:         modelEnvFrom(model),
+			VolumeMounts:    initVolumeMounts,
+			SecurityContext: initContainerSecurityContext(isvc),
+		})
 
 		return modelStorageConfig{
 			modelPath:      modelPath,
@@ -1621,18 +1665,19 @@ func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1a
 	env := modelInitEnvVars(model.Spec.Source, cacheDir, modelPath, model.Spec.SHA256)
 	addCACertVolume(&volumes, &initVolumeMounts, &cmd, caCertConfigMap)
 
-	initContainers := []corev1.Container{
-		cachePrepInitContainer(initContainerImage, resolvedFSGroup),
-		{
-			Name:            "model-downloader",
-			Image:           initContainerImage,
-			Command:         []string{"sh", "-c", cmd},
-			Env:             env,
-			EnvFrom:         modelEnvFrom(model),
-			VolumeMounts:    initVolumeMounts,
-			SecurityContext: initContainerSecurityContext(isvc),
-		},
+	initContainers := []corev1.Container{}
+	if cachePrepIncluded(prep) {
+		initContainers = append(initContainers, cachePrepInitContainer(initContainerImage, resolvedFSGroup))
 	}
+	initContainers = append(initContainers, corev1.Container{
+		Name:            "model-downloader",
+		Image:           initContainerImage,
+		Command:         []string{"sh", "-c", cmd},
+		Env:             env,
+		EnvFrom:         modelEnvFrom(model),
+		VolumeMounts:    initVolumeMounts,
+		SecurityContext: initContainerSecurityContext(isvc),
+	})
 
 	return modelStorageConfig{
 		modelPath:      modelPath,

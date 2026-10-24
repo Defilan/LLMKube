@@ -176,6 +176,7 @@ func main() {
 	var modelCacheClass string
 	var modelCacheAccessMode string
 	var modelCacheMode string
+	var modelCachePrep string
 	var allowedHostPathRoots string
 	var allowedRemoteHosts string
 	var gpuSharingSharedPoolSelector string
@@ -201,6 +202,13 @@ func main() {
 		"Storage class for model cache PVCs (empty for default).")
 	flag.StringVar(&modelCacheAccessMode, "model-cache-access-mode", "ReadWriteOnce",
 		"Access mode for the shared model cache PVC (only used when --model-cache-mode=shared).")
+	flag.StringVar(&modelCachePrep, "model-cache-prep", controller.ModelCachePrepAlways,
+		"Whether to inject the root model-cache-prep init container into cache-backed pods and prefetch "+
+			"Jobs: always (default) chowns the cache root so the non-root downloader can write, which is "+
+			"required on storage that does not apply the pod fsGroup (a CSI driver with fsGroupPolicy None, "+
+			"or an unset policy on a ReadWriteMany volume); never omits it for storage that applies fsGroup "+
+			"itself or a cache pre-provisioned with the downloader's ownership, which is what lets a "+
+			"restricted Pod Security namespace admit the cache (#2057).")
 	flag.StringVar(&modelCacheMode, "model-cache-mode", controller.ModelCacheModeShared,
 		"Model cache provisioning mode: shared (default) uses a single cluster-wide "+
 			"llmkube-model-cache PVC the operator mounts and all InferenceServices share "+
@@ -406,6 +414,14 @@ func main() {
 	if federationRole != controller.FederationRoleHub && federationRole != controller.FederationRoleEdge {
 		setupLog.Error(fmt.Errorf("invalid value %q", federationRole),
 			"invalid --federation-role: must be \"hub\" or \"edge\"")
+		os.Exit(1)
+	}
+
+	// Validate --model-cache-prep up front: falling back to always for a
+	// value the operator typed would tell someone who asked for never that
+	// their cache is restricted-compliant when it is not.
+	if err := controller.ValidateModelCachePrep(modelCachePrep); err != nil {
+		setupLog.Error(err, "invalid --model-cache-prep")
 		os.Exit(1)
 	}
 
@@ -643,6 +659,7 @@ func main() {
 		ModelCacheAccessMode: modelCacheAccessMode,
 		ModelCacheMode:       modelCacheMode,
 		ModelCachePath:       modelCachePath,
+		ModelCachePrep:       modelCachePrep,
 	}
 	if reconcileTimeout > 0 {
 		modelReconciler.ReconcileDecorator = controller.WithReconcileDeadline(reconcileTimeout, ctrl.Log.WithName("model"))
@@ -660,6 +677,7 @@ func main() {
 		ModelCacheClass:       modelCacheClass,
 		ModelCacheAccessMode:  modelCacheAccessMode,
 		ModelCacheMode:        modelCacheMode,
+		ModelCachePrep:        modelCachePrep,
 		CACertConfigMap:       caCertConfigMap,
 		InitContainerImage:    initContainerImage,
 		DefaultFSGroup:        defaultFSGroup,

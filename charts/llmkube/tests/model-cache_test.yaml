@@ -177,3 +177,35 @@ tests:
       - notExists:
           path: spec.template.spec.volumes[?(@.name == "model-cache")]
         template: deployment.yaml
+
+  # --model-cache-prep is wired through from the chart value. Default is
+  # always: the operator injects the root prep into every cache-backed pod.
+  - it: passes the cache-prep policy to the operator (always by default)
+    template: deployment.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --model-cache-prep=always
+
+  - it: passes never to the operator when the cache prep is turned off
+    template: deployment.yaml
+    set:
+      modelCache.prep: never
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --model-cache-prep=never
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --model-cache-prep=always
+
+  # With caching disabled the flag is not passed at all: the operator's own
+  # default (always) applies, and no cache-backed pod exists to disagree.
+  - it: omits the cache-prep policy when caching is disabled
+    template: deployment.yaml
+    set:
+      modelCache.enabled: false
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --model-cache-prep=always

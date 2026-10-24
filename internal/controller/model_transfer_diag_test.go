@@ -133,6 +133,13 @@ func TestMatchModelTransferFailure_Signatures(t *testing.T) {
 			msg:        "sh: write error: No space left on device",
 			wantReason: ReasonModelTransferOutOfSpace,
 		},
+		{
+			// Captured from curl 8.18.0 with a /models root the downloader
+			// cannot write: the mkdir of the cache key dir fails first.
+			name:       "cache root the downloader cannot write",
+			msg:        "mkdir: can't create directory '/models/tripwire-key': Permission denied",
+			wantReason: ReasonModelCacheNotWritable,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
