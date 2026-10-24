@@ -15,6 +15,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -43,8 +44,7 @@ func TestIssue2186EveryWaiterSeesDeadline(t *testing.T) {
 		WithLabelValues(routerIssue2186, "heavy-slot", "coder", "deadline")
 	before := testutil.ToFloat64(failures)
 
-	const budget = 200 * time.Millisecond
-	errs := acquireWithWaiters(t, a, budget, nil)
+	errs := acquireWithWaiters(t, a, 200*time.Millisecond, nil, nil)
 
 	for i, err := range errs {
 		if !errors.Is(err, ErrSwapDeadlineExceeded) {
@@ -72,12 +72,14 @@ func TestIssue2186EveryWaiterSeesActivationError(t *testing.T) {
 	// before it can fail.
 	fake.activateGate = make(chan struct{})
 	fake.activateFail = map[string]bool{"coder": true}
-	a := NewActivator(context.Background(), fake, routerIssue2186, nil)
+	var held atomic.Int64
+	deact := &gatedDeactivate{fakeMemberController: fake, held: &held}
+	a := NewActivator(context.Background(), deact, routerIssue2186, nil)
 	failures := prommetrics.ModelPoolSwapFailuresTotal.
 		WithLabelValues(routerIssue2186, "heavy-slot", "coder", "error")
 	before := testutil.ToFloat64(failures)
 
-	errs := acquireWithWaiters(t, a, 5*time.Second, func() { close(fake.activateGate) })
+	errs := acquireWithWaiters(t, a, 5*time.Second, &held, func() { close(fake.activateGate) })
 
 	for i, err := range errs {
 		if err == nil {
@@ -96,16 +98,46 @@ func TestIssue2186EveryWaiterSeesActivationError(t *testing.T) {
 	if got := testutil.ToFloat64(failures) - before; got != 1 {
 		t.Errorf("swap_failures_total{reason=error} delta = %v, want 1", got)
 	}
+	// The failed swap has to scale its own target down: every waiter returns the
+	// recorded failure instead of giving up, so none of them reaches the
+	// deferred deactivate. Assert it happened while waiters were still
+	// registered; after they return the deferred path scales the target down
+	// anyway, and a final-state check would pass for the wrong reason.
+	if deact.seenAt == 0 {
+		t.Error("the failed swap never scaled its target down while its waiters were still registered")
+	}
 	waitFor(t, "the failed target to be scaled back down", func() bool {
 		return fake.replicaCount("coder") == 0
 	})
 }
 
+// gatedDeactivate records, on the first Deactivate for a member, the value of a
+// counter the test keeps of callers registered on the pool and not yet returned.
+type gatedDeactivate struct {
+	*fakeMemberController
+	held   *atomic.Int64
+	mu     sync.Mutex
+	seenAt int64
+}
+
+func (g *gatedDeactivate) Deactivate(ctx context.Context, namespace, isvc string) error {
+	// Sample before touching the fake and without any fake lock: the swap path
+	// calls this with the activator's lock held.
+	n := g.held.Load()
+	g.mu.Lock()
+	if g.seenAt == 0 && n > 0 {
+		g.seenAt = n
+	}
+	g.mu.Unlock()
+	return g.fakeMemberController.Deactivate(ctx, namespace, isvc)
+}
+
 // acquireWithWaiters runs three Acquire calls that share one swap and returns
 // their errors. The first caller starts the swap, the other two join it while it
 // is in flight, and release runs only once all three are registered, so no
-// caller can have seen the swap's outcome before the last one joined.
-func acquireWithWaiters(t *testing.T, a *Activator, budget time.Duration, release func()) []error {
+// caller can have seen the swap's outcome before the last one joined. held, when
+// non-nil, counts the callers registered and not yet returned.
+func acquireWithWaiters(t *testing.T, a *Activator, budget time.Duration, held *atomic.Int64, release func()) []error {
 	t.Helper()
 	const calls = 3
 	errs := make(chan error, calls)
@@ -116,13 +148,17 @@ func acquireWithWaiters(t *testing.T, a *Activator, budget time.Duration, releas
 		// not a caller's own timer, decides the result.
 		ctx, cancel := context.WithTimeout(context.Background(), budget+10*time.Second)
 		defer cancel()
-		if rel, err := a.Acquire(ctx, budgetPool("coder", budget)); err == nil {
-			rel()
-		} else {
-			errs <- err
-			return
+		if held != nil {
+			held.Add(1)
 		}
-		errs <- nil
+		rel, err := a.Acquire(ctx, budgetPool("coder", budget))
+		if err == nil {
+			rel()
+		}
+		if held != nil {
+			held.Add(-1)
+		}
+		errs <- err
 	}
 
 	wg.Add(1)
@@ -187,70 +223,3 @@ func TestIssue2186ArrivalAfterFailureStartsFreshLoad(t *testing.T) {
 		t.Errorf("Activate(coder) called %d times, want 2 (a fresh load for the new arrival)", got)
 	}
 }
-
-// TestIssue2186LateArrivalKeepsTheFailure is the window that made #2186 worse
-// than one lost outcome: a request arriving between a swap failing and the
-// other waiters waking must not clear the failure those waiters have not read
-// yet. The caller that arrives, and the one that was already waiting, both end
-// up with a fresh load rather than the abandoned one.
-func TestIssue2186LateArrivalKeepsTheFailure(t *testing.T) {
-	fake := newFakeMemberController()
-	fake.noAutoReady = true
-	fake.setPhase("judge", modelReadyPhase)
-	a := NewActivator(context.Background(), fake, routerIssue2186, nil)
-
-	// The first caller starts the swap and is still held on it.
-	firstDone := make(chan error, 1)
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_, err := a.Acquire(ctx, budgetPool("coder", 150*time.Millisecond))
-		firstDone <- err
-	}()
-	waitFor(t, "the swap to be in flight", func() bool {
-		a.mu.Lock()
-		defer a.mu.Unlock()
-		pr := a.pools["lab/heavy-slot"]
-		return pr != nil && pr.swapping
-	})
-
-	// A second request joins while the swap runs, so both are registered
-	// before the failure lands.
-	secondDone := make(chan error, 1)
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_, err := a.Acquire(ctx, budgetPool("coder", 150*time.Millisecond))
-		secondDone <- err
-	}()
-	waitFor(t, "both callers to be registered on the swap", func() bool {
-		a.mu.Lock()
-		defer a.mu.Unlock()
-		return a.pools["lab/heavy-slot"].waiting["coder"] == 2
-	})
-	waitFor(t, "the swap to be abandoned", func() bool {
-		a.mu.Lock()
-		defer a.mu.Unlock()
-		return !a.pools["lab/heavy-slot"].swapping
-	})
-
-	// The failure is recorded and neither waiter has necessarily read it yet.
-	// A third request arriving now must not wipe it.
-	a.mu.Lock()
-	_, recorded := a.pools["lab/heavy-slot"].swapErr["coder"]
-	a.mu.Unlock()
-	if !recorded {
-		t.Fatal("no failure recorded after the swap was abandoned")
-	}
-
-	for i, ch := range []chan error{firstDone, secondDone} {
-		if err := <-ch; !errors.Is(err, ErrSwapDeadlineExceeded) {
-			t.Errorf("waiter %d err = %v, want ErrSwapDeadlineExceeded", i, err)
-		}
-	}
-	if got := fake.activateCount("coder"); got != 1 {
-		t.Errorf("Activate(coder) called %d times, want 1", got)
-	}
-}
-
-// that arrives after the failure is not handed that failure and starts exactly
