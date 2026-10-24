@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
@@ -178,14 +179,6 @@ func appendMaxNumSeqsArgs(args []string, parallelSlots *int32, extraArgs []strin
 	return args, nil
 }
 
-// appendSpeculativeConfig renders the block as the one argument vLLM accepts
-// for speculative decoding. vLLM registers no per-field speculative flags: its
-// parser takes --speculative-config (JSON) and builds a dataclass that forbids
-// unknown keys (vllm/config/utils.py, extra="forbid"), so a key that does not
-// exist in the image you run fails the engine at startup. Method-specific keys
-// (draft_sample_method, prompt_lookup_max, ...) therefore belong in
-// spec.extraArgs as --speculative-config, which wins over this block, rather
-// than in typed fields this operator cannot version-check.
 // vllmSpeculativeArgSpellings are every extraArgs spelling that writes the same
 // speculative document the typed block renders: vLLM registers these flags as
 // descriptions of one SpeculativeConfig and raises when a key appears both in
@@ -197,9 +190,42 @@ var vllmSpeculativeArgSpellings = []string{"speculative-config", "-sc", "spec-me
 // extraArgsSetsVLLMSpeculative reports whether the user configures speculative
 // decoding themselves, in any of vLLM's spellings.
 func extraArgsSetsVLLMSpeculative(extraArgs []string) bool {
-	return hasMatchingExtraArgAny(extraArgs, vllmSpeculativeArgSpellings...)
+	return hasMatchingExtraArgAny(vllmFlagNames(extraArgs), vllmSpeculativeArgSpellings...)
 }
 
+// vllmFlagNames reduces each flag in args to the name vLLM's parser resolves it
+// to (vllm/utils/argparse_utils.py at v0.25.1). The parser rewrites
+// underscores to dashes in a long flag's name, so --spec_tokens is
+// --spec-tokens, and it merges a dotted flag such as
+// --speculative-config.prompt_lookup_max=4 into one --speculative-config
+// document it appends after every other argument. Matching the raw spelling
+// would render the typed block beside the user's flag: the first case fails the
+// engine at startup, and the second silently replaces the typed block with the
+// user's partial document. Values are dropped; only names are returned.
+func vllmFlagNames(args []string) []string {
+	names := make([]string, 0, len(args))
+	for _, a := range args {
+		if !strings.HasPrefix(a, "-") {
+			continue
+		}
+		name, _, _ := strings.Cut(a, "=")
+		name, _, _ = strings.Cut(name, ".")
+		if strings.HasPrefix(name, "--") {
+			name = strings.ReplaceAll(name, "_", "-")
+		}
+		names = append(names, name)
+	}
+	return names
+}
+
+// appendSpeculativeConfig renders the block as the one argument vLLM accepts
+// for speculative decoding. vLLM registers no per-field speculative flags: its
+// parser takes --speculative-config (JSON) and builds a dataclass that forbids
+// unknown keys (vllm/config/utils.py, extra="forbid"), so a key that does not
+// exist in the image you run fails the engine at startup. Method-specific keys
+// (draft_sample_method, prompt_lookup_max, ...) therefore belong in
+// spec.extraArgs as --speculative-config, which wins over this block, rather
+// than in typed fields this operator cannot version-check.
 func appendSpeculativeConfig(args []string, cfg *inferencev1alpha1.SpeculativeConfig, draftPath string, extraArgs []string) ([]string, error) {
 	if cfg == nil || cfg.Enabled == nil || !*cfg.Enabled {
 		return args, nil

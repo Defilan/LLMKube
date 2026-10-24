@@ -213,6 +213,68 @@ func TestAppendSpeculativeConfig(t *testing.T) {
 			extraArgs: []string{"-sc", `{"method":"dspark"}`},
 		},
 		{
+			name: "extraArgs --spec_tokens wins, because vLLM reads underscores as dashes",
+			cfg: &inferencev1alpha1.SpeculativeConfig{
+				Enabled: ptrBool(true),
+				Model:   "my-draft-cr",
+			},
+			draftPath: "/models/abc123",
+			extraArgs: []string{"--spec_tokens", "3"},
+		},
+		{
+			name: "extraArgs inline --speculative_config=... wins",
+			cfg: &inferencev1alpha1.SpeculativeConfig{
+				Enabled: ptrBool(true),
+				Method:  "mtp",
+			},
+			extraArgs: []string{`--speculative_config={"method":"dspark"}`},
+		},
+		{
+			name: "extraArgs dotted --speculative-config.key=value wins, because vLLM appends it as the whole document",
+			cfg: &inferencev1alpha1.SpeculativeConfig{
+				Enabled: ptrBool(true),
+				Method:  "ngram",
+			},
+			extraArgs: []string{"--speculative-config.prompt_lookup_max=4"},
+		},
+		{
+			name: "extraArgs dotted --speculative-config.key value wins",
+			cfg: &inferencev1alpha1.SpeculativeConfig{
+				Enabled: ptrBool(true),
+				Method:  "mtp",
+			},
+			extraArgs: []string{"--speculative-config.method", "ngram"},
+		},
+		{
+			name: "extraArgs dotted underscore --speculative_config.key=value wins",
+			cfg: &inferencev1alpha1.SpeculativeConfig{
+				Enabled: ptrBool(true),
+				Method:  "mtp",
+			},
+			extraArgs: []string{"--speculative_config.num_speculative_tokens=1"},
+		},
+		{
+			name: "extraArgs dotted short alias -sc.key=value wins",
+			cfg: &inferencev1alpha1.SpeculativeConfig{
+				Enabled: ptrBool(true),
+				Method:  "mtp",
+			},
+			extraArgs: []string{"-sc.method=ngram"},
+		},
+		{
+			name: "an unrelated flag whose value has a dot leaves the block in place",
+			cfg: &inferencev1alpha1.SpeculativeConfig{
+				Enabled:              ptrBool(true),
+				Method:               "mtp",
+				NumSpeculativeTokens: ptrInt32(1),
+			},
+			extraArgs: []string{"--served-model-name=glm-5.3", "--gpu_memory_utilization", "0.9"},
+			want: map[string]interface{}{
+				"method":                 "mtp",
+				"num_speculative_tokens": float64(1),
+			},
+		},
+		{
 			name: "a draft that nothing staged is an error, not an empty model",
 			cfg: &inferencev1alpha1.SpeculativeConfig{
 				Enabled: ptrBool(true),
