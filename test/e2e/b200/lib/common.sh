@@ -50,6 +50,100 @@ b200_float_ge() {
 # skipModelInit true the operator mounts no model storage and hands vLLM the
 # source string itself, which only works for a Hugging Face repo id.
 
+# Site rendering, for a cluster whose access path differs from the stock rows.
+# None of it changes the weights or image under test, so none of it is an
+# override, and none of it is published:
+#
+#   B200_NS                moves both objects to the run namespace (--namespace)
+#   B200_SOURCE_SECRET     downloads the weights through the operator with this
+#                          Secret (HF_TOKEN, and HF_ENDPOINT for a mirror) instead
+#                          of vLLM fetching them: adds the Model's
+#                          spec.sourceSecretRef and spec.files (config.json,
+#                          *.json, *.safetensors; a repository source stages
+#                          only listed files), sets skipModelInit to false and
+#                          drops vllmConfig.hfTokenSecretRef
+#   B200_MODEL_SPEC_FILE   lines spliced into the top of the Model spec
+#   B200_ISVC_SPEC_FILE    lines spliced into the top of the InferenceService spec
+#                          (node selectors, tolerations, modelCache)
+#
+# A spec file's lines are indented two spaces, as under spec:, and it may not set
+# a field the row already sets.
+
+# b200_site_active is true when any site rendering applies.
+b200_site_active() {
+  [ -n "${B200_SOURCE_SECRET:-}${B200_MODEL_SPEC_FILE:-}${B200_ISVC_SPEC_FILE:-}" ] && return 0
+  [ -n "${B200_NS:-}" ] && [ "$B200_NS" != "default" ]
+}
+
+# b200_spec_keys <yaml> <kind> prints the top-level spec field names of the
+# document of that kind.
+b200_spec_keys() {
+  printf '%s\n' "$1" | awk -v kind="$2" '
+    /^---$/ { cur = ""; inspec = 0; next }
+    /^kind: / { cur = $2 }
+    /^spec:$/ { inspec = (cur == kind); next }
+    /^[^ ]/ { inspec = 0 }
+    inspec && /^  [A-Za-z0-9_]+:/ { k = $1; sub(/:$/, "", k); print k }
+  '
+}
+
+# b200_splice_spec <yaml> <kind> <file> prints the YAML with the file's lines
+# inserted at the top of that kind's spec.
+b200_splice_spec() {
+  local yaml="$1" kind="$2" file="$3" key line
+  [ -f "$file" ] || b200_die "spec file for $kind not found: $file"
+  while IFS= read -r line; do
+    case "$line" in
+      ''|'  '*) ;;
+      *) b200_die "spec file $file: every line must be indented under spec:, got: $line" ;;
+    esac
+  done < "$file"
+  for key in $(b200_spec_keys "$(printf 'kind: %s\nspec:\n' "$kind"; cat "$file")" "$kind"); do
+    if b200_spec_keys "$yaml" "$kind" | grep -qx -- "$key"; then
+      b200_die "spec file $file: the row's $kind already sets $key"
+    fi
+  done
+  printf '%s\n' "$yaml" | awk -v kind="$kind" -v file="$file" '
+    /^---$/ { cur = "" }
+    /^kind: / { cur = $2 }
+    { print }
+    $0 == "spec:" && cur == kind && !done {
+      while ((getline l < file) > 0) print l
+      done = 1
+    }
+  '
+}
+
+# b200_render_site <yaml> prints the YAML with the site rendering applied.
+b200_render_site() {
+  local yaml="$1"
+  if [ -n "${B200_NS:-}" ] && [ "$B200_NS" != "default" ]; then
+    yaml="$(printf '%s\n' "$yaml" | sed "s|^  namespace: default\$|  namespace: $(b200_sed_escape "$B200_NS")|")"
+  fi
+  if [ -n "${B200_SOURCE_SECRET:-}" ]; then
+    yaml="$(printf '%s\n' "$yaml" | awk -v secret="$B200_SOURCE_SECRET" '
+      /^---$/ { cur = "" }
+      /^kind: / { cur = $2 }
+      { print }
+      cur == "Model" && /^  source: / {
+        print "  sourceSecretRef:"
+        print "    name: " secret
+        print "  files:"
+        print "  - config.json"
+        print "  - \"*.json\""
+        print "  - \"*.safetensors\""
+      }
+    ' | sed -e 's|^  skipModelInit: true$|  skipModelInit: false|' -e '/^    hfTokenSecretRef:$/,/^      key: /d')"
+  fi
+  if [ -n "${B200_MODEL_SPEC_FILE:-}" ]; then
+    yaml="$(b200_splice_spec "$yaml" Model "$B200_MODEL_SPEC_FILE")" || return 1
+  fi
+  if [ -n "${B200_ISVC_SPEC_FILE:-}" ]; then
+    yaml="$(b200_splice_spec "$yaml" InferenceService "$B200_ISVC_SPEC_FILE")" || return 1
+  fi
+  printf '%s\n' "$yaml"
+}
+
 # b200_override <row> <KEY> prints B200_ROW_<NN>_<KEY>, or nothing.
 b200_override() {
   local var
@@ -106,10 +200,16 @@ b200_render_manifest() {
     b200_require_once "$manifest" '^  image: ' "B200_VLLM_IMAGE"
     expr+=(-e "s|^  image: .*|  image: $(b200_sed_escape "$img")|")
   fi
+  local yaml
   if [ "${#expr[@]}" -eq 0 ]; then
-    cat "$manifest"
+    yaml="$(cat "$manifest")"
   else
-    sed "${expr[@]}" "$manifest"
+    yaml="$(sed "${expr[@]}" "$manifest")"
+  fi
+  if b200_site_active; then
+    b200_render_site "$yaml" || return 1
+  else
+    printf '%s\n' "$yaml"
   fi
 }
 
@@ -146,7 +246,11 @@ b200_standard_row() {
   printf '%s\n' "$rendered" | kubectl apply -f -
   kubectl wait --for=jsonpath='{.status.phase}'=Ready "inferenceservice/$isvc" \
     -n "$B200_NS" --timeout=1800s
-  llmkube benchmark "$isvc" -n "$B200_NS" -o json > "$out-benchmark.json"
+  # B200_BENCHMARK_ARGS adds benchmark flags, such as --port-forward when the
+  # harness runs outside the cluster and cannot reach the service endpoint.
+  local -a bench_args=()
+  read -r -a bench_args <<< "${B200_BENCHMARK_ARGS:-}"
+  llmkube benchmark "$isvc" -n "$B200_NS" -o json ${bench_args[@]+"${bench_args[@]}"} > "$out-benchmark.json"
 
   if [ "$(jq -r '.successful_runs' "$out-benchmark.json")" -lt 1 ]; then
     b200_log "row $row: FAIL: benchmark reported no successful runs"

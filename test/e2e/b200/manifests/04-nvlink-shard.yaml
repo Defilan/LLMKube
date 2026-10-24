@@ -12,7 +12,7 @@ metadata:
   name: b200-row-04
   namespace: default
 spec:
-  source: "RedHatAI/Llama-3.1-70B-Instruct-FP8"
+  source: "RedHatAI/Meta-Llama-3.1-70B-Instruct-FP8"
   format: safetensors
   quantization: fp8
   hardware:

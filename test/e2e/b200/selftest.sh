@@ -41,6 +41,16 @@ assert_contains() {
   fi
 }
 
+# assert_has_block matches a multi-line needle as one contiguous block.
+# assert_contains cannot: grep -F treats each needle line as its own pattern.
+assert_has_block() {
+  local hay="$1" needle="$2" name="$3"
+  case "$hay" in
+    *"$needle"*) ok "$name" ;;
+    *) bad "$name (expected the block: $needle)" ;;
+  esac
+}
+
 assert_eq() {
   local got="$1" want="$2" name="$3"
   if [ "$got" = "$want" ]; then
@@ -217,7 +227,7 @@ else
   ok "a staged source drops hfTokenSecretRef"
 fi
 r3="$(B200_ROW_02_SOURCE='pvc://models/llama-8b-fp8' B200_VLLM_IMAGE='registry.local/vllm:v0.31' b200_render_manifest 3 "$m3")"
-assert_contains "$r3" 'source: "RedHatAI/Llama-3.1-70B-Instruct-FP8"' "a row 2 source override leaves row 3's source alone"
+assert_contains "$r3" 'source: "RedHatAI/Meta-Llama-3.1-70B-Instruct-FP8"' "a row 2 source override leaves row 3's source alone"
 assert_contains "$r3" 'image: registry.local/vllm:v0.31' "the image override reaches every row"
 
 # Overrides: a Hugging Face repo id is not a staged source, so the runtime
@@ -240,6 +250,88 @@ assert_contains "$run4" "source=pvc://models/llama-8b-fp8 image=registry.local/v
 assert_eq "$(jq -r '.overrides' "$tmp/results-override/2.json")" "true" "the result records that overrides were used"
 assert_eq "$(jq -r '.model_source' "$tmp/results-override/2.json")" "pvc://models/llama-8b-fp8" "the result records the effective source"
 assert_eq "$(jq -r '.overrides' "$tmp/results/1.json")" "false" "a stock run records no overrides"
+
+# Site rendering: on a cluster that reaches Hugging Face only through a mirror,
+# the operator downloads the weights through a Secret (B200_SOURCE_SECRET), and
+# the cluster's scheduling and cache fields come from local spec files. The
+# namespace follows --namespace. None of it changes the weights or image under
+# test, so none of it is an override.
+site="$tmp/site"
+mkdir -p "$site"
+printf '  nodeSelector:\n    pool: gpu\n  tolerations:\n  - operator: Exists\n  modelCache:\n    claimName: model-cache\n    prefetch: true\n' > "$site/isvc.yaml"
+printf '  prefetchTolerations:\n  - operator: Exists\n' > "$site/model.yaml"
+rs="$(B200_NS=serving B200_SOURCE_SECRET=hf-mirror B200_ISVC_SPEC_FILE="$site/isvc.yaml" B200_MODEL_SPEC_FILE="$site/model.yaml" b200_render_manifest 2 "$m2")"
+rc=$?
+assert_eq "$rc" "0" "site rendering succeeds"
+model_doc="${rs%%kind: InferenceService*}"
+isvc_doc="${rs#*kind: InferenceService}"
+assert_has_block "$model_doc" "$(printf '  sourceSecretRef:\n    name: hf-mirror')" "the source Secret lands on the Model"
+assert_has_block "$model_doc" "$(printf '  files:\n  - config.json\n  - "*.json"\n  - "*.safetensors"')" "operator download stages the config, JSON and safetensors files"
+assert_has_block "$model_doc" "$(printf 'spec:\n  prefetchTolerations:\n  - operator: Exists')" "the Model spec file lands at the top of the Model spec"
+assert_has_block "$isvc_doc" "$(printf 'spec:\n  nodeSelector:\n    pool: gpu')" "the InferenceService spec file lands at the top of its spec"
+assert_has_block "$isvc_doc" "$(printf '  modelCache:\n    claimName: model-cache\n    prefetch: true')" "the cache claim reaches the InferenceService"
+assert_contains "$isvc_doc" 'skipModelInit: false' "operator download re-enables the model init container"
+for want in 'sourceSecretRef' 'hfTokenSecretRef' 'prefetchTolerations'; do
+  if printf '%s' "$isvc_doc" | grep -qF "$want"; then
+    bad "the InferenceService carries no $want"
+  else
+    ok "the InferenceService carries no $want"
+  fi
+done
+assert_eq "$(printf '%s\n' "$rs" | grep -c '^  namespace: serving$')" "2" "both objects move to the run namespace"
+assert_eq "$(printf '%s\n' "$rs" | grep -c 'namespace: default')" "0" "no object stays in default"
+assert_eq "$(b200_manifest_value "$rs" source)" "RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8" "site rendering keeps the stock source"
+assert_eq "$(b200_manifest_value "$rs" image)" "$(b200_manifest_value "$(cat "$m2")" image)" "site rendering keeps the stock image"
+assert_eq "$(B200_SOURCE_SECRET=hf-mirror B200_ISVC_SPEC_FILE="$site/isvc.yaml" b200_row_has_overrides 2)" "false" "site rendering is not an override"
+
+# Site rendering: a spec file may not set a field the row already sets, so it
+# cannot swap the image, resources or weights under test.
+printf '  resources:\n    gpu: 2\n' > "$site/clash.yaml"
+out="$( B200_ISVC_SPEC_FILE="$site/clash.yaml" b200_render_manifest 2 "$m2" 2>&1 )"
+rc=$?
+assert_ne_zero "$rc" "a spec file that repeats a row field fails"
+assert_contains "$out" "already sets resources" "the clash names the field"
+printf 'spec:\n  replicas: 2\n' > "$site/toplevel.yaml"
+out="$( B200_ISVC_SPEC_FILE="$site/toplevel.yaml" b200_render_manifest 2 "$m2" 2>&1 )"
+rc=$?
+assert_ne_zero "$rc" "a spec file with an unindented line fails"
+
+# Site rendering: dry-run reports the source Secret and records no override.
+run5="$( B200_SOURCE_SECRET=hf-mirror B200_ISVC_SPEC_FILE="$site/isvc.yaml" "$here/run-matrix.sh" --rows 2 --dry-run --namespace serving --out "$tmp/results-site" 2>&1 )"
+rc=$?
+assert_eq "$rc" "0" "dry-run with site rendering succeeds"
+assert_contains "$run5" "overrides=false" "dry-run with site rendering reports no override"
+assert_eq "$(jq -r '.overrides' "$tmp/results-site/2.json")" "false" "the result records no override for site rendering"
+
+# Live row path, with kubectl and llmkube stubbed: the site rendering is what
+# gets applied, the run namespace reaches every command, and
+# B200_BENCHMARK_ARGS reaches the benchmark, which cannot reach a ClusterIP
+# endpoint from outside the cluster without --port-forward.
+stub="$tmp/stub"
+mkdir -p "$stub/bin" "$tmp/live"
+cat > "$stub/bin/kubectl" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$stub/kubectl.args"
+if [ "\$1" = "apply" ]; then cat > "$stub/applied.yaml"; fi
+EOF
+cat > "$stub/bin/llmkube" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$stub/llmkube.args"
+cat "$B200_FIXTURES/benchmark-sample.json"
+EOF
+chmod +x "$stub/bin/kubectl" "$stub/bin/llmkube"
+cp "$B200_DOC" "$tmp/live/matrix.md"
+(
+  PATH="$stub/bin:$PATH" B200_DRY_RUN=0 B200_OUT="$tmp/live" B200_DOC="$tmp/live/matrix.md" B200_NS=serving \
+    B200_SOURCE_SECRET=hf-mirror B200_ISVC_SPEC_FILE="$site/isvc.yaml" B200_BENCHMARK_ARGS="--port-forward --iterations 3" \
+    b200_standard_row 1 b200-row-01 "$m1" 5
+) >/dev/null 2>&1
+rc=$?
+assert_eq "$rc" "0" "a stubbed live row passes"
+assert_contains "$(cat "$stub/applied.yaml" 2>/dev/null)" "name: hf-mirror" "the live row applies the site rendering"
+assert_contains "$(cat "$stub/kubectl.args" 2>/dev/null)" "-n serving" "the live row waits in the run namespace"
+assert_eq "$(cat "$stub/llmkube.args" 2>/dev/null)" "benchmark b200-row-01 -n serving -o json --port-forward --iterations 3" "the benchmark gets the run namespace and B200_BENCHMARK_ARGS"
+assert_eq "$(jq -r '.status' "$tmp/live/1.json" 2>/dev/null)" "pass" "the stubbed live row records a pass"
 
 # Publish with overrides: the matrix row carries the substitution once, even
 # after a re-run, so a substituted pass is never read as the stock row.

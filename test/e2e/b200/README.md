@@ -77,6 +77,39 @@ effective `model_source` and `image` in its result file, and a published
 matrix row carries a `(run with overrides: ...)` note, so a substituted run is
 never read as the stock row.
 
+## Running through a mirror, from outside the cluster
+
+Some clusters reach Hugging Face only through a mirror, and need scheduling and
+cache fields the stock rows do not carry. These variables change how a row is
+deployed and measured, not the weights or image under test, so they are not
+overrides and nothing about them is published:
+
+| Variable | Effect |
+|---|---|
+| `B200_SOURCE_SECRET` | The operator downloads the weights with this Secret (`HF_TOKEN`, plus `HF_ENDPOINT` for a mirror) instead of vLLM fetching them. Adds the Model's `sourceSecretRef` and `files` (`config.json`, `*.json`, `*.safetensors`), sets `skipModelInit: false`, and drops `vllmConfig.hfTokenSecretRef`. |
+| `B200_MODEL_SPEC_FILE` | Lines spliced into the top of each Model's `spec`, such as `prefetchNodeSelector`. |
+| `B200_ISVC_SPEC_FILE` | Lines spliced into the top of each InferenceService's `spec`, such as `nodeSelector`, `tolerations` and `modelCache`. |
+| `B200_BENCHMARK_ARGS` | Extra `llmkube benchmark` flags. Pass `--port-forward` when the harness runs outside the cluster. |
+
+`--namespace` moves both objects of every row to that namespace. A spec file's
+lines are indented two spaces, as under `spec:`, and it may not set a field the
+row already sets, so it cannot change the resources, image or weights under
+test. Keep site spec files out of the repository.
+
+```sh
+# The InferenceService waits for the weights to be cached before it takes a GPU.
+cat > /tmp/isvc-spec.yaml <<'EOF'
+  tolerations:
+  - operator: Exists
+  modelCache:
+    claimName: model-cache
+    prefetch: true
+EOF
+B200_SOURCE_SECRET=huggingface B200_ISVC_SPEC_FILE=/tmp/isvc-spec.yaml \
+B200_BENCHMARK_ARGS=--port-forward \
+  test/e2e/b200/run-matrix.sh --rows 1 --namespace serving
+```
+
 ## Preflight gate
 
 Before any row runs, `lib/preflight.sh` asserts that the node meets the floors
