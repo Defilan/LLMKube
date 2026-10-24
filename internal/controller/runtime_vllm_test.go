@@ -234,6 +234,39 @@ func TestVLLMBuildArgs(t *testing.T) {
 			contains: []FlagCheck{{"--kv-cache-dtype", "fp8_e4m3"}},
 		},
 		{
+			// vLLM resolves the bare "fp8" alias itself (fp8_e4m3 on CUDA),
+			// so the flag must carry the value the recipe asked for.
+			model: model,
+			name:  "kvCacheDtype=fp8 emits flag unrewritten",
+			spec: &inferencev1alpha1.InferenceServiceSpec{
+				Runtime:    "vllm",
+				ModelRef:   "test-model",
+				VLLMConfig: &inferencev1alpha1.VLLMConfig{KVCacheDtype: ptrString("fp8")},
+			},
+			contains:    []FlagCheck{{"--kv-cache-dtype", "fp8"}},
+			notContains: []string{"fp8_e4m3"},
+		},
+		{
+			model: model,
+			name:  "kvCacheDtype=float16 emits flag",
+			spec: &inferencev1alpha1.InferenceServiceSpec{
+				Runtime:    "vllm",
+				ModelRef:   "test-model",
+				VLLMConfig: &inferencev1alpha1.VLLMConfig{KVCacheDtype: ptrString("float16")},
+			},
+			contains: []FlagCheck{{"--kv-cache-dtype", "float16"}},
+		},
+		{
+			model: model,
+			name:  "kvCacheDtype=bfloat16 emits flag",
+			spec: &inferencev1alpha1.InferenceServiceSpec{
+				Runtime:    "vllm",
+				ModelRef:   "test-model",
+				VLLMConfig: &inferencev1alpha1.VLLMConfig{KVCacheDtype: ptrString("bfloat16")},
+			},
+			contains: []FlagCheck{{"--kv-cache-dtype", "bfloat16"}},
+		},
+		{
 			model: model,
 			name:  "kvCacheCustomDtype=turbo2 emits flag (vLLM v0.20+ TurboQuant 2-bit)",
 			spec: &inferencev1alpha1.InferenceServiceSpec{

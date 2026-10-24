@@ -160,7 +160,7 @@ These are project changes the LLMKube codebase, Helm chart, or docs need to abso
 **LANDED (#1375).** `InferenceServiceSpec.VLLMConfig.Quantization` accepts
 `awq;gptq;squeezellm;fp8;nvfp4;mxfp4;compressed-tensors`.
 
-- FP8 (E4M3, E5M2) values pass through cleanly; `kvCacheDtype` separately accepts `fp8_e5m2` / `fp8_e4m3`.
+- FP8 (E4M3, E5M2) values pass through cleanly; `kvCacheDtype` separately accepts `fp8`, `fp8_e5m2`, `fp8_e4m3`, `float16` and `bfloat16` (#2191; `fp8` is vLLM's platform-resolved alias for E4M3 on CUDA).
 - **`mxfp4` was added in #1375** (the OCP standard 4-bit format, with broader vLLM support than NVFP4); `nvfp4` was already present.
 - The field's GoDoc records the per-runtime notes, the sm_100/sm_120 hardware requirement, and the vLLM >= v0.25.0 floor.
 - Conversion paths: NVFP4 has ready-made checkpoints published under `nvidia/*-NVFP4` on Hugging Face — prefer those to a local conversion. For local conversion the tool is **`NVIDIA/Model-Optimizer`** (PyPI `nvidia-modelopt`), **renamed from `NVIDIA/TensorRT-Model-Optimizer`**; the old URL 301-redirects. MXFP4 is the OCP standard.

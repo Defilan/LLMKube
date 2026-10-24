@@ -14,8 +14,9 @@ Long-context inference is bandwidth-bound on the KV cache, not the weights. At f
 | llama.cpp | turbo4 (fork) | 4.25 | ~8.5 GB | Decode-heavy agentic workloads on Metal |
 | llama.cpp | turbo3 (fork) | 3.25 | ~6.5 GB | Long-context prefill on Metal |
 | vLLM | auto (default) | follows dtype | varies | Reference / baseline |
-| vLLM | fp8_e4m3 | 8 | ~16 GB | Production agentic on H100/L4 |
+| vLLM | fp8 / fp8_e4m3 | 8 | ~16 GB | Production agentic on H100/L4 |
 | vLLM | fp8_e5m2 | 8 | ~16 GB | Same scale, different exponent bias |
+| vLLM | float16 / bfloat16 | 16 | ~32 GB | Unquantized cache, pinned explicitly |
 | vLLM | turbo2 (v0.20+) | 2 | ~4 GB | Maximum context per VRAM |
 
 ## Two runtimes, two fields each
@@ -41,12 +42,14 @@ K and V are independent. Asymmetric `cacheTypeK: q8_0` + `cacheTypeCustomV: turb
 ```yaml
 spec:
   vllmConfig:
-    kvCacheDtype: fp8_e4m3        # enum: auto, fp8_e5m2, fp8_e4m3
+    kvCacheDtype: fp8              # enum: auto, fp8_e5m2, fp8_e4m3, fp8, float16, bfloat16
     # Or the custom escape hatch (turbo2 from vLLM v0.20+, future variants)
     kvCacheCustomDtype: turbo2
 ```
 
 vLLM does not split K and V into separate flags — `--kv-cache-dtype` controls both.
+
+`fp8` is the spelling vLLM's own recipes use, and vLLM resolves it per platform: it is `fp8_e4m3` on CUDA and ROCm and `fp8_inc` on Intel Gaudi. LLMKube passes whichever value you set through unchanged rather than rewriting the alias. `float16` and `bfloat16` pin an unquantized cache, which is how you opt out of an fp8 default on models that set one (DeepSeek-V3.2 and its descendants). An fp8 KV cache takes its scales from the checkpoint; without them vLLM assumes scales of 1.0, which can cost accuracy, so prefer a checkpoint whose scales are calibrated.
 
 ## When to use which field
 
@@ -54,8 +57,8 @@ vLLM does not split K and V into separate flags — `--kv-cache-dtype` controls 
 |---|---|
 | A standard llama.cpp cache type (q8_0, iq4_nl, etc.) | `cacheTypeK` / `cacheTypeV` (enum-validated, catches typos at API-server admission) |
 | TurboQuant turbo3/turbo4 on Metal or AmesianX tbqp3 on CUDA | `cacheTypeCustomK` / `cacheTypeCustomV` |
-| Standard vLLM auto/fp8 | `kvCacheDtype` (enum-validated) |
-| TurboQuant turbo2 on vLLM v0.20+, or any future cache format | `kvCacheCustomDtype` |
+| Standard vLLM auto/fp8/fp8_*/float16/bfloat16 | `kvCacheDtype` (enum-validated) |
+| `fp8_ds_mla`, `nvfp4`, the `turboquant_*` and `*_per_token_head` types, or any value newer than your vLLM image's enum | `kvCacheCustomDtype` |
 
 The custom fields skip CRD enum validation. The runtime image / binary must understand the value or the underlying server fails to start with a clear error. LLMKube does not pre-validate the strings so it can support any fork-specific value without an LLMKube release.
 
