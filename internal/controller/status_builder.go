@@ -392,6 +392,7 @@ func (r *InferenceServiceReconciler) updateStatusWithSchedulingInfo(
 			// churn, not an error: requeue and recompute against the latest
 			// object rather than logging a spurious failure. controller-runtime
 			// re-runs immediately with the updated resourceVersion.
+			//nolint:staticcheck // SA1019: keep the rate-limited retry on a write conflict; RequeueAfter would swap backoff for a fixed delay.
 			return ctrl.Result{Requeue: true}, nil
 		}
 		log.Error(err, "Failed to update InferenceService status")

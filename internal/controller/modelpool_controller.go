@@ -243,6 +243,7 @@ func (r *ModelPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 	if err := r.updateStatus(ctx, pool, statusBefore, members, owner, swapping, deferReason); err != nil {
 		if apierrors.IsConflict(err) {
+			//nolint:staticcheck // SA1019: keep the rate-limited retry on a write conflict; RequeueAfter would swap backoff for a fixed delay.
 			return ctrl.Result{Requeue: true}, nil
 		}
 		log.Error(err, "update ModelPool status")
@@ -579,6 +580,7 @@ func (r *ModelPoolReconciler) markMetalUnsupported(ctx context.Context, pool *in
 	}
 	if err := r.Status().Patch(ctx, pool, client.MergeFrom(before)); err != nil {
 		if apierrors.IsConflict(err) {
+			//nolint:staticcheck // SA1019: keep the rate-limited retry on a write conflict; RequeueAfter would swap backoff for a fixed delay.
 			return ctrl.Result{Requeue: true}, nil
 		}
 		return ctrl.Result{}, err
@@ -721,6 +723,7 @@ func (r *ModelPoolReconciler) markDegraded(ctx context.Context, pool *inferencev
 	}
 	if err := r.Status().Patch(ctx, pool, client.MergeFrom(before)); err != nil {
 		if apierrors.IsConflict(err) {
+			//nolint:staticcheck // SA1019: keep the rate-limited retry on a write conflict; RequeueAfter would swap backoff for a fixed delay.
 			return ctrl.Result{Requeue: true}, nil
 		}
 		return ctrl.Result{}, err
