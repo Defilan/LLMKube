@@ -99,6 +99,7 @@ func TestVLLMBuildArgs(t *testing.T) {
 				"--kv-cache-dtype",
 				"--max-num-batched-tokens",
 				"--model",
+				"--speculative-config",
 				"--speculative-model",
 			},
 		},
@@ -118,6 +119,7 @@ func TestVLLMBuildArgs(t *testing.T) {
 				"--gpu-memory-utilization",
 				"--kv-cache-dtype",
 				"--max-num-batched-tokens",
+				"--speculative-config",
 				"--speculative-model",
 			},
 		},
@@ -401,26 +403,27 @@ func TestVLLMBuildArgs(t *testing.T) {
 		},
 		{
 			model: model,
-			name:  "speculative enabled+model emits both flags",
+			name:  "speculative method and tokens render one --speculative-config",
 			spec: &inferencev1alpha1.InferenceServiceSpec{
 				Runtime:  "vllm",
 				ModelRef: "test-model",
 				VLLMConfig: &inferencev1alpha1.VLLMConfig{
 					Speculative: &inferencev1alpha1.SpeculativeConfig{
 						Enabled:              ptrBool(true),
-						Model:                "Qwen/Qwen3.6-4B",
+						Method:               "dspark",
 						NumSpeculativeTokens: ptrInt32(4),
 					},
 				},
 			},
 			contains: []FlagCheck{
-				{"--speculative-model", "Qwen/Qwen3.6-4B"},
-				{"--num-speculative-tokens", "4"},
+				{"--speculative-config", `{"method":"dspark","num_speculative_tokens":4}`},
 			},
+			exactlyOnce: []string{"--speculative-config"},
+			notContains: []string{"--speculative-model", "--num-speculative-tokens"},
 		},
 		{
 			model: model,
-			name:  "speculative enabled without model skips both flags",
+			name:  "speculative enabled without model or method skips the flag",
 			spec: &inferencev1alpha1.InferenceServiceSpec{
 				Runtime:  "vllm",
 				ModelRef: "test-model",
@@ -431,7 +434,7 @@ func TestVLLMBuildArgs(t *testing.T) {
 					},
 				},
 			},
-			notContains: []string{"--speculative-model", "--num-speculative-tokens"},
+			notContains: []string{"--speculative-config", "--speculative-model", "--num-speculative-tokens"},
 		},
 		{
 			model: model,
@@ -442,11 +445,11 @@ func TestVLLMBuildArgs(t *testing.T) {
 				VLLMConfig: &inferencev1alpha1.VLLMConfig{
 					Speculative: &inferencev1alpha1.SpeculativeConfig{
 						Enabled: ptrBool(false),
-						Model:   "Qwen/Qwen3.6-4B",
+						Method:  "dspark",
 					},
 				},
 			},
-			notContains: []string{"--speculative-model", "--num-speculative-tokens"},
+			notContains: []string{"--speculative-config", "--speculative-model", "--num-speculative-tokens"},
 		},
 		{
 			model: model,
@@ -861,7 +864,22 @@ func TestValidateVLLMConfig(t *testing.T) {
 			wantReason: "",
 		},
 		{
-			name: "speculative enabled without model reports SpeculativeMissingModel",
+			name: "speculative enabled with a method and no draft model is valid",
+			isvc: &inferencev1alpha1.InferenceService{
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					Runtime: "vllm",
+					VLLMConfig: &inferencev1alpha1.VLLMConfig{
+						Speculative: &inferencev1alpha1.SpeculativeConfig{
+							Enabled: ptrBool(true),
+							Method:  "dspark",
+						},
+					},
+				},
+			},
+			wantReason: "",
+		},
+		{
+			name: "speculative enabled without model or method reports SpeculativeMissingModel",
 			isvc: &inferencev1alpha1.InferenceService{
 				Spec: inferencev1alpha1.InferenceServiceSpec{
 					Runtime: "vllm",
@@ -871,6 +889,55 @@ func TestValidateVLLMConfig(t *testing.T) {
 				},
 			},
 			wantReason: "SpeculativeMissingModel",
+		},
+		{
+			name: "a draft model under skipModelInit reports SpeculativeDraftNotStaged",
+			isvc: &inferencev1alpha1.InferenceService{
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					Runtime:       "vllm",
+					SkipModelInit: ptrBool(true),
+					VLLMConfig: &inferencev1alpha1.VLLMConfig{
+						Speculative: &inferencev1alpha1.SpeculativeConfig{
+							Enabled: ptrBool(true),
+							Model:   "draft-model",
+						},
+					},
+				},
+			},
+			wantReason: "SpeculativeDraftNotStaged",
+		},
+		{
+			name: "skipModelInit with only a method is valid: nothing needs staging",
+			isvc: &inferencev1alpha1.InferenceService{
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					Runtime:       "vllm",
+					SkipModelInit: ptrBool(true),
+					VLLMConfig: &inferencev1alpha1.VLLMConfig{
+						Speculative: &inferencev1alpha1.SpeculativeConfig{
+							Enabled: ptrBool(true),
+							Method:  "dspark",
+						},
+					},
+				},
+			},
+			wantReason: "",
+		},
+		{
+			name: "skipModelInit with an extraArgs --speculative-config is valid",
+			isvc: &inferencev1alpha1.InferenceService{
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					Runtime:       "vllm",
+					SkipModelInit: ptrBool(true),
+					ExtraArgs:     []string{"--speculative-config", `{"method":"dspark"}`},
+					VLLMConfig: &inferencev1alpha1.VLLMConfig{
+						Speculative: &inferencev1alpha1.SpeculativeConfig{
+							Enabled: ptrBool(true),
+							Model:   "draft-model",
+						},
+					},
+				},
+			},
+			wantReason: "",
 		},
 		{
 			name: "cpuOffloadGB set surfaces CPUOffloadUnverified",

@@ -1,0 +1,52 @@
+# Oracles for the vLLM speculative-decoding argument.
+#
+# The operator renders spec.vllmConfig.speculative as one --speculative-config
+# JSON document. These files are the pinned engine's own answer to "what may
+# appear in that document", captured from the upstream source, so the test
+# asserts against vLLM's parser rather than against our reading of it (#1031).
+#
+# spec-fields.txt
+#   Source: vllm-project/vllm @ tag v0.25.1 (the tag VLLMBackend.DefaultImage
+#   pins, vllm/vllm-openai:v0.25.1), file vllm/config/speculative.py,
+#   `class SpeculativeConfig` through the last field (line ~230).
+#   Extracted with:
+#     gh api -H 'Accept: application/vnd.github.raw' \
+#       'repos/vllm-project/vllm/contents/vllm/config/speculative.py?ref=v0.25.1' \
+#       | awk '/^class SpeculativeConfig:/{f=1} f && /^    [a-z_]+:/ {split($1,a,":"); print a[1]} f && /^RejectionSampleMethod/ {exit}'
+#
+#   The class is a pydantic dataclass built by vllm/config/utils.py:69
+#   (ConfigDict(extra="forbid")), so a key outside this list is a startup
+#   error, not a warning. That is why only keys present here are typed:
+#   enable_adaptive_verification exists in v0.32.0 only.
+enforce_eager
+num_speculative_tokens
+model
+method
+draft_tensor_parallel_size
+tensor_parallel_size
+quantization
+moe_backend
+attention_backend
+max_model_len
+revision
+code_revision
+disable_padded_drafter_batch
+use_local_argmax_reduction
+use_heterogeneous_vocab
+prompt_lookup_max
+prompt_lookup_min
+parallel_drafting
+target_model_config
+target_parallel_config
+num_speculative_tokens_per_batch_size
+draft_model_config
+draft_parallel_config
+suffix_decoding_max_tree_depth
+suffix_decoding_max_cached_requests
+suffix_decoding_max_spec_factor
+suffix_decoding_min_token_prob
+draft_load_config
+rejection_sample_method
+synthetic_acceptance_rates
+synthetic_acceptance_length
+draft_sample_method

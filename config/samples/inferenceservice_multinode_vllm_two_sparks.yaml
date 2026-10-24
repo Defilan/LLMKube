@@ -40,8 +40,13 @@ spec:
     - "2"
     # Speculative decoding with the drafter folded into this checkpoint raised
     # single-stream decode from 25 to 37 tok/s on the ring for a third of the KV
-    # cache; the CRD's speculative field covers separate draft models only, so
-    # it goes through extraArgs:
+    # cache. The drafter ships inside the checkpoint, so the typed route is
+    # vllmConfig.speculative {enabled, method: dspark, numSpeculativeTokens};
+    # this spec keeps the extraArgs form because the method-specific keys below
+    # (draft_sample_method, rejection_sample_method, adaptive verification) have
+    # no typed field and extraArgs wins over the block. adaptive verification
+    # exists only in the custom image pinned above, not in the operator's
+    # default image, and vLLM's config parser rejects keys it does not know:
     # - --speculative-config={"method":"dspark","model":"/model-source/snapshots/<hash>","num_speculative_tokens":3,"draft_sample_method":"probabilistic","enable_adaptive_verification":false}
   env:
     - name: HF_HUB_OFFLINE

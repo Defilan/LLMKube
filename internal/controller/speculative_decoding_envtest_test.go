@@ -218,6 +218,46 @@ var _ = Describe("InferenceService draft-model speculative decoding", func() {
 			}
 			Expect(draftModelRefFor(isvc)).To(BeEmpty())
 		})
+
+		// The vLLM draft rides the same fail-closed gate, so it needs the same
+		// watch: a vLLM service waiting on its draft must be enqueued when the
+		// draft goes Ready, not left Pending until the resync (#1528).
+		It("enqueues a vllm service when its speculative draft Model changes", func() {
+			draftModel := &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: "vllm-spec-watch-draft", Namespace: "default"},
+				Spec: inferencev1alpha1.ModelSpec{
+					Source:   "https://example.com/draft.gguf",
+					Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "cpu"},
+				},
+			}
+			Expect(k8sClient.Create(ctx, draftModel)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, draftModel) })
+
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: "vllm-draft-watcher", Namespace: "default"},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					// Deliberately a DIFFERENT target: only the draft ref can
+					// match this Model.
+					ModelRef: "some-other-target",
+					Runtime:  "vllm",
+					VLLMConfig: &inferencev1alpha1.VLLMConfig{
+						Speculative: &inferencev1alpha1.SpeculativeConfig{
+							Enabled: ptrBool(true),
+							Model:   draftModel.Name,
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, isvc) })
+
+			ref, field := draftWeightsRefFor(isvc)
+			Expect(ref).To(Equal(draftModel.Name))
+			Expect(field).To(Equal("spec.vllmConfig.speculative.model"))
+			Expect(reconciler.findInferenceServicesForModel(ctx, draftModel)).To(ContainElement(
+				reconcile.Request{NamespacedName: types.NamespacedName{
+					Name: "vllm-draft-watcher", Namespace: "default"}}))
+		})
 	})
 
 	// Ground truth for the pod-shape invariants: the apiserver's own

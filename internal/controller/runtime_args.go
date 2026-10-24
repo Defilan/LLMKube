@@ -17,7 +17,6 @@ limitations under the License.
 package controller
 
 import (
-	"fmt"
 	"strings"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
@@ -31,11 +30,24 @@ const (
 )
 
 func hasMatchingExtraArg(extraArgs []string, argName string) bool {
-	arg := fmt.Sprintf("--%s", argName)
-	inlineArg := fmt.Sprintf("--%s=", argName)
-	for _, v := range extraArgs {
-		if v == arg || strings.HasPrefix(v, inlineArg) {
-			return true
+	return hasMatchingExtraArgAny(extraArgs, argName)
+}
+
+// hasMatchingExtraArgAny reports whether any spelling of the named flags is
+// present, in either the "--name value" or "--name=value" form. It exists for
+// flags vLLM registers under a short alias as well as a long name
+// (--speculative-config / -sc): matching only the long spelling would let a
+// user set the same option twice.
+func hasMatchingExtraArgAny(extraArgs []string, names ...string) bool {
+	for _, name := range names {
+		flag := name
+		if !strings.HasPrefix(flag, "-") {
+			flag = "--" + flag
+		}
+		for _, v := range extraArgs {
+			if v == flag || strings.HasPrefix(v, flag+"=") {
+				return true
+			}
 		}
 	}
 	return false

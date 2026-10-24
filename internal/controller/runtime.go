@@ -26,7 +26,7 @@ type RuntimeBackend interface {
 
 	// BuildArgs renders the runtime's argv. draftPath is the in-container path
 	// to speculative-decoding draft weights, or "" when the service configures
-	// none; only LlamaCppBackend consumes it.
+	// none; consumed by LlamaCppBackend and VLLMBackend.
 	BuildArgs(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, modelPath string, draftPath string, port int32) []string
 
 	// BuildProbes returns startup, liveness, and readiness probes.

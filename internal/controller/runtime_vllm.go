@@ -93,7 +93,7 @@ func (b *VLLMBackend) DisableServiceLinks() bool { return true }
 // whose zero value matches vLLM's own default are only emitted when the user
 // set them to true. This keeps generated pod specs minimal and lets us track
 // vLLM upstream default changes without needing an operator release.
-func (b *VLLMBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, modelPath string, _ string, port int32) []string {
+func (b *VLLMBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, modelPath string, draftPath string, port int32) []string {
 	source := modelPath
 	if source == "" {
 		// Serve path: hand vLLM the bare "org/name[@rev]" repo id, not a resolve
@@ -138,7 +138,7 @@ func (b *VLLMBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, model 
 		args = appendEnableChunkedPrefill(args, cfg.EnableChunkedPrefill)
 		args = appendMaxNumBatchedTokens(args, cfg.MaxNumBatchedTokens)
 		args = appendAttentionBackend(args, cfg.AttentionBackend)
-		args, err = appendSpeculativeModel(args, cfg.Speculative)
+		args, err = appendSpeculativeConfig(args, cfg.Speculative, draftPath, isvc.Spec.ExtraArgs)
 		if err != nil {
 			vllmLog.Info(
 				err.Error(),
@@ -195,7 +195,7 @@ func (b *VLLMBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, model 
 // metav1.Condition on the InferenceService status.
 //
 // Only one (reason, message) is returned, so check ordering is precedence:
-// SpeculativeMissingModel (a flag that gets skipped entirely) outranks
+// the speculative checks (both are flags that get skipped entirely) outrank
 // CPUOffloadUnverified (a flag with an open upstream reliability report).
 func ValidateVLLMConfig(isvc *inferencev1alpha1.InferenceService) (reason, message string) {
 	if isvc == nil || isvc.Spec.VLLMConfig == nil {
@@ -203,9 +203,20 @@ func ValidateVLLMConfig(isvc *inferencev1alpha1.InferenceService) (reason, messa
 	}
 	cfg := isvc.Spec.VLLMConfig
 	if cfg.Speculative != nil && cfg.Speculative.Enabled != nil && *cfg.Speculative.Enabled {
-		if cfg.Speculative.Model == "" {
+		if cfg.Speculative.Model == "" && cfg.Speculative.Method == "" {
 			return "SpeculativeMissingModel",
-				"spec.vllmConfig.speculative.enabled is true but spec.vllmConfig.speculative.model is empty; speculative decoding flags will be skipped"
+				"spec.vllmConfig.speculative.enabled is true but neither model nor method is set; vLLM rejects a speculative config without one, so the flags will be skipped"
+		}
+		// skipModelInit declines staging, so the draft's weights are not in
+		// the pod and the path handed to vLLM would not resolve. A vLLM
+		// backend always NeedsModelInit, so skipModelInit is the only way its
+		// pod stages nothing (operatorStagesModel, runtime_hf_mirror.go).
+		// extraArgs is exempt: a user who sets --speculative-config themselves
+		// may point at weights they mount some other way.
+		if cfg.Speculative.Model != "" && !extraArgsSetsVLLMSpeculative(isvc.Spec.ExtraArgs) &&
+			isvc.Spec.SkipModelInit != nil && *isvc.Spec.SkipModelInit {
+			return "SpeculativeDraftNotStaged",
+				"spec.vllmConfig.speculative.model is set but spec.skipModelInit is true, so the operator stages no draft weights and vLLM cannot load them; speculative decoding flags will be skipped"
 		}
 	}
 	// TODO(#1320): remove once vllm-project/vllm#48468 ships in DefaultImage.
