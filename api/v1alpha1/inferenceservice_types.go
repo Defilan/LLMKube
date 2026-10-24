@@ -2088,10 +2088,13 @@ type SGLangConfig struct {
 	// that: Qwen3.5-family hybrid models on Blackwell get triton while the
 	// prefix cache runs without the mamba extra buffer, which is slow on long
 	// prompts; flashinfer is the typed fix (see the SGLang on Blackwell guide).
-	// The values are SGLang v0.5.15's --attention-backend choices. flash_attn
-	// is not one (SGLang exits with an invalid-choice error); it stays
-	// accepted so existing objects remain valid, and the SGLangSpecValid
-	// condition reports it. Maps to SGLang --attention-backend flag.
+	// The values are the --attention-backend choices SGLang accepted through
+	// v0.5.19. flash_attn is not one (SGLang exits with an invalid-choice
+	// error); it stays accepted so existing objects remain valid, and the
+	// SGLangSpecValid condition reports it. SGLang v0.5.20 removed cutlass_mla
+	// and dual_chunk_flash_attn: the default image rejects them, they stay
+	// accepted for a service pinned to an older image, and the same condition
+	// reports them. Maps to SGLang --attention-backend flag.
 	// +kubebuilder:validation:Enum=triton;torch_native;flex_attention;dsa;dsv4;cutlass_mla;fa3;fa4;flashinfer;flashmla;trtllm_mla;cutedsl_mla;tokenspeed_mla;trtllm_mha;dual_chunk_flash_attn;aiter;wave;intel_amx;ascend;intel_xpu;flash_attn
 	// +optional
 	AttentionBackend string `json:"attentionBackend,omitempty"`

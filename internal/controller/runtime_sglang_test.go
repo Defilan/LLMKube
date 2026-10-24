@@ -18,6 +18,7 @@ package controller
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -810,6 +811,26 @@ func TestValidateSGLangConfig(t *testing.T) {
 			wantReason: "AttentionBackendUnsupported",
 		},
 		{
+			name: "cutlass_mla reports AttentionBackendRemoved",
+			isvc: &inferencev1alpha1.InferenceService{
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					Runtime:      "sglang",
+					SGLangConfig: &inferencev1alpha1.SGLangConfig{AttentionBackend: "cutlass_mla"},
+				},
+			},
+			wantReason: "AttentionBackendRemoved",
+		},
+		{
+			name: "dual_chunk_flash_attn reports AttentionBackendRemoved",
+			isvc: &inferencev1alpha1.InferenceService{
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					Runtime:      "sglang",
+					SGLangConfig: &inferencev1alpha1.SGLangConfig{AttentionBackend: "dual_chunk_flash_attn"},
+				},
+			},
+			wantReason: "AttentionBackendRemoved",
+		},
+		{
 			// The pod cannot start at all with flash_attn, which outranks a
 			// speculative misconfiguration that only skips flags.
 			name: "flash_attn outranks a speculative misconfiguration",
@@ -929,6 +950,27 @@ func TestValidateSGLangConfig(t *testing.T) {
 			}
 			if reason != "" && message == "" {
 				t.Errorf("expected non-empty message when reason is set, got empty")
+			}
+		})
+	}
+}
+
+// TestValidateSGLangConfigRemovedBackendMessage pins what a user with a
+// removed backend needs to act (#2213): which value, which release dropped
+// it, and the older image that still accepts it.
+func TestValidateSGLangConfigRemovedBackendMessage(t *testing.T) {
+	for _, backend := range []string{"cutlass_mla", "dual_chunk_flash_attn"} {
+		t.Run(backend, func(t *testing.T) {
+			_, message := ValidateSGLangConfig(&inferencev1alpha1.InferenceService{
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					Runtime:      "sglang",
+					SGLangConfig: &inferencev1alpha1.SGLangConfig{AttentionBackend: backend},
+				},
+			})
+			for _, want := range []string{backend, "v0.5.20", "lmsysorg/sglang:v0.5.19-cu129"} {
+				if !strings.Contains(message, want) {
+					t.Errorf("message %q does not mention %q", message, want)
+				}
 			}
 		})
 	}
