@@ -473,9 +473,11 @@ func draftWeightsRefFor(isvc *inferencev1alpha1.InferenceService) (string, strin
 	return "", ""
 }
 
-// draftModelRefFor is the llama.cpp half of draftWeightsRefFor, kept so the
-// callers that only ever spoke about speculativeDecoding.draftModelRef read
-// the same.
+// draftModelRefFor returns the draft Model for whichever runtime's block
+// resolves in precedence order (see draftWeightsRefFor). Its only production
+// caller is the Model watch mapping, which depends on this reaching the vLLM
+// block as well, or a service waiting on that draft is only enqueued by the
+// resync (#1528).
 func draftModelRefFor(isvc *inferencev1alpha1.InferenceService) string {
 	ref, _ := draftWeightsRefFor(isvc)
 	return ref

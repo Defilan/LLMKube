@@ -318,12 +318,14 @@ With the field set:
   (or keeps its live Deployment as it is), and no Job runs. That covers
   model caching disabled on the operator, a runtime the operator does not
   stage (TGI, `generic` without `stageModel`, `skipModelInit: true`), a
-  `speculativeDecoding.draftModelRef` (the draft is not prefetched), a
-  `multiNode` member with its own `modelCache.claimName` (that member's pod
-  mounts a claim the prefetch does not fill), and a source the downloader
-  does not stage ahead of time (`s3://`). The field
-  is `PrefetchNotApplicable`, and not waited for, only where nothing
-  downloads at serve time: Metal, `pvc://`, `oci://` and local sources.
+  `spec.speculativeDecoding.draftModelRef` or a `spec.vllmConfig.speculative.model`
+  (the draft is not prefetched, so its downloader would run on the serving
+  node), a `multiNode` member with its own `modelCache.claimName` (that
+  member's pod mounts a claim the prefetch does not fill), and a source the
+  downloader does not stage ahead of time (`s3://`).
+  The field is `PrefetchNotApplicable`, and not waited for, only where
+  nothing downloads at serve time: Metal, `pvc://`, `oci://` and local
+  sources.
 
 Applied together by GitOps, the pair above is safe in either order: the
 Model names the claim, the service inherits or repeats it, and the service

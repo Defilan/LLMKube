@@ -262,9 +262,10 @@ type ModelCacheSpec struct {
 	// mounted) and pre-staged sources (pvc://, oci://, local paths). A
 	// request the pods could not consume is refused and held as
 	// PrefetchUnsupported: model caching disabled on the operator, a runtime
-	// the operator does not stage, a speculativeDecoding draft model, a
-	// multiNode member with its own modelCache.claimName, or a source the
-	// downloader does not stage ahead of time (s3://).
+	// the operator does not stage, a spec.speculativeDecoding.draftModelRef or a
+	// spec.vllmConfig.speculative.model, a multiNode member with its own
+	// modelCache.claimName, or a source the downloader does not stage ahead
+	// of time (s3://).
 	// +optional
 	Prefetch bool `json:"prefetch,omitempty"`
 }

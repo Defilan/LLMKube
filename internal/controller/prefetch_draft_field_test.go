@@ -28,8 +28,9 @@ import (
 // TestPrefetchDraftRefusalNamesTheField covers the prefetch gate's new input:
 // a vLLM draft Model cannot be covered by a prefetch either (its downloader
 // runs on the serving node), and the refusal has to name the field the user
-// actually set. The llama.cpp message is asserted verbatim because it is the
-// pre-existing behavior for that input class and must not drift.
+// actually set. The llama.cpp case pins the message body for that input class;
+// the field-path prefix is deliberately not pinned, because the full path is
+// what the controller writes into status.
 func TestPrefetchDraftRefusalNamesTheField(t *testing.T) {
 	// A cache key makes the Model otherwise prefetchable, so the draft branch
 	// is the one that decides.
@@ -46,7 +47,7 @@ func TestPrefetchDraftRefusalNamesTheField(t *testing.T) {
 		wantMsg string
 	}{
 		{
-			name: "llama.cpp draftModelRef keeps its message",
+			name: "llama.cpp draftModelRef keeps its message body",
 			spec: inferencev1alpha1.InferenceServiceSpec{
 				Runtime: "llamacpp",
 				SpeculativeDecoding: &inferencev1alpha1.SpeculativeDecodingSpec{
