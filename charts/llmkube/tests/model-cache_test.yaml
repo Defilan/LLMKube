@@ -208,4 +208,7 @@ tests:
     asserts:
       - notContains:
           path: spec.template.spec.containers[0].args
+          content: --model-cache-prep=never
+      - notContains:
+          path: spec.template.spec.containers[0].args
           content: --model-cache-prep=always

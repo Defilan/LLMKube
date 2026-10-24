@@ -203,22 +203,6 @@ var modelTransferSignatures = []modelTransferSignature{
 		matches: []string{"no space left on device", "disk quota exceeded"},
 	},
 	{
-		// Captured from curl 8.18.0 (the pinned init image) with a cache root
-		// the downloader cannot write: "mkdir: can't create directory
-		// '/models/<key>': Permission denied". A write failure inside curl
-		// prints only "curl: (23) ... on write", which is also a full disk, so
-		// that spelling is deliberately not matched on its own. Only a pod
-		// that mounts the model-cache PVC gets this diagnosis: the remedy is
-		// about the cache, not about an emptyDir or a CA bundle.
-		reason: ReasonModelCacheNotWritable,
-		remedy: "the downloader cannot write to the model cache. The cache-prep init container fixes ownership, " +
-			"and it is off when the operator runs with --model-cache-prep=never (chart value modelCache.prep): " +
-			"that setting is only right for storage that applies the pod fsGroup itself (a CSI driver with " +
-			"fsGroupPolicy File). Either turn the prep back on (modelCache.prep: always) or chown the cache root " +
-			"to the downloader's uid, for example with `llmkube cache prep`",
-		matches: []string{"permission denied"},
-	},
-	{
 		reason: ReasonModelSourceUnreachable,
 		remedy: "check the endpoint address, cluster DNS, and any NetworkPolicy or egress restriction",
 		matches: []string{
@@ -227,6 +211,25 @@ var modelTransferSignatures = []modelTransferSignature{
 			"connection refused",
 			"connection timed out",
 		},
+	},
+	{
+		// Captured from curl 8.18.0 (the pinned init image) with a cache root
+		// the downloader cannot write: "mkdir: can't create directory
+		// '/models/<key>': Permission denied". A write failure inside curl
+		// prints only "curl: (23) ... on write", which is also a full disk, so
+		// that spelling is deliberately not matched on its own.
+		//
+		// It comes last so a more specific cause wins when a message carries
+		// both. It only fires for a container that writes the cache
+		// (writesModelCache): the prefetched serving pod mounts the same claim
+		// read-only and this remedy does not apply to it.
+		reason: ReasonModelCacheNotWritable,
+		remedy: "the downloader cannot write to the model cache. The cache-prep init container fixes ownership, " +
+			"and it is off when the operator runs with --model-cache-prep=never (chart value modelCache.prep): " +
+			"that setting is only right for storage that applies the pod fsGroup itself (a CSI driver with " +
+			"fsGroupPolicy File). Either turn the prep back on (modelCache.prep: always) or chown the cache root " +
+			"to the downloader's uid, for example with `llmkube cache prep`",
+		matches: []string{"permission denied"},
 	},
 }
 
@@ -279,6 +282,8 @@ func isGeneratedInitContainer(name string) bool {
 func findModelTransferFailure(pods []corev1.Pod) (nodeName, reason, matchedLine string, found bool) {
 	for i := range pods {
 		pod := &pods[i]
+		// One pod-level answer, reused per container: does anything here
+		// mount a model cache at all.
 		cacheBacked := podMountsModelCache(pod)
 		for j := range pod.Status.InitContainerStatuses {
 			cs := &pod.Status.InitContainerStatuses[j]
@@ -300,11 +305,11 @@ func findModelTransferFailure(pods []corev1.Pod) (nodeName, reason, matchedLine 
 					continue
 				}
 				if r, line, ok := matchModelTransferFailure(term.Message); ok {
-					// The cache remedy only applies to a pod that writes a
-					// shared cache: an emptyDir mount has no cache-prep to
-					// turn on, so leave that failure unlabelled rather than
-					// point the reader at a setting for another storage path.
-					if r == ReasonModelCacheNotWritable && !cacheBacked {
+					// The cache remedy needs both: a container that writes
+					// the cache (model-verify only reads it) and a pod that
+					// mounts one (an emptyDir store has no cache-prep to
+					// turn on).
+					if r == ReasonModelCacheNotWritable && !(writesModelCache(cs.Name) && cacheBacked) {
 						continue
 					}
 					return pod.Spec.NodeName, r, line, true
@@ -324,6 +329,14 @@ func podMountsModelCache(pod *corev1.Pod) bool {
 		}
 	}
 	return false
+}
+
+// writesModelCache reports whether a generated init container writes the model
+// cache, so a cache-write failure can only come from it. model-verify is the
+// exception among the containers that mount the cache: it runs on the
+// read-only prefetched mount and never creates anything.
+func writesModelCache(name string) bool {
+	return name == "model-cache-prep" || name == "model-downloader"
 }
 
 // initContainersCompleted reports whether any pod has got past every generated

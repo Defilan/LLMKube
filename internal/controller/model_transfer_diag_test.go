@@ -227,6 +227,38 @@ func TestFindModelTransferFailure(t *testing.T) {
 		}
 	})
 
+	// The prefetched serving pod mounts the same claim read-only and runs
+	// model-verify, which never writes to it: a permission denied there is
+	// not a cache-ownership problem. Built through the production builder so
+	// the container name is the real one.
+	t.Run("cache permission failure on the read-only prefetched pod is not labelled with the cache remedy", func(t *testing.T) {
+		cfg := buildPrefetchedStorageConfig(cachePrepTripwireModel(), cachePrepTripwireIsvc(), ModelCacheModeShared,
+			"docker.io/curlimages/curl:8.18.0", nil)
+		if len(cfg.initContainers) != 1 || cfg.initContainers[0].Name != "model-verify" {
+			t.Fatalf("prefetched initContainers = %v, want [model-verify]", containerNames(cfg.initContainers))
+		}
+		pod := initPod("node-a",
+			terminatedInit("model-verify", 1, "sha256sum: can't open '/models/k/m.gguf': Permission denied"))
+		pod.Spec.Volumes = cfg.volumes
+		if _, reason, _, found := findModelTransferFailure([]corev1.Pod{pod}); found {
+			t.Errorf("read-only prefetched pod diagnosed as %q; model-verify never writes the cache", reason)
+		}
+	})
+
+	// The cache signature runs last, so a message that also names a specific
+	// cause keeps that cause rather than the generic cache remedy. Matched
+	// directly on the message: findModelTransferFailure reads the last
+	// termination before the current one, so a pod-level fixture would test
+	// precedence between attempts, not between signatures.
+	t.Run("a specific cause wins over the cache remedy", func(t *testing.T) {
+		reason, _, ok := matchModelTransferFailure(
+			"mkdir: can't create directory '/models/k': Permission denied\n" +
+				"curl: (60) SSL certificate problem: unable to get local issuer certificate")
+		if !ok || reason != ReasonModelSourceUntrusted {
+			t.Fatalf("ok=%v reason=%q, want %q", ok, reason, ReasonModelSourceUntrusted)
+		}
+	})
+
 	t.Run("ignores a clean exit", func(t *testing.T) {
 		pods := []corev1.Pod{initPod("node-a",
 			terminatedInit("model-downloader", 0, "Model downloaded successfully"))}

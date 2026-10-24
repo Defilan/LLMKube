@@ -129,6 +129,29 @@ func TestDraftCachePrepFollowsPolicy(t *testing.T) {
 	assertNoRootContainer(t, dep.Spec.Template.Spec.InitContainers)
 }
 
+// A draft with no cache of its own mounts an emptyDir and never had a prep;
+// under never the target still must not keep one.
+func TestDraftUncachedKeepsNoPrep(t *testing.T) {
+	draft := cachePrepTripwireModel()
+	draft.Name = "tripwire-uncached-draft"
+	draft.Status.CacheKey = ""
+	draft.Status.Path = ""
+
+	isvc := cachePrepTripwireIsvc()
+	isvc.Spec.SpeculativeDecoding = &inferencev1alpha1.SpeculativeDecodingSpec{
+		Type: "draft-dspark", DraftModelRef: draft.Name,
+	}
+	r := cachePrepTripwireISvcReconciler()
+	r.ModelCachePrep = ModelCachePrepNever
+	names := containerNames(r.constructDeployment(isvc, cachePrepTripwireModel(), draft, 1, "", "").Spec.Template.Spec.InitContainers)
+	if slices.Contains(names, "model-cache-prep") || slices.Contains(names, "draft-model-cache-prep") {
+		t.Fatalf("initContainers = %v, want no prep", names)
+	}
+	if !slices.Contains(names, "draft-model-downloader") {
+		t.Fatalf("initContainers = %v, want a draft downloader", names)
+	}
+}
+
 // Under never the prefetch Job must be Pod Security restricted compliant: no
 // root container, pod-level seccomp, and every container carrying a numeric
 // non-root uid. A named user + runAsNonRoot is refused by the kubelet, which
@@ -223,10 +246,13 @@ func TestPrefetchJobAlwaysUnchanged(t *testing.T) {
 	}
 }
 
-// The invariant the prefetch uid exists for: whatever prepares the cache, the
-// prefetch downloader and the serving downloader are the same user. A serving
-// pod that has to write into a directory the prefetch created (mode 0755, no
-// group write) would get Permission denied otherwise.
+// What the pinned prefetch uid buys: for the default image, and for the pod
+// context the docs prescribe, the prefetch downloader and the serving
+// downloader are the same user. A serving pod that has to write into a
+// directory the prefetch created (mode 0755, no group write) would get
+// Permission denied if they diverged. A custom --init-container-image still
+// leaves the serving side to the image while the prefetch stages as
+// initContainerUID; that is documented in docs/MODEL-CACHE.md.
 func TestPrefetchDownloaderMatchesServingDownloaderUID(t *testing.T) {
 	mr := cachePrepTripwireModelReconciler()
 	mr.ModelCachePrep = ModelCachePrepNever

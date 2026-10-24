@@ -976,7 +976,7 @@ The prep is the **compatibility implementation** for these backends, and the ope
 
 Use `never` only when you know the cache's ownership is right without the prep: a CSI driver with `fsGroupPolicy: File` and a pod that sets `fsGroup` (kubelet applies only the pod's fsGroup), or a claim you pre-provisioned with the downloader's ownership. A supplied `spec.podSecurityContext` replaces the operator's default entirely, so `fsGroup` must be restated there. Then the cache-backed pods contain no root container at all, which is what a `restricted` namespace needs, and the prefetch Job additionally carries `runAsNonRoot` with a numeric uid, `allowPrivilegeEscalation: false`, `ALL` dropped, and a pod-level `seccompProfile: RuntimeDefault`.
 
-Changing the value rolls every cache-backed serving pod once, because the pod template changes. A prefetch Job already running finishes under the setting it started with.
+Changing the value rolls every cache-backed serving pod once, because the pod template changes. A prefetch Job whose pod has already started finishes under the setting it started with. One that has not started a pod yet keeps the template it was created with, so under `restricted` its pods are refused until the Job is deleted and rebuilt (or its `ttlSecondsAfterFinished` expires). Under `never` the prefetch Job's containers run as uid 101, the default `curlimages/curl` user, whatever `--init-container-image` is set to.
 
 `auto` (resolve the storage class and skip the prep only when the driver applies `fsGroup` itself) is a planned follow-up; the flag and the chart schema reject it today.
 
