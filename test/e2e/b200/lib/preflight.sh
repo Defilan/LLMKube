@@ -12,6 +12,25 @@
 # comparison floor and is checked separately as an exact match.
 PF_FLOOR_KEYS="nvidiaDriver cudaToolkit nccl gpuOperator k8sDevicePlugin dcgmExporter"
 
+# Rows whose assertions read the DCGM exporter: row 5 (Blackwell counters) and
+# row 10 (runbooks triggered by DCGM alerts). Its floor exists for them; the
+# serving rows never scrape DCGM, so a run that names none of these rows skips
+# it instead of refusing to run.
+PF_DCGM_ROWS="5 10"
+
+# pf_rows_need_dcgm <rows> is true when the comma-separated row list is empty
+# (assert everything) or names a row in PF_DCGM_ROWS.
+pf_rows_need_dcgm() {
+  local rows="$1" r d
+  [ -n "$rows" ] || return 0
+  for r in $(printf '%s' "$rows" | tr ',' ' '); do
+    for d in $PF_DCGM_ROWS; do
+      [ "$r" = "$d" ] && return 0
+    done
+  done
+  return 1
+}
+
 # pf_floor_value <floors-file> <key> prints the raw floor string, e.g.
 # ">= 580.173.02 (R580 LTS; R570 is EOL)".
 pf_floor_value() {
@@ -91,14 +110,20 @@ pf_floor_satisfied() {
   esac
 }
 
-# pf_assert_floors <floors-file> <measured-file> asserts every floor and the
-# Fabric Manager exact match. Prints a PREFLIGHT line per check and returns 1
-# when any floor fails or could not be read.
+# pf_assert_floors <floors-file> <measured-file> [rows] asserts every floor and
+# the Fabric Manager exact match. With a comma-separated row list, the DCGM
+# exporter floor is asserted only if a listed row reads DCGM. Prints a
+# PREFLIGHT line per check and returns 1 when any floor fails or could not be
+# read.
 pf_assert_floors() {
-  local floors="$1" measured="$2"
+  local floors="$1" measured="$2" rows="${3:-}"
   local key raw meas rc=0
 
   for key in $PF_FLOOR_KEYS; do
+    if [ "$key" = "dcgmExporter" ] && ! pf_rows_need_dcgm "$rows"; then
+      b200_log "PREFLIGHT SKIP: dcgmExporter not read by rows $rows (only rows ${PF_DCGM_ROWS// /, } read DCGM)"
+      continue
+    fi
     raw="$(pf_floor_value "$floors" "$key")"
     if [ -z "$raw" ]; then
       b200_log "PREFLIGHT FAIL: $key has no floor in $floors"
@@ -172,13 +197,14 @@ pf_collect_live() {
   pf_emit "$out" fabricManager "${B200_FABRIC_MANAGER:-}"
 }
 
-# pf_preflight_live asserts the floors against this host's readings.
+# pf_preflight_live [rows] asserts the floors the named rows need against this
+# host's readings.
 pf_preflight_live() {
-  local tmp rc=0
+  local rows="${1:-}" tmp rc=0
   tmp="$(mktemp)"
   pf_collect_live "$tmp"
   b200_log "preflight: floors from $PF_FLOORS_FILE, readings from $tmp"
-  pf_assert_floors "$PF_FLOORS_FILE" "$tmp" || rc=$?
+  pf_assert_floors "$PF_FLOORS_FILE" "$tmp" "$rows" || rc=$?
   rm -f "$tmp"
   return $rc
 }

@@ -86,6 +86,10 @@ the Fabric Manager version matches the driver exactly. A Fabric Manager
 mismatch silently degrades NVLink5 to PCIe with no error surface, which is why
 it is a gate rather than a row assertion.
 
+The DCGM exporter floor is the exception: only rows 5 and 10 read DCGM, so it
+is asserted only when `--rows` includes one of them. A run of the serving rows
+on a node below it logs `PREFLIGHT SKIP: dcgmExporter` and continues.
+
 A reading the harness cannot take is reported as unverified and fails the
 gate. It is never treated as a pass.
 

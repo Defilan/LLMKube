@@ -1,0 +1,10 @@
+# Measured platform versions: compliant except the DCGM exporter, which is
+# below its floor. Only the rows that read DCGM (5 and 10) need it, so a run of
+# rows 1-3 passes the gate and a run that includes row 5 or 10 does not.
+nvidiaDriver=580.173.02
+cudaToolkit=13.3.1
+nccl=2.30.4
+gpuOperator=v26.3.3
+k8sDevicePlugin=v0.19.3
+dcgmExporter=4.5.3-4.8.2
+fabricManager=580.173.02

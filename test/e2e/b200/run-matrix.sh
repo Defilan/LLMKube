@@ -89,7 +89,7 @@ if [ "$dry_run" = "1" ]; then
   pf_preflight_selfcheck || b200_die "preflight self-check failed; harness wiring is broken"
 else
   b200_require_cmd kubectl llmkube
-  pf_preflight_live || b200_die "preflight gate failed; refusing to run rows"
+  pf_preflight_live "$rows_spec" || b200_die "preflight gate failed; refusing to run rows"
 fi
 
 processed=0

@@ -87,6 +87,24 @@ rc=$?
 assert_ne_zero "$rc" "preflight rejects an unread floor"
 assert_contains "$out" "PREFLIGHT UNVERIFIED: cudaToolkit could not be read" "preflight names the unread floor"
 
+# Preflight: the DCGM exporter floor applies only to the rows that read DCGM
+# (5 and 10). A node below it still runs the serving rows, and the gate says
+# why it skipped the floor; asking for row 5 or 10, or for no rows, asserts it.
+out="$(pf_assert_floors "$B200_FIXTURES/floors.yaml" "$B200_FIXTURES/measured-dcgm-below.kv" "1,2,3" 2>&1)"
+rc=$?
+assert_eq "$rc" "0" "preflight skips the DCGM floor for rows that do not read DCGM"
+assert_contains "$out" "PREFLIGHT SKIP: dcgmExporter" "preflight names the skipped DCGM floor"
+out="$(pf_assert_floors "$B200_FIXTURES/floors.yaml" "$B200_FIXTURES/measured-dcgm-below.kv" "1,5" 2>&1)"
+rc=$?
+assert_ne_zero "$rc" "preflight asserts the DCGM floor when row 5 runs"
+assert_contains "$out" "dcgmExporter 4.5.3-4.8.2 below >= 4.6.0-4.8.3" "preflight names the DCGM shortfall"
+out="$(pf_assert_floors "$B200_FIXTURES/floors.yaml" "$B200_FIXTURES/measured-dcgm-below.kv" "10" 2>&1)"
+rc=$?
+assert_ne_zero "$rc" "preflight asserts the DCGM floor when row 10 runs"
+out="$(pf_assert_floors "$B200_FIXTURES/floors.yaml" "$B200_FIXTURES/measured-dcgm-below.kv" 2>&1)"
+rc=$?
+assert_ne_zero "$rc" "preflight asserts the DCGM floor when no rows are named"
+
 # Capture: a benchmark result round-trips into the harness row schema.
 cap_normalize "$B200_FIXTURES/benchmark-sample.json" "$tmp/01.json" 1 pass
 assert_eq "$(jq -r '.row' "$tmp/01.json")" "1" "capture records the row"
