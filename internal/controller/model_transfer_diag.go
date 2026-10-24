@@ -207,7 +207,9 @@ var modelTransferSignatures = []modelTransferSignature{
 		// the downloader cannot write: "mkdir: can't create directory
 		// '/models/<key>': Permission denied". A write failure inside curl
 		// prints only "curl: (23) ... on write", which is also a full disk, so
-		// that spelling is deliberately not matched on its own.
+		// that spelling is deliberately not matched on its own. Only a pod
+		// that mounts the model-cache PVC gets this diagnosis: the remedy is
+		// about the cache, not about an emptyDir or a CA bundle.
 		reason: ReasonModelCacheNotWritable,
 		remedy: "the downloader cannot write to the model cache. The cache-prep init container fixes ownership, " +
 			"and it is off when the operator runs with --model-cache-prep=never (chart value modelCache.prep): " +
@@ -277,6 +279,7 @@ func isGeneratedInitContainer(name string) bool {
 func findModelTransferFailure(pods []corev1.Pod) (nodeName, reason, matchedLine string, found bool) {
 	for i := range pods {
 		pod := &pods[i]
+		cacheBacked := podMountsModelCache(pod)
 		for j := range pod.Status.InitContainerStatuses {
 			cs := &pod.Status.InitContainerStatuses[j]
 			if !isGeneratedInitContainer(cs.Name) {
@@ -297,12 +300,30 @@ func findModelTransferFailure(pods []corev1.Pod) (nodeName, reason, matchedLine 
 					continue
 				}
 				if r, line, ok := matchModelTransferFailure(term.Message); ok {
+					// The cache remedy only applies to a pod that writes a
+					// shared cache: an emptyDir mount has no cache-prep to
+					// turn on, so leave that failure unlabelled rather than
+					// point the reader at a setting for another storage path.
+					if r == ReasonModelCacheNotWritable && !cacheBacked {
+						continue
+					}
 					return pod.Spec.NodeName, r, line, true
 				}
 			}
 		}
 	}
 	return "", "", "", false
+}
+
+// podMountsModelCache reports whether the pod mounts the model-cache PVC, the
+// only mount a cache-prep init container ever prepared.
+func podMountsModelCache(pod *corev1.Pod) bool {
+	for i := range pod.Spec.Volumes {
+		if pod.Spec.Volumes[i].Name == "model-cache" && pod.Spec.Volumes[i].PersistentVolumeClaim != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // initContainersCompleted reports whether any pod has got past every generated

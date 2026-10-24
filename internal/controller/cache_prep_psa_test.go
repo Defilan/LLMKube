@@ -92,20 +92,20 @@ func cacheBackedServingTemplate(r *InferenceServiceReconciler, isvc *inferencev1
 	return r.constructDeployment(isvc, model, nil, 1, "", "").Spec.Template
 }
 
-// cacheBackedIsvcWithRestrictedPodContext is the user configuration the docs
-// tell a `restricted` namespace to supply: a numeric non-root uid (the
-// downloader inherits it) and a runtime-default seccomp profile.
+// cacheBackedIsvcWithRestrictedPodContext is the user configuration
+// docs/MODEL-CACHE.md tells a `restricted` namespace to supply, verbatim: a
+// numeric non-root uid the downloader inherits, the fsGroup a supplied context
+// has to restate, and a runtime-default seccomp profile. The serving
+// container's context is left to the operator default, as the docs assume.
 func cacheBackedIsvcWithRestrictedPodContext() *inferencev1alpha1.InferenceService {
-	uid := int64(101)
+	uid, gid := int64(101), int64(102)
 	isvc := cachePrepTripwireIsvc()
 	isvc.Spec.PodSecurityContext = &corev1.PodSecurityContext{
-		RunAsNonRoot:   boolPtr(true),
-		RunAsUser:      &uid,
-		SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
-	}
-	isvc.Spec.SecurityContext = &corev1.SecurityContext{
-		AllowPrivilegeEscalation: boolPtr(false),
-		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+		RunAsNonRoot:        boolPtr(true),
+		RunAsUser:           &uid,
+		FSGroup:             &gid,
+		FSGroupChangePolicy: fsGroupChangeOnRootMismatch(),
+		SeccompProfile:      &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 	}
 	return isvc
 }

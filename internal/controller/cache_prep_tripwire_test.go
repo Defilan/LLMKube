@@ -29,10 +29,11 @@ import (
 // existed. Rollouts key on desiredTemplateHash, so any byte that moves here
 // rolls every cache-backed pod on upgrade.
 //
-// The hashes below were recorded against upstream/main (<base>) while the
-// flag did not exist. A diff means a builder changed shape for the default
-// configuration; that is either a bug in the policy gating or a deliberate
-// template change that needs its own reason and its own upgrade note.
+// The hashes below were recorded by running this file in a worktree of
+// upstream/main while the flag did not exist. A diff means a builder changed
+// shape for the default configuration; that is either a bug in the policy
+// gating or a deliberate template change that needs its own reason and its
+// own upgrade note.
 
 const (
 	// cachePrepTripwireDeploymentHash is desiredTemplateHash of
@@ -109,7 +110,7 @@ func TestCachePrepAlwaysTemplatesUnchanged(t *testing.T) {
 // before the flag, and any embedding that constructs one by hand) must render
 // what it rendered before: the prep.
 func TestCachePrepEmptyPolicyRendersPrep(t *testing.T) {
-	cfg := buildCachedStorageConfig(cachePrepTripwireModel(), nil, "", "", "docker.io/curlimages/curl:8.18.0", 102, ModelCachePrepAlways, "")
+	cfg := buildCachedStorageConfig(cachePrepTripwireModel(), nil, "", "", "docker.io/curlimages/curl:8.18.0", 102, "", "")
 	if len(cfg.initContainers) < 1 || cfg.initContainers[0].Name != "model-cache-prep" {
 		t.Fatalf("empty policy rendered initContainers %v, want model-cache-prep first", containerNames(cfg.initContainers))
 	}

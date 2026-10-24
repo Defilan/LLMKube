@@ -389,11 +389,13 @@ This checks the default annotation, not provisioner health or PV capacity.
 gets the root `model-cache-prep` init container, which chowns the cache root so
 the non-root downloader can write. Set it to `never` on storage that applies
 the pod `fsGroup` itself (a CSI driver with `fsGroupPolicy: File`) or on a
-cache you pre-provisioned with the downloader's ownership. Only then does a
-namespace that enforces Pod Security `restricted` accept the cache, and each
-InferenceService must still set `spec.podSecurityContext` with
-`runAsNonRoot: true`, a numeric `runAsUser`, and `seccompProfile: RuntimeDefault`.
-See `docs/MODEL-CACHE.md` under "Turning the prep off".
+cache you pre-provisioned with the downloader's ownership. A namespace that
+enforces Pod Security `restricted` then accepts the cache, provided each
+InferenceService sets `spec.podSecurityContext` with `fsGroup` (a supplied
+context replaces the operator default), `runAsNonRoot: true`, a numeric
+`runAsUser`, and `seccompProfile: RuntimeDefault`. See `docs/MODEL-CACHE.md`
+under "Turning the prep off".
+
 See the [air-gapped guide](../../docs/site/guides/air-gapped.md#clusters-without-dynamic-provisioning)
 for a static-PV example.
 

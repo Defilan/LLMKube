@@ -223,18 +223,58 @@ func TestPrefetchJobAlwaysUnchanged(t *testing.T) {
 	}
 }
 
-// The generated models are not mutated: a Job built from a shared Model and
-// then another must not share the container security context it stamps.
-func TestPrefetchJobDoesNotMutateStorageConfig(t *testing.T) {
+// The invariant the prefetch uid exists for: whatever prepares the cache, the
+// prefetch downloader and the serving downloader are the same user. A serving
+// pod that has to write into a directory the prefetch created (mode 0755, no
+// group write) would get Permission denied otherwise.
+func TestPrefetchDownloaderMatchesServingDownloaderUID(t *testing.T) {
 	mr := cachePrepTripwireModelReconciler()
 	mr.ModelCachePrep = ModelCachePrepNever
 	m := cachePrepTripwireModel()
 	seedPrefetchCacheKey(m)
-	if _, err := mr.buildPrefetchJob(t.Context(), m, "", ""); err != nil {
+	job, err := mr.buildPrefetchJob(t.Context(), m, "", "")
+	if err != nil {
 		t.Fatalf("buildPrefetchJob: %v", err)
 	}
-	cfg := buildCachedStorageConfig(m, nil, "", "", "docker.io/curlimages/curl:8.18.0", 102, ModelCachePrepAlways, "")
-	if len(cfg.initContainers) != 2 || cfg.initContainers[0].Name != "model-cache-prep" {
-		t.Fatalf("a later build with always rendered %v", containerNames(cfg.initContainers))
+	var prefetchUID *int64
+	for i := range job.Spec.Template.Spec.InitContainers {
+		if job.Spec.Template.Spec.InitContainers[i].Name == "model-downloader" {
+			prefetchUID = job.Spec.Template.Spec.InitContainers[i].SecurityContext.RunAsUser
+		}
+	}
+	if prefetchUID == nil {
+		t.Fatal("prefetch downloader has no runAsUser")
+	}
+
+	// The serving path leaves the downloader's uid to the image, or to the
+	// pod context's runAsUser when the user set one.
+	for _, tc := range []struct {
+		name string
+		isvc *inferencev1alpha1.InferenceService
+		want *int64
+	}{
+		{"default image", cachePrepTripwireIsvc(), prefetchUID},
+		{"pod context overrides the uid", cacheBackedIsvcWithRestrictedPodContext(), prefetchUID},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sc := cachePrepTripwireISvcReconciler()
+			sc.ModelCachePrep = ModelCachePrepNever
+			dep := sc.constructDeployment(tc.isvc, m, nil, 1, "", "")
+			var servingUID *int64
+			for i := range dep.Spec.Template.Spec.InitContainers {
+				if dep.Spec.Template.Spec.InitContainers[i].Name == "model-downloader" {
+					servingUID = dep.Spec.Template.Spec.InitContainers[i].SecurityContext.RunAsUser
+				}
+			}
+			if servingUID != nil {
+				if *servingUID != *tc.want {
+					t.Fatalf("serving downloader uid = %d, prefetch uid = %d: a serving pod could not write into what the prefetch created", *servingUID, *tc.want)
+				}
+				return
+			}
+			if *tc.want != initContainerUID {
+				t.Fatalf("serving downloader uid unset (image default), prefetch uid = %d, want the image default %d", *tc.want, initContainerUID)
+			}
+		})
 	}
 }

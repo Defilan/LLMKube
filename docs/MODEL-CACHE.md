@@ -974,7 +974,7 @@ The prep is the **compatibility implementation** for these backends, and the ope
 | `always` (default) | The prep runs in every cache-backed pod and every prefetch Job. |
 | `never` | The prep is never injected. The downloader still runs non-root; if the volume's ownership is wrong it fails with `Permission denied` and the `ModelCacheNotWritable` diagnosis names this setting. |
 
-Use `never` only when you know the cache's ownership is right without the prep: a CSI driver with `fsGroupPolicy: File`, or a claim you pre-provisioned with the downloader's uid. Then the cache-backed pods contain no root container at all, which is what a `restricted` namespace needs, and the prefetch Job additionally carries `runAsNonRoot` with a numeric uid, `allowPrivilegeEscalation: false`, `ALL` dropped, and a pod-level `seccompProfile: RuntimeDefault`.
+Use `never` only when you know the cache's ownership is right without the prep: a CSI driver with `fsGroupPolicy: File` and a pod that sets `fsGroup` (kubelet applies only the pod's fsGroup), or a claim you pre-provisioned with the downloader's ownership. A supplied `spec.podSecurityContext` replaces the operator's default entirely, so `fsGroup` must be restated there. Then the cache-backed pods contain no root container at all, which is what a `restricted` namespace needs, and the prefetch Job additionally carries `runAsNonRoot` with a numeric uid, `allowPrivilegeEscalation: false`, `ALL` dropped, and a pod-level `seccompProfile: RuntimeDefault`.
 
 Changing the value rolls every cache-backed serving pod once, because the pod template changes. A prefetch Job already running finishes under the setting it started with.
 
@@ -991,9 +991,13 @@ spec:
   podSecurityContext:
     runAsNonRoot: true
     runAsUser: 101        # numeric; the downloader inherits it
+    fsGroup: 102          # the --default-fsgroup value; a supplied context replaces the operator default
+    fsGroupChangePolicy: OnRootMismatch
     seccompProfile:
       type: RuntimeDefault
 ```
+
+`fsGroup` has to be in the snippet because the operator's default `fsGroup` is not merged into a user-supplied context: without it kubelet applies no group to the cache volume and a `fsGroupPolicy: File` driver, which is why `never` was chosen, changes nothing. `OnRootMismatch` is the operator's own default for the same reason (see `fsGroupChangePolicy` below).
 
 A numeric `runAsUser` is required, not optional: the default init image (`curlimages/curl`) declares the *named* user `curl_user`, and the kubelet refuses `runAsNonRoot` on an image whose user it cannot resolve numerically (`container has runAsNonRoot and image has non-numeric user (curl_user)`).
 

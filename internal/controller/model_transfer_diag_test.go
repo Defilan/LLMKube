@@ -206,6 +206,27 @@ func TestFindModelTransferFailure(t *testing.T) {
 		}
 	})
 
+	t.Run("cache permission failure on a cache-backed pod names the setting", func(t *testing.T) {
+		pod := initPod("node-a",
+			terminatedInit("model-downloader", 1, "mkdir: can't create directory '/models/k': Permission denied"))
+		pod.Spec.Volumes = []corev1.Volume{{Name: "model-cache", VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "c"}}}}
+		_, reason, _, found := findModelTransferFailure([]corev1.Pod{pod})
+		if !found || reason != ReasonModelCacheNotWritable {
+			t.Fatalf("found=%v reason=%q, want %q", found, reason, ReasonModelCacheNotWritable)
+		}
+	})
+
+	t.Run("cache permission failure on an emptyDir pod is not labelled with the cache remedy", func(t *testing.T) {
+		pod := initPod("node-a",
+			terminatedInit("model-downloader", 1, "mkdir: can't create directory '/models/k': Permission denied"))
+		pod.Spec.Volumes = []corev1.Volume{{Name: "model-storage", VolumeSource: corev1.VolumeSource{
+			EmptyDir: &corev1.EmptyDirVolumeSource{}}}}
+		if _, reason, _, found := findModelTransferFailure([]corev1.Pod{pod}); found {
+			t.Errorf("emptyDir permission failure diagnosed as %q; the cache remedy does not apply", reason)
+		}
+	})
+
 	t.Run("ignores a clean exit", func(t *testing.T) {
 		pods := []corev1.Pod{initPod("node-a",
 			terminatedInit("model-downloader", 0, "Model downloaded successfully"))}
