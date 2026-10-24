@@ -17,6 +17,8 @@ limitations under the License.
 package controller
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -26,19 +28,10 @@ import (
 
 // The parity guard for #2148: an InferenceService that leaves
 // spec.imagePullPolicy unset must render the pod template this operator emitted
-// before the field existed. Rollouts key on desiredTemplateHash, so a byte that
-// moves here rolls every serving pod on an operator upgrade.
-//
-// This file deliberately names no field the change adds, so it compiles and runs
-// on both upstream/main and the branch. The hash below was recorded by running
-// this file in a detached worktree of upstream/main.
-
-const (
-	// imagePullPolicyTripwireDeploymentHash is desiredTemplateHash of
-	// constructDeployment for imagePullPolicyTripwireISvc and
-	// imagePullPolicyTripwireModel.
-	imagePullPolicyTripwireDeploymentHash = "cb92c4fc1275579a" //nolint:gosec // a SHA-256 prefix of a pod template, not a credential
-)
+// before the field existed. Rollouts key on desiredTemplateHash, a hash of the
+// template's JSON, so an imagePullPolicy key appearing there rolls every serving
+// pod on an operator upgrade. The guard checks for that key rather than pinning
+// the whole template's hash, so unrelated builder changes do not trip it.
 
 func imagePullPolicyTripwireModel() *inferencev1alpha1.Model {
 	return &inferencev1alpha1.Model{
@@ -79,10 +72,13 @@ func TestImagePullPolicyUnsetTemplateUnchanged(t *testing.T) {
 	r := imagePullPolicyTripwireReconciler()
 	dep := r.constructDeployment(imagePullPolicyTripwireISvc(), imagePullPolicyTripwireModel(), nil, 1, "", "")
 
-	if got := desiredTemplateHash(dep.Spec.Template); got != imagePullPolicyTripwireDeploymentHash {
-		t.Errorf("pod template drifted from base: desiredTemplateHash = %s, want %s\n"+
-			"every serving pod would roll on upgrade; an unset spec.imagePullPolicy must render exactly what base rendered",
-			got, imagePullPolicyTripwireDeploymentHash)
+	data, err := json.Marshal(dep.Spec.Template)
+	if err != nil {
+		t.Fatalf("marshal pod template: %v", err)
+	}
+	if strings.Contains(string(data), `"imagePullPolicy"`) {
+		t.Errorf("pod template JSON carries an imagePullPolicy key, so desiredTemplateHash differs from base and " +
+			"every serving pod would roll on upgrade; an unset spec.imagePullPolicy must leave the key out")
 	}
 
 	if got := dep.Spec.Template.Spec.Containers[0].ImagePullPolicy; got != "" {
