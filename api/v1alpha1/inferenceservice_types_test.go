@@ -19,6 +19,7 @@ package v1alpha1
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -727,12 +728,18 @@ func TestGatewayStatusRoundTrip(t *testing.T) {
 func TestSpeculativeConfigRoundTrip(t *testing.T) {
 	sc := SpeculativeConfig{
 		Enabled:              ptrBool(true),
+		Method:               "dspark",
 		Model:                "draft-model",
 		NumSpeculativeTokens: ptrInt32(4),
 	}
 	data, err := json.Marshal(sc)
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
+	}
+	// The API field names are the CRD keys; Method must not collapse into
+	// another field or it would never reach the controller.
+	if !strings.Contains(string(data), `"method":"dspark"`) {
+		t.Fatalf("method is not serialized under its own key: %s", data)
 	}
 
 	var got SpeculativeConfig

@@ -79,10 +79,12 @@ spec:
       name: hf-token
       key: HF_TOKEN
     # To enable speculative decoding, add a second Model CR (e.g. a 4B draft)
-    # and uncomment the block below. NumSpeculativeTokens defaults to 4.
+    # and uncomment the block below. The operator mounts the draft and passes
+    # its path in --speculative-config; numSpeculativeTokens defaults to 4.
     #
     # speculative:
     #   enabled: true
+    #   method: draft_model
     #   model: qwen3-4b-draft
     #   numSpeculativeTokens: 4
   endpoint:

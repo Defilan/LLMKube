@@ -1575,9 +1575,15 @@ type VLLMConfig struct {
 	// +optional
 	AttentionBackend string `json:"attentionBackend,omitempty"`
 
-	// Speculative enables draft-model speculative decoding. On single-stream
-	// agentic workloads this can be 30-60% faster than plain tensor-parallel
-	// execution. Requires a second (smaller) Model CR to act as the draft.
+	// Speculative enables speculative decoding, rendered as one
+	// --speculative-config JSON document (method, model, num_speculative_tokens).
+	// On single-stream agentic workloads this can be 30-60% faster than plain
+	// tensor-parallel execution. A draft Model is mounted and passed by path
+	// for the methods that need one; methods whose drafter lives in the target
+	// checkpoint (mtp, dspark) need only the method and a token count. Keys
+	// outside the three typed fields (draft_sample_method,
+	// rejection_sample_method, prompt_lookup_max, ...) go in spec.extraArgs as
+	// --speculative-config, which wins over this block.
 	// +optional
 	Speculative *SpeculativeConfig `json:"speculative,omitempty"`
 
@@ -1695,26 +1701,41 @@ type VLLMStallDetection struct {
 	WindowSeconds *int32 `json:"windowSeconds,omitempty"`
 }
 
-// SpeculativeConfig configures draft-model speculative decoding for vLLM.
+// SpeculativeConfig configures speculative decoding for vLLM. The operator
+// renders the fields below as one --speculative-config JSON document, the only
+// speculative-decoding argument vLLM accepts.
+// +kubebuilder:validation:XValidation:rule="!has(self.enabled) || !self.enabled || (has(self.model) && self.model.size() > 0) || (has(self.method) && self.method.size() > 0)",message="speculative decoding needs a method (e.g. draft_model, mtp, dspark, ngram) or a draft Model in model: vLLM rejects num_speculative_tokens without one"
 type SpeculativeConfig struct {
 	// Enabled toggles speculative decoding on. When false or nil, no
 	// speculative flags are emitted regardless of other fields.
 	// +optional
 	Enabled *bool `json:"enabled,omitempty"`
 
+	// Method is the vLLM speculative method, rendered as the
+	// --speculative-config "method" key. Values current vLLM registers
+	// include draft_model, mtp, eagle, eagle3, medusa, dflash, dspark,
+	// ngram and suffix. Not an enum: vLLM adds a method per release (dspark
+	// and dflash arrived after v0.25.1's list), so the value must exist in
+	// the image you run or vLLM refuses to start. Optional: with a draft
+	// Model and no method, vLLM infers draft_model.
+	// +optional
+	Method string `json:"method,omitempty"`
+
 	// Model references the Model CR (in the same namespace as the
-	// InferenceService) to use as the speculative draft model.
-	// Required when Enabled is true. If missing, speculative decoding is
-	// skipped and the InferenceService surfaces a SpeculativeInvalid
-	// status condition rather than failing the reconcile.
-	// Maps to vLLM --speculative-model flag.
+	// InferenceService) holding the draft weights. The operator stages and
+	// mounts it exactly like the target model, and vLLM receives its
+	// in-container path as the --speculative-config "model" key, never the
+	// CR name. Required for the methods that load separate weights
+	// (draft_model, eagle, eagle3); omit it for methods whose drafter ships
+	// in the target checkpoint (mtp, dspark) or needs none (ngram, suffix).
 	// +optional
 	Model string `json:"model,omitempty"`
 
-	// NumSpeculativeTokens is the number of draft tokens proposed per step.
+	// NumSpeculativeTokens is the number of draft tokens proposed per step,
+	// rendered as the --speculative-config "num_speculative_tokens" key.
 	// Typical sweet spot is 3-5; higher values increase wasted work when the
-	// draft disagrees with the target model.
-	// Maps to vLLM --num-speculative-tokens flag.
+	// draft disagrees with the target model. Emitted as 4 when unset while a
+	// draft model is configured, because vLLM requires it whenever one is.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=16
 	// +kubebuilder:default=4
