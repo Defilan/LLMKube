@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -177,23 +178,66 @@ func appendMaxNumSeqsArgs(args []string, parallelSlots *int32, extraArgs []strin
 	return args, nil
 }
 
-// appendSpeculativeModel require both Enabled=true and a non-empty
-// draft Model ref. Silent-skip with a log line when misconfigured;
-// the reconciler also sets a status condition via ValidateVLLMConfig.
-func appendSpeculativeModel(args []string, speculativeCfg *inferencev1alpha1.SpeculativeConfig) ([]string, error) {
-	if speculativeCfg == nil || speculativeCfg.Enabled == nil || !*speculativeCfg.Enabled {
+// appendSpeculativeConfig renders the block as the one argument vLLM accepts
+// for speculative decoding. vLLM registers no per-field speculative flags: its
+// parser takes --speculative-config (JSON) and builds a dataclass that forbids
+// unknown keys (vllm/config/utils.py, extra="forbid"), so a key that does not
+// exist in the image you run fails the engine at startup. Method-specific keys
+// (draft_sample_method, prompt_lookup_max, ...) therefore belong in
+// spec.extraArgs as --speculative-config, which wins over this block, rather
+// than in typed fields this operator cannot version-check.
+func appendSpeculativeConfig(args []string, cfg *inferencev1alpha1.SpeculativeConfig, draftPath string, extraArgs []string) ([]string, error) {
+	if cfg == nil || cfg.Enabled == nil || !*cfg.Enabled {
 		return args, nil
 	}
-	if speculativeCfg.Model == "" {
-		return args, errors.New("speculative decoding enabled but spec.vllmConfig.speculative.model is empty; skipping speculative flags")
+	if hasMatchingExtraArg(extraArgs, "speculative-config") {
+		return args, nil
 	}
-	args = append(args, "--speculative-model", speculativeCfg.Model)
-	if speculativeCfg.NumSpeculativeTokens != nil {
-		args = append(args, "--num-speculative-tokens",
-			fmt.Sprintf("%d", *speculativeCfg.NumSpeculativeTokens))
+	if cfg.Model != "" && draftPath == "" {
+		return args, errors.New("spec.vllmConfig.speculative.model is set but nothing staged the draft; skipping --speculative-config")
 	}
-	return args, nil
+	if cfg.Model == "" && cfg.Method == "" {
+		return args, errors.New("spec.vllmConfig.speculative.enabled is true but neither model nor method is set; skipping --speculative-config")
+	}
+
+	payload := vllmSpeculativeConfig{NumSpeculativeTokens: vllmDefaultSpeculativeTokens}
+	if cfg.Method != "" {
+		payload.Method = cfg.Method
+	}
+	if draftPath != "" {
+		// The path, not the CR name: vLLM loads what the pod mounted.
+		payload.Model = draftPath
+		if payload.Method == "" {
+			payload.Method = "draft_model"
+		}
+	}
+	if cfg.NumSpeculativeTokens != nil {
+		payload.NumSpeculativeTokens = *cfg.NumSpeculativeTokens
+	}
+
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return args, fmt.Errorf("cannot render spec.vllmConfig.speculative as JSON: %w", err)
+	}
+	return append(args, "--speculative-config", string(raw)), nil
 }
+
+// vllmSpeculativeConfig is the JSON document vLLM's SpeculativeConfig parses.
+// Field names and order are the wire contract: reordering only changes the
+// rendered argv, but a rename silently becomes an unknown key, which vLLM's
+// parser rejects.
+type vllmSpeculativeConfig struct {
+	Method               string `json:"method,omitempty"`
+	Model                string `json:"model,omitempty"`
+	NumSpeculativeTokens int32  `json:"num_speculative_tokens"`
+}
+
+// vllmDefaultSpeculativeTokens is the CRD default for
+// spec.vllmConfig.speculative.numSpeculativeTokens. It is also what the
+// apiserver would default the field to; the fallback here keeps the rendered
+// JSON valid when the Go value reaches us undefaulted, because vLLM refuses a
+// draft model without a token count.
+const vllmDefaultSpeculativeTokens int32 = 4
 
 func appendTensorParallelSize(args []string, tensorParallelSize *int32) []string {
 	if tensorParallelSize != nil && *tensorParallelSize > 1 {
