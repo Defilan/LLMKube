@@ -43,9 +43,10 @@ func TestModelRouterAgentGateway_RBACCoversClientVerbs(t *testing.T) {
 	// resource: the guard chain Gets the referenced Gateway and, for
 	// allowedRoutes Selector matching, the router's namespace; backend
 	// resolution Gets InferenceServices; the apply creates/updates pools, the
-	// extraction policy, and the HTTPRoute; the conflict detector Lists
-	// policies; the deletion, leaving, and consent-withdrawal sweeps List and
-	// Delete policies, pools, and routes; the pre-flight name check Gets each
+	// extraction policy, the HTTPRoute, and (routing: Model) the
+	// AgentgatewayModels; the conflict detector Lists policies; the deletion,
+	// leaving, consent-withdrawal, and mode-switch sweeps and the stale-model
+	// prune List and Delete policies, pools, routes, and models; the pre-flight name check Gets each
 	// generated object; status and finalizer writes update and patch the
 	// router; the Recorder emits events.
 	//
@@ -66,6 +67,7 @@ func TestModelRouterAgentGateway_RBACCoversClientVerbs(t *testing.T) {
 		{"inference.networking.k8s.io/inferencepools", []string{"get", "list", "create", "update", "patch", "delete"}},
 		{"gateway.networking.k8s.io/httproutes", []string{"get", "list", "create", "update", "patch", "delete"}},
 		{"agentgateway.dev/agentgatewaypolicies", []string{"get", "list", "create", "update", "patch", "delete"}},
+		{"agentgateway.dev/agentgatewaymodels", []string{"get", "list", "create", "update", "patch", "delete"}},
 		{"gateway.networking.k8s.io/gateways", []string{"get"}},
 		{"/namespaces", []string{"get", "list", "watch"}},
 		{"/events", []string{"create", "patch"}},

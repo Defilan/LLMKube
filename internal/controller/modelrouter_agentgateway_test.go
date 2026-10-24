@@ -2462,8 +2462,8 @@ func newCountingModelRouterAgentGatewayReconciler(t *testing.T, cfg *rest.Config
 }
 
 // TestModelRouterAgentGateway_SweepOnlyForUsedRouters pins the evidence gate
-// on the leave-AgentGateway sweep: the sweep runs three uncached Lists
-// (cluster-wide policies, pools, routes), so a router that never used
+// on the leave-AgentGateway sweep: the sweep runs four uncached Lists
+// (cluster-wide policies, pools, routes, models), so a router that never used
 // AgentGateway mode must make none, and a router that switches away must be
 // swept exactly once - after the sweep clears the plane's status, later
 // reconciles find no evidence and skip it.
@@ -2523,14 +2523,14 @@ func TestModelRouterAgentGateway_SweepOnlyForUsedRouters(t *testing.T) {
 		}
 
 		// The switch reconcile sweeps: one List each for policies
-		// (cluster-wide), pools, and routes.
+		// (cluster-wide), pools, routes, and models.
 		if _, err := r.Reconcile(context.Background(), ctrl.Request{
 			NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: ns},
 		}); err != nil {
 			t.Fatalf("reconcile after switch: %v", err)
 		}
-		if got := counter.lists - before; got != 3 {
-			t.Errorf("the switch reconcile made %d List calls, want exactly 3 (one per swept kind)", got)
+		if got := counter.lists - before; got != 4 {
+			t.Errorf("the switch reconcile made %d List calls, want exactly 4 (one per swept kind)", got)
 		}
 		assertAllGoneLike(t, c, ns, mr.Name, "sweep1-cuda")
 
@@ -2543,7 +2543,7 @@ func TestModelRouterAgentGateway_SweepOnlyForUsedRouters(t *testing.T) {
 				t.Fatalf("reconcile %d after sweep: %v", i+1, err)
 			}
 		}
-		if got := counter.lists - before - 3; got != 0 {
+		if got := counter.lists - before - 4; got != 0 {
 			t.Errorf("later reconciles made %d List calls after the sweep, want 0", got)
 		}
 	})
@@ -2568,14 +2568,14 @@ func TestModelRouterAgentGateway_SweepOnlyForUsedRouters(t *testing.T) {
 		}
 
 		// The ref-removal reconcile sweeps: one List each for policies
-		// (cluster-wide), pools, and routes.
+		// (cluster-wide), pools, routes, and models.
 		if _, err := r.Reconcile(context.Background(), ctrl.Request{
 			NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: ns},
 		}); err != nil {
 			t.Fatalf("reconcile after ref removal: %v", err)
 		}
-		if got := counter.lists - before; got != 3 {
-			t.Errorf("the ref-removal reconcile made %d List calls, want exactly 3 (one per swept kind)", got)
+		if got := counter.lists - before; got != 4 {
+			t.Errorf("the ref-removal reconcile made %d List calls, want exactly 4 (one per swept kind)", got)
 		}
 		assertAllGoneLike(t, c, ns, mr.Name, "sweep2-cuda")
 
@@ -2588,7 +2588,7 @@ func TestModelRouterAgentGateway_SweepOnlyForUsedRouters(t *testing.T) {
 				t.Fatalf("reconcile %d after sweep: %v", i+1, err)
 			}
 		}
-		if got := counter.lists - before - 3; got != 0 {
+		if got := counter.lists - before - 4; got != 0 {
 			t.Errorf("later reconciles made %d List calls after the sweep, want 0", got)
 		}
 		refless := &inferencev1alpha1.ModelRouter{}

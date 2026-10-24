@@ -174,10 +174,15 @@ type ModelRouterAgentGatewayReconciler struct {
 	// InferencePool kind and agentgateway.dev's AgentgatewayPolicy kind.
 	detectorOnce sync.Once
 	detector     *crdDetector
+
+	// modelDetector gates routing: Model on the AgentgatewayModel CRD alone.
+	modelDetectorOnce sync.Once
+	modelDetector     *crdDetector
 }
 
 // +kubebuilder:rbac:groups=inference.networking.k8s.io,resources=inferencepools,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=agentgateway.dev,resources=agentgatewaypolicies,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=agentgateway.dev,resources=agentgatewaymodels,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways,verbs=get
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
@@ -224,7 +229,7 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 	// status.agentGateway block (set exactly when generation succeeded), or a
 	// TRUE AgentGatewayReady condition. A FALSE condition is not evidence:
 	// refusals set it without generating anything, and counting it would make
-	// every refusal reconcile re-run the three Lists below - the cost this
+	// every refusal reconcile re-run the four Lists below - the cost this
 	// gate exists to remove.
 	readyCond := apimeta.FindStatusCondition(mr.Status.Conditions, ModelRouterAgentGatewayConditionReady)
 	usedAgentGateway := hasFinalizer || mr.Status.AgentGateway != nil ||
@@ -240,10 +245,11 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 			return ctrl.Result{}, err
 		}
 		if deleting || leaving {
-			// Pools and routes are owner-referenced, but owner-ref GC only
-			// fires when the router object goes away: a router that leaves
-			// AgentGateway mode must stop attaching to the Gateway now.
-			if err := r.cleanupGeneratedPoolsAndRoutes(ctx, mr); err != nil {
+			// Pools, routes and models are owner-referenced, but owner-ref GC
+			// only fires when the router object goes away: a router that
+			// leaves AgentGateway mode must stop attaching to the Gateway now.
+			if err := r.deleteGeneratedObjects(ctx, mr, nil,
+				inferencePoolGVK(), gatewayHTTPRouteGVK(), agentGatewayModelGVK()); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
@@ -309,7 +315,8 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 	// kind is meant, rather than having to read the detector; #1725). A
 	// transient discovery error (not a missing kind) is returned so we requeue
 	// rather than disabling.
-	present, missing, err := r.requiredCRDsMissing(log)
+	modelRouting := agentGatewayModelRouting(mr)
+	present, missing, err := r.requiredCRDsMissing(log, modelRouting)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -317,6 +324,11 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 		names := make([]string, 0, len(missing))
 		for _, gvk := range missing {
 			names = append(names, fmt.Sprintf("%s (%s/%s)", gvk.Kind, gvk.Group, gvk.Version))
+		}
+		if modelRouting {
+			return ctrl.Result{}, r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonModelCRDMissing,
+				"agentGatewayRef.routing: Model needs agentgateway v1.6.0 or later, and its AgentgatewayModel CRD is not "+
+					"installed; agentgateway exposure is disabled; missing: "+strings.Join(names, ", "))
 		}
 		return ctrl.Result{}, r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonCRDsMissing,
 			"Gateway API Inference Extension and agentgateway CRDs are not installed; agentgateway exposure is disabled; missing: "+
@@ -373,50 +385,53 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 		return ctrl.Result{RequeueAfter: agentGatewayConflictRequeueAfter}, nil
 	}
 
-	// Fail loud when the AgentgatewayPolicy this router would generate already
-	// exists and LLMKube did not create it. Runs BEFORE the conflict check so
-	// a foreign policy that both holds our name and conflicts reports the more
-	// specific name-taken reason, and before any generation so a name-taken
-	// router yields no partial resources. The pools and the route are checked
-	// the same way inside reconcileAgentGatewayResources, once their names are
-	// known from the resolved backends.
-	if err := r.checkGeneratedNameAvailable(ctx, mr, newAgentGatewayModelExtractionPolicy(mr, mr.Spec.AgentGatewayRef)); err != nil {
-		var taken *agentGatewayNameTakenError
-		if errors.As(err, &taken) {
-			// Whether the name is free depends on objects outside the router's
-			// spec; requeue so deleting or renaming the foreign object takes
-			// effect without an unrelated event.
-			if serr := r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonResourceNameTaken, err.Error()); serr != nil {
-				return ctrl.Result{}, serr
+	// routing: Model writes no extraction policy, so these checks don't apply.
+	if !modelRouting {
+		// Fail loud when the AgentgatewayPolicy this router would generate already
+		// exists and LLMKube did not create it. Runs BEFORE the conflict check so
+		// a foreign policy that both holds our name and conflicts reports the more
+		// specific name-taken reason, and before any generation so a name-taken
+		// router yields no partial resources. The pools and the route are checked
+		// the same way inside reconcileAgentGatewayResources, once their names are
+		// known from the resolved backends.
+		if err := r.checkGeneratedNameAvailable(ctx, mr, newAgentGatewayModelExtractionPolicy(mr, mr.Spec.AgentGatewayRef)); err != nil {
+			var taken *agentGatewayNameTakenError
+			if errors.As(err, &taken) {
+				// Whether the name is free depends on objects outside the router's
+				// spec; requeue so deleting or renaming the foreign object takes
+				// effect without an unrelated event.
+				if serr := r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonResourceNameTaken, err.Error()); serr != nil {
+					return ctrl.Result{}, serr
+				}
+				return ctrl.Result{RequeueAfter: agentGatewayConflictRequeueAfter}, nil
 			}
-			return ctrl.Result{RequeueAfter: agentGatewayConflictRequeueAfter}, nil
-		}
-		return ctrl.Result{}, err
-	}
-
-	// Fail loud when the target Gateway already carries a PreRouting
-	// transformation policy this router does not own. agentgateway merges
-	// equal-specificity policies oldest-wins per whole field and never
-	// combines list entries (and no condition reports the dropped field), so a
-	// second transformation on the same Gateway either silently disables the
-	// generated model extraction or is silently disabled by it. Refuse before
-	// any generation so a conflicted router yields no partial resources.
-	conflicts, err := r.agentGatewayPreRoutingConflicts(ctx, mr, gateway.GetLabels())
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if len(conflicts) > 0 {
-		if err := r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonPolicyConflict,
-			fmt.Sprintf("Gateway %s/%s already carries PreRouting transformation policy(ies) that LLMKube does not own: %s. "+
-				"agentgateway merges same-specificity policies oldest-wins per field without combining list entries, "+
-				"so the generated model extraction could be silently dropped, or silently shadow the existing policy. "+
-				"Remove or scope the other policy", agentGatewayPolicyNamespace(mr), mr.Spec.AgentGatewayRef.Name,
-				strings.Join(conflicts, ", "))); err != nil {
 			return ctrl.Result{}, err
 		}
-		// Recheck on the conflict cadence so the condition clears by itself
-		// when the foreign policy is deleted.
-		return ctrl.Result{RequeueAfter: agentGatewayConflictRequeueAfter}, nil
+
+		// Fail loud when the target Gateway already carries a PreRouting
+		// transformation policy this router does not own. agentgateway merges
+		// equal-specificity policies oldest-wins per whole field and never
+		// combines list entries (and no condition reports the dropped field), so a
+		// second transformation on the same Gateway either silently disables the
+		// generated model extraction or is silently disabled by it. Refuse before
+		// any generation so a conflicted router yields no partial resources.
+		conflicts, err := r.agentGatewayPreRoutingConflicts(ctx, mr, gateway.GetLabels())
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if len(conflicts) > 0 {
+			if err := r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonPolicyConflict,
+				fmt.Sprintf("Gateway %s/%s already carries PreRouting transformation policy(ies) that LLMKube does not own: %s. "+
+					"agentgateway merges same-specificity policies oldest-wins per field without combining list entries, "+
+					"so the generated model extraction could be silently dropped, or silently shadow the existing policy. "+
+					"Remove or scope the other policy", agentGatewayPolicyNamespace(mr), mr.Spec.AgentGatewayRef.Name,
+					strings.Join(conflicts, ", "))); err != nil {
+				return ctrl.Result{}, err
+			}
+			// Recheck on the conflict cadence so the condition clears by itself
+			// when the foreign policy is deleted.
+			return ctrl.Result{RequeueAfter: agentGatewayConflictRequeueAfter}, nil
+		}
 	}
 
 	// Fail-loud on matches the agentgateway data plane cannot express. We
@@ -424,7 +439,10 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 	// user expects. The agentgateway plane matches on the OpenAI "model" field
 	// (via the extracted agentGatewayHTTPModelHeader) and on headers (via
 	// HTTPRoute header matches); everything the Gateway plane rejects is
-	// rejected here too.
+	// rejected here too. routing: Model has its own boundary, checked first.
+	if msg := agentGatewayModelRoutingMessage(mr); msg != "" {
+		return ctrl.Result{}, r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonUnsupportedModelRouting, msg)
+	}
 	if msg := agentGatewayUnsupportedMatchMessage(mr); msg != "" {
 		return ctrl.Result{}, r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonUnsupported, msg)
 	}
@@ -480,7 +498,12 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 		return ctrl.Result{}, r.setAgentGatewayNotReady(ctx, mr, reason, msg)
 	}
 
-	ejected, err := r.reconcileAgentGatewayResources(ctx, mr)
+	var ejected []string
+	if modelRouting {
+		err = r.reconcileAgentGatewayModels(ctx, mr)
+	} else {
+		ejected, err = r.reconcileAgentGatewayResources(ctx, mr)
+	}
 	if err != nil {
 		var taken *agentGatewayNameTakenError
 		if errors.As(err, &taken) {
@@ -491,6 +514,11 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 				return ctrl.Result{}, serr
 			}
 			return ctrl.Result{RequeueAfter: agentGatewayConflictRequeueAfter}, nil
+		}
+		// No requeue: the InferenceService watch re-reconciles on a fix.
+		var refusal *agentGatewayRefusalError
+		if errors.As(err, &refusal) {
+			return ctrl.Result{}, r.setAgentGatewayNotReady(ctx, mr, refusal.reason, refusal.message)
 		}
 		_ = r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonReconcile, err.Error())
 		return ctrl.Result{}, err
@@ -577,6 +605,10 @@ func (r *ModelRouterAgentGatewayReconciler) reconcileAgentGatewayResources(
 			return nil, fmt.Errorf("%s/%s: %w", obj.GetKind(), obj.GetName(), err)
 		}
 	}
+	// Remove what routing: Model left behind.
+	if err := r.deleteGeneratedObjects(ctx, mr, nil, agentGatewayModelGVK()); err != nil {
+		return nil, err
+	}
 	return ejected, nil
 }
 
@@ -595,27 +627,9 @@ func (r *ModelRouterAgentGatewayReconciler) resolveAgentGatewayBackends(
 	pickers, _, _ := agentGatewayResolvePoolPickers(mr)
 	resolved := make([]agentGatewayBackendResource, 0, len(mr.Spec.Backends))
 	for _, b := range mr.Spec.Backends {
-		if b.External != nil {
-			return nil, fmt.Errorf("backend %q is External; dataPlane: AgentGateway routes to an InferencePool "+
-				"that selects model-server pods, so off-cluster backends cannot be attached", b.Name)
-		}
-		if b.InferenceServiceRef == nil {
-			return nil, fmt.Errorf("backend %q has no inferenceServiceRef", b.Name)
-		}
-
-		isvc := &inferencev1alpha1.InferenceService{}
-		key := types.NamespacedName{Name: b.InferenceServiceRef.Name, Namespace: mr.Namespace}
-		if err := r.Get(ctx, key, isvc); err != nil {
-			if apierrors.IsNotFound(err) {
-				return nil, fmt.Errorf("backend %q references InferenceService %q which does not exist in namespace %q",
-					b.Name, b.InferenceServiceRef.Name, mr.Namespace)
-			}
-			return nil, fmt.Errorf("backend %q: looking up InferenceService %q: %w", b.Name, b.InferenceServiceRef.Name, err)
-		}
-
-		port := int64(8080)
-		if isvc.Spec.Endpoint != nil && isvc.Spec.Endpoint.Port > 0 {
-			port = int64(isvc.Spec.Endpoint.Port)
+		isvc, err := r.backendInferenceService(ctx, mr, b)
+		if err != nil {
+			return nil, err
 		}
 		resolved = append(resolved, agentGatewayBackendResource{
 			Name: b.Name,
@@ -623,7 +637,7 @@ func (r *ModelRouterAgentGatewayReconciler) resolveAgentGatewayBackends(
 			// InferenceService name so one pool serves one model's pods.
 			PoolName: sanitizeDNSName(isvc.Name),
 			FQDN:     fmt.Sprintf("%s.%s.svc.cluster.local", sanitizeDNSName(isvc.Name), isvc.Namespace),
-			Port:     port,
+			Port:     gatewayServicePort(isvc),
 			Picker:   pickers[sanitizeDNSName(isvc.Name)],
 			// A backend is healthy iff its InferenceService has at least one ready
 			// replica. An unhealthy backend is ejected from the route's
@@ -633,6 +647,33 @@ func (r *ModelRouterAgentGatewayReconciler) resolveAgentGatewayBackends(
 		})
 	}
 	return resolved, nil
+}
+
+// backendInferenceService fetches a backend's InferenceService. External
+// backends and missing InferenceServices are errors.
+func (r *ModelRouterAgentGatewayReconciler) backendInferenceService(
+	ctx context.Context,
+	mr *inferencev1alpha1.ModelRouter,
+	b inferencev1alpha1.RouterBackend,
+) (*inferencev1alpha1.InferenceService, error) {
+	if b.External != nil {
+		return nil, fmt.Errorf("backend %q is External; dataPlane: AgentGateway routes to an InferencePool "+
+			"that selects model-server pods, so off-cluster backends cannot be attached", b.Name)
+	}
+	if b.InferenceServiceRef == nil {
+		return nil, fmt.Errorf("backend %q has no inferenceServiceRef", b.Name)
+	}
+
+	isvc := &inferencev1alpha1.InferenceService{}
+	key := types.NamespacedName{Name: b.InferenceServiceRef.Name, Namespace: mr.Namespace}
+	if err := r.Get(ctx, key, isvc); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, fmt.Errorf("backend %q references InferenceService %q which does not exist in namespace %q",
+				b.Name, b.InferenceServiceRef.Name, mr.Namespace)
+		}
+		return nil, fmt.Errorf("backend %q: looking up InferenceService %q: %w", b.Name, b.InferenceServiceRef.Name, err)
+	}
+	return isvc, nil
 }
 
 // applyAgentGatewayResource creates-or-updates desired. Objects in the
@@ -695,7 +736,13 @@ func (r *ModelRouterAgentGatewayReconciler) applyAgentGatewayResource(
 // requiredCRDsMissing reports whether the CRDs this slice needs are registered,
 // and, when they are not, exactly which GVKs are missing (so the disabled
 // condition can name them). Delegates to the shared crdDetector.
-func (r *ModelRouterAgentGatewayReconciler) requiredCRDsMissing(log logr.Logger) (bool, []schema.GroupVersionKind, error) {
+func (r *ModelRouterAgentGatewayReconciler) requiredCRDsMissing(log logr.Logger, modelRouting bool) (bool, []schema.GroupVersionKind, error) {
+	if modelRouting {
+		r.modelDetectorOnce.Do(func() {
+			r.modelDetector = newCRDDetector("agentgateway-model", []schema.GroupVersionKind{agentGatewayModelGVK()})
+		})
+		return r.modelDetector.PresentMissing(r.Client, log)
+	}
 	r.detectorOnce.Do(func() {
 		r.detector = newCRDDetector("agentgateway", modelRouterAgentGatewayGVKs())
 	})
@@ -756,6 +803,7 @@ func (r *ModelRouterAgentGatewayReconciler) agentGatewayAllowedRoutesViolation(
 	mr *inferencev1alpha1.ModelRouter,
 ) (string, error) {
 	policyNS := agentGatewayPolicyNamespace(mr)
+	sectionName := mr.Spec.AgentGatewayRef.SectionName
 	listeners, _, _ := unstructured.NestedSlice(gateway.Object, "spec", "listeners")
 
 	nsLabels := map[string]string{}
@@ -804,6 +852,13 @@ func (r *ModelRouterAgentGatewayReconciler) agentGatewayAllowedRoutesViolation(
 		proto, _, _ := unstructured.NestedString(listener, "protocol")
 		kinds, _, _ := unstructured.NestedSlice(listener, "allowedRoutes", "kinds")
 		summary = append(summary, describeListener(from, proto, kinds))
+
+		// A sectionName route attaches to that listener only.
+		if sectionName != "" {
+			if name, _, _ := unstructured.NestedString(listener, metadataNameField); name != sectionName {
+				continue
+			}
+		}
 
 		// An HTTPRoute attaches only to HTTP/HTTPS listeners, and only to
 		// kinds the listener lists: an unset kinds list defaults by protocol
@@ -862,10 +917,17 @@ func (r *ModelRouterAgentGatewayReconciler) agentGatewayAllowedRoutesViolation(
 			}
 		}
 	}
-	return fmt.Sprintf("Gateway %s/%s has no listener that admits namespace %q for an HTTPRoute (listeners: %s); "+
-		"the generated HTTPRoute would be refused (NotAllowedByListeners), and the model-extraction AgentgatewayPolicy "+
-		"must not be written without that consent",
-		policyNS, mr.Spec.AgentGatewayRef.Name, mr.Namespace, strings.Join(summary, ", ")), nil
+	listener := "no listener"
+	if sectionName != "" {
+		listener = fmt.Sprintf("no listener named %q", sectionName)
+	}
+	msg := fmt.Sprintf("Gateway %s/%s has %s that admits namespace %q for an HTTPRoute (listeners: %s); "+
+		"the generated HTTPRoute would be refused (NotAllowedByListeners)",
+		policyNS, mr.Spec.AgentGatewayRef.Name, listener, mr.Namespace, strings.Join(summary, ", "))
+	if agentGatewayModelRouting(mr) {
+		return msg, nil
+	}
+	return msg + ", and the model-extraction AgentgatewayPolicy must not be written without that consent", nil
 }
 
 // labelSelectorFromUnstructured converts an unstructured LabelSelector
@@ -1104,21 +1166,24 @@ func (r *ModelRouterAgentGatewayReconciler) cleanupExtractionPolicies(
 	return nil
 }
 
-// cleanupGeneratedPoolsAndRoutes deletes the InferencePools and HTTPRoute this
-// router generated, matched by the router-UID label in the router's namespace.
-// It runs when the router leaves AgentGateway mode (dataPlane change or ref
-// removal) and on deletion: owner-ref GC only fires when the router object
-// goes away, but a router that leaves the mode must stop attaching to the
-// Gateway immediately. The sweep is label-based, not owner-ref-based, because
-// the Gateway plane also owner-references objects in the router's namespace;
-// the UID label is what makes it mode-precise. A missing CRD (NoMatch, or the
-// cached-mapping 404 after CRD removal) means the API server removed the CRs
-// with it, so there is nothing to clean.
-func (r *ModelRouterAgentGatewayReconciler) cleanupGeneratedPoolsAndRoutes(
+// deleteGeneratedObjects deletes the objects of each given kind this router
+// generated, matched by the router-UID label in the router's namespace, except
+// the names in keep. It runs when the router leaves AgentGateway mode
+// (dataPlane change or ref removal) and on deletion: owner-ref GC only fires
+// when the router object goes away, but a router that leaves the mode must
+// stop attaching to the Gateway immediately. Each routing mode also runs it to
+// clear the other mode's kinds. The sweep is label-based, not owner-ref-based,
+// because the Gateway plane also owner-references objects in the router's
+// namespace; the UID label is what makes it mode-precise. A missing CRD
+// (NoMatch, or the cached-mapping 404 after CRD removal) means the API server
+// removed the CRs with it, so there is nothing to clean.
+func (r *ModelRouterAgentGatewayReconciler) deleteGeneratedObjects(
 	ctx context.Context,
 	mr *inferencev1alpha1.ModelRouter,
+	keep map[string]bool,
+	gvks ...schema.GroupVersionKind,
 ) error {
-	for _, gvk := range []schema.GroupVersionKind{inferencePoolGVK(), gatewayHTTPRouteGVK()} {
+	for _, gvk := range gvks {
 		list := &unstructured.UnstructuredList{}
 		list.SetGroupVersionKind(gvk)
 		if err := r.List(ctx, list, client.InNamespace(mr.Namespace),
@@ -1130,6 +1195,9 @@ func (r *ModelRouterAgentGatewayReconciler) cleanupGeneratedPoolsAndRoutes(
 		}
 		for i := range list.Items {
 			obj := &list.Items[i]
+			if keep[obj.GetName()] {
+				continue
+			}
 			if err := r.Delete(ctx, obj); err != nil && !apierrors.IsNotFound(err) {
 				return fmt.Errorf("delete %s %s/%s: %w", gvk.Kind, obj.GetNamespace(), obj.GetName(), err)
 			}
@@ -1167,7 +1235,7 @@ func (r *ModelRouterAgentGatewayReconciler) setAgentGatewayReady(
 ) error {
 	patch := client.MergeFrom(mr.DeepCopy())
 	mr.Status.AgentGateway = &inferencev1alpha1.AgentGatewayStatus{
-		PoolReady: true,
+		PoolReady: !agentGatewayModelRouting(mr),
 		Endpoint:  agentGatewayEndpointAddress(mr.Spec.AgentGatewayRef),
 	}
 	message := agentGatewayReadyMessage(mr)
@@ -1184,8 +1252,12 @@ func (r *ModelRouterAgentGatewayReconciler) setAgentGatewayReady(
 }
 
 // agentGatewayReadyMessage builds the success condition message: the rule count
-// and the resolved endpoint.
+// (with routing: Model, the model count) and the resolved endpoint.
 func agentGatewayReadyMessage(mr *inferencev1alpha1.ModelRouter) string {
+	if agentGatewayModelRouting(mr) {
+		return fmt.Sprintf("compiled %d model(s) onto agentgateway %s", len(mr.Spec.Backends),
+			agentGatewayEndpointAddress(mr.Spec.AgentGatewayRef))
+	}
 	return fmt.Sprintf("compiled %d rule(s) onto agentgateway %s", len(mr.Spec.Rules),
 		agentGatewayEndpointAddress(mr.Spec.AgentGatewayRef))
 }
@@ -1337,12 +1409,8 @@ func compileAgentGatewayRules(mr *inferencev1alpha1.ModelRouter) ([]agentGateway
 	// defaultRoute catch-all. First-match ordering mirrors the proxy.
 	if mr.Spec.DefaultRouteStrategy == inferencev1alpha1.DefaultRouteStrategyBackendNameMatch {
 		for _, b := range mr.Spec.Backends {
-			modelID := b.Name
-			if b.DisplayName != "" {
-				modelID = b.DisplayName
-			}
 			rules = append(rules, agentGatewayRuleResource{
-				Models:      []string{modelID},
+				Models:      []string{agentGatewayServedName(b)},
 				BackendRefs: []agentGatewayBackendRef{{Name: b.Name}},
 			})
 		}

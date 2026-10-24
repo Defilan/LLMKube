@@ -1,9 +1,10 @@
 # CRDs for `make test-e2e-rbac` with RBAC_E2E_GATEWAY_API=true.
 
-These two files are symlinks into the vendored upstream CRDs
+These three files are symlinks into the vendored upstream CRDs
 (`test/crd/inference-extension/README.md` records their provenance). The
-AgentGateway plane needs the InferencePool and AgentgatewayPolicy kinds, which
-the upstream Gateway API standard bundle does not ship.
+AgentGateway plane needs the InferencePool, AgentgatewayPolicy and
+AgentgatewayModel kinds, which the upstream Gateway API standard bundle does
+not ship.
 
 The vendored directory also contains hand-made Gateway and HTTPRoute stubs.
 Those must NOT be installed next to `RBAC_E2E_GATEWAY_API=true`: the script

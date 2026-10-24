@@ -184,6 +184,9 @@ func agentGatewayModeViolations(mr *inferencev1alpha1.ModelRouter, specPath *fie
 	if _, reason, msg := agentGatewayResolvePoolPickers(mr); reason != "" {
 		errs = append(errs, field.Invalid(specPath.Child("backends"), nil, msg))
 	}
+	if msg := agentGatewayModelRoutingMessage(mr); msg != "" {
+		errs = append(errs, field.Invalid(specPath, nil, msg))
+	}
 	if msg := agentGatewayUnsupportedMatchMessage(mr); msg != "" {
 		errs = append(errs, field.Invalid(specPath.Child("rules"), nil, msg))
 	}

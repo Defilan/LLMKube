@@ -81,6 +81,7 @@ rules:
 - apiGroups:
   - agentgateway.dev
   resources:
+  - agentgatewaymodels
   - agentgatewaypolicies
   verbs:
   - create

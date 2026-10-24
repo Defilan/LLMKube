@@ -37,8 +37,12 @@ type agentGatewayPicker struct {
 // every pool resolves exactly one picker and no picker serves two pools. A
 // non-empty reason names the refusal; the reconciler and the webhook both call
 // this, so admission and reconcile cannot diverge. External backends are not
-// counted: the reconciler refuses them separately.
+// counted: the reconciler refuses them separately. routing: Model compiles no
+// pool, so it resolves none.
 func agentGatewayResolvePoolPickers(mr *inferencev1alpha1.ModelRouter) (map[string]agentGatewayPicker, string, string) {
+	if agentGatewayModelRouting(mr) {
+		return nil, "", ""
+	}
 	var def *agentGatewayPicker
 	if ref := mr.Spec.AgentGatewayRef; ref != nil && ref.EndpointPicker != "" {
 		def = &agentGatewayPicker{Name: ref.EndpointPicker, Port: ref.EndpointPickerPort}

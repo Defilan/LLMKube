@@ -347,6 +347,65 @@ Each `InferencePool` is named after its `InferenceService`, and a router never a
 
 `primary-fallback` routes each rule to its first healthy backend. When that backend's `InferenceService` has no ready replica, the next reconcile moves the rule to the next backend. Failover follows replica readiness, not individual request errors: a primary that is up but failing requests keeps its traffic.
 
+## Model routing on dataPlane: AgentGateway
+
+`agentGatewayRef.routing: Model` compiles the router onto agentgateway's own model router instead of the Inference Extension. It needs agentgateway v1.6.0 or later, which ships the `AgentgatewayModel` CRD, and a Gateway. It needs no Gateway API Inference Extension CRDs, no Endpoint Picker, and no Gateway-wide policy, which suits single-replica `InferenceService`s reached through their Service.
+
+```yaml
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: ModelRouter
+metadata:
+  name: llm-router
+spec:
+  dataPlane: AgentGateway
+  agentGatewayRef:
+    name: ai-gateway
+    routing: Model
+    sectionName: llm
+  backends:
+    - name: chat
+      displayName: chat-large
+      inferenceServiceRef:
+        name: chat-vllm
+    - name: chat-small
+      inferenceServiceRef:
+        name: chat-llama
+    - name: reranker
+      inferenceServiceRef:
+        name: reranker
+```
+
+`chat-vllm` must start vLLM with `--served-model-name=chat-large` in its `extraArgs`, since LLMKube does not set that flag.
+
+The router generates, all in its own namespace and owned by it:
+
+- one `HTTPRoute` named after the router, attached to the Gateway, with a single rule named `models` at `/` whose only backend is `AgentgatewayModel` `*`. The rule sits at `/` because agentgateway strips the rule's path prefix before it classifies the endpoint: under `/v1`, `/v1/embeddings` would parse as a chat completion;
+- one `AgentgatewayModel` per backend, named `<router>-<backend>` (cut and hashed past 63 characters), attached to that rule. Its `match.model` is the backend's `displayName`, else its `name`, so served names such as `Qwen3.5-2B` or `org/model` work. It reaches the `InferenceService`'s Service through a custom provider, and the request keeps its model name, so the served name must be one the runtime answers to: llama.cpp ignores it, and vLLM needs a matching `--served-model-name` in `extraArgs`.
+
+The provider and API formats come from the `InferenceService`:
+
+| Runtime | `spec.mode` (or inferred) | `providerOverride` | Formats |
+|---|---|---|---|
+| `llamacpp` (or unset) | chat | `llamacpp` | `Completions` |
+| `vllm` | chat | `vllm` | `Completions`, `Messages`, `AnthropicTokenCount`, `Responses` |
+| `llamacpp`, `vllm` | embedding | as above | `Embeddings` |
+| `llamacpp`, `vllm` | rerank | as above | `Rerank` |
+
+agentgateway then routes each request on the body's `model`, answers `GET /v1/models` itself, and returns a JSON 404 `model_not_found` for a model no backend serves.
+
+A rule at `/` takes every path on the listeners it attaches to, so this mode requires `agentGatewayRef.sectionName` (one listener), `agentGatewayRef.hostnames`, or both. Your own routes still share the listener: a rule with a longer match, such as a `PathPrefix` `/v1` with a header match, outranks the router's `/`. Use one `routing: Model` router per listener and hostname. Two routers' `/` rules tie, Gateway API gives the tie to the older route, and the newer router's models get no traffic.
+
+The router reports `AgentGatewayReady=False` and generates nothing when:
+
+- the `AgentgatewayModel` CRD is not installed (`AgentgatewayModelCRDNotInstalled`);
+- the spec has `rules`, a `defaultRoute`, an `external` backend, `resolution: endpoint`, a backend `endpointPicker`, a served name containing `*`, or two backends serving one name (`UnsupportedInModelRouting`; the webhook rejects these at apply time). Fallback between backends and external backends need an `AgentgatewayBackend`, which this mode does not generate yet;
+- a backend's `InferenceService` runs a runtime other than `llamacpp` or `vllm`, or runs vLLM without a `--served-model-name` matching the backend's served name (`UnsupportedRuntimeInModelRouting`);
+- a generated name is held by an object LLMKube did not create (`GeneratedResourceNameTaken`); delete or rename that object.
+
+When you replace hand-written `AgentgatewayModel`s with a router, remove the hand-written ones for the same model names on that listener, so each name has one model.
+
+Removing a backend deletes its model. Switching `routing` in either direction deletes the other mode's objects, including the `InferencePool` mode's extraction policy in the Gateway's namespace.
+
 ## Composition with LiteLLM
 
 LLMKube does not replace [LiteLLM](https://github.com/BerriAI/litellm). For organizations already running a LiteLLM proxy as their cloud-provider abstraction, point a `ModelRouter` external backend at it:

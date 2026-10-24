@@ -209,15 +209,6 @@ func newAgentGatewayHTTPRoute(
 	rules []agentGatewayRuleResource,
 	backends []agentGatewayBackendResource,
 ) *unstructured.Unstructured {
-	parentRef := map[string]interface{}{
-		metadataNameField: ref.Name,
-		"kind":            "Gateway",
-		"group":           gatewayBackendRefGroupAPI,
-	}
-	if ref.Namespace != "" {
-		parentRef["namespace"] = ref.Namespace
-	}
-
 	compiledRules := make([]interface{}, 0, len(rules))
 	poolFor := make(map[string]string, len(backends))
 	for _, b := range backends {
@@ -235,10 +226,27 @@ func newAgentGatewayHTTPRoute(
 	// leaving-AgentGateway sweep can find it (mirrors the extraction policy).
 	u.SetLabels(map[string]string{agentGatewayRouterUIDLabel: string(mr.UID)})
 	u.Object["spec"] = map[string]interface{}{
-		"parentRefs": []interface{}{parentRef},
+		"parentRefs": []interface{}{agentGatewayRouteParentRef(ref)},
 		"rules":      compiledRules,
 	}
 	return u
+}
+
+// agentGatewayRouteParentRef only carries a sectionName with routing: Model,
+// where the CRD allows it, so the InferencePool route renders unchanged.
+func agentGatewayRouteParentRef(ref *inferencev1alpha1.AgentGatewayReference) map[string]interface{} {
+	parentRef := map[string]interface{}{
+		metadataNameField: ref.Name,
+		"kind":            "Gateway",
+		"group":           gatewayBackendRefGroupAPI,
+	}
+	if ref.Namespace != "" {
+		parentRef["namespace"] = ref.Namespace
+	}
+	if ref.SectionName != "" {
+		parentRef["sectionName"] = ref.SectionName
+	}
+	return parentRef
 }
 
 // compileAgentGatewayRouteRule builds one HTTPRoute rule: the matches block (a

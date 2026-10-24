@@ -58,3 +58,24 @@ spec:
     route:
       backends:
       - local
+---
+# The same backend through agentGatewayRef.routing: Model. This exercises
+# agentgatewaymodels create/update, and the lists every Model-mode reconcile
+# runs to sweep the other mode's objects and the models of removed backends.
+# Deleting it exercises owner-reference garbage collection of the route and
+# the model, as for the router above.
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: ModelRouter
+metadata:
+  name: rbac-agw-model-router
+spec:
+  dataPlane: AgentGateway
+  agentGatewayRef:
+    name: rbac-agw-gateway
+    routing: Model
+    sectionName: http
+  backends:
+  - name: local
+    tier: local
+    inferenceServiceRef:
+      name: rbac-agw-cpu

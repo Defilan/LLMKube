@@ -68,6 +68,8 @@ spec:
                   items:
                     type: object
                     properties:
+                      name:
+                        type: string
                       matches:
                         type: array
                         items:

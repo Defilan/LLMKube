@@ -803,18 +803,62 @@ type MCPServerSpec struct {
 	Enabled bool `json:"enabled,omitempty"`
 }
 
+// AgentGatewayRouting selects what a dataPlane: AgentGateway ModelRouter
+// compiles to.
+type AgentGatewayRouting string
+
+const (
+	AgentGatewayRoutingInferencePool AgentGatewayRouting = "InferencePool"
+	AgentGatewayRoutingModel         AgentGatewayRouting = "Model"
+)
+
 // AgentGatewayReference identifies the pre-installed agentgateway data plane a
 // dataPlane: AgentGateway ModelRouter compiles onto. The Gateway is the
 // gateway.networking.k8s.io Gateway whose GatewayClass is agentgateway; the
 // EndpointPicker is the Endpoint Picker (EPP) Service that selects a model
 // server endpoint per request for each generated InferencePool. The Gateway,
 // the Gateway API Inference Extension CRDs, and a running EPP are documented
-// prerequisites that LLMKube does not install or own.
+// prerequisites that LLMKube does not install or own. With routing: Model only
+// the Gateway and agentgateway v1.6.0 or later are.
 // +kubebuilder:validation:XValidation:rule="has(self.endpointPicker) == has(self.endpointPickerPort)",message="endpointPicker and endpointPickerPort must be set together"
+// +kubebuilder:validation:XValidation:rule="!(has(self.routing) && self.routing == 'Model') || !has(self.endpointPicker)",message="endpointPicker and endpointPickerPort apply only to routing: InferencePool"
+// +kubebuilder:validation:XValidation:rule="!(has(self.routing) && self.routing == 'Model') || has(self.sectionName) || has(self.hostnames)",message="routing: Model requires sectionName or hostnames: its HTTPRoute matches every path, so it must not take over a whole Gateway"
+// +kubebuilder:validation:XValidation:rule="(has(self.routing) && self.routing == 'Model') || (!has(self.sectionName) && !has(self.hostnames))",message="sectionName and hostnames apply only to routing: Model"
 type AgentGatewayReference struct {
 	// Name is the agentgateway Gateway's name.
 	// +kubebuilder:validation:Required
 	Name string `json:"name"`
+
+	// Routing selects the compile target. "InferencePool" (the default) is the
+	// Gateway API Inference Extension path described on spec.agentGatewayRef.
+	// "Model" uses agentgateway's model router (v1.6.0+): one AgentgatewayModel
+	// per backend, matched on its displayName (else name), behind one
+	// catch-all HTTPRoute. It needs no Inference Extension CRDs or Endpoint
+	// Picker. spec.rules, spec.defaultRoute, external backends, resolution:
+	// endpoint, and per-backend endpoint pickers are refused in this mode.
+	// +kubebuilder:validation:Enum=InferencePool;Model
+	// +kubebuilder:default=InferencePool
+	// +optional
+	Routing AgentGatewayRouting `json:"routing,omitempty"`
+
+	// SectionName names the Gateway listener the generated HTTPRoute attaches
+	// to. routing: Model only, where it or hostnames is required, because the
+	// route takes every path on its listeners.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	// +optional
+	SectionName string `json:"sectionName,omitempty"`
+
+	// Hostnames limit the generated HTTPRoute to these hosts. routing: Model
+	// only, where it or sectionName is required.
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=253
+	// +kubebuilder:validation:items:Pattern=`^(\*\.)?[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	// +optional
+	Hostnames []string `json:"hostnames,omitempty"`
 
 	// Namespace is the Gateway's namespace. Empty means the ModelRouter's own
 	// namespace. A different namespace is supported: the generated

@@ -9,12 +9,15 @@ schemas on purpose: the generated InferencePool spec must pass server-side
 validation (a flat `selector` map was once emitted here and only the real CRD's
 `matchLabels` requirement catches it), and the AgentgatewayPolicy CRD's CEL
 rules (PreRouting targets a Gateway/ListenerSet, same-namespace targetRefs) are
-why the generated extraction policy lives in the Gateway's namespace.
+why the generated extraction policy lives in the Gateway's namespace. The
+AgentgatewayModel CRD's CEL rules (a custom provider's backendRef kind, a
+match.model wildcard shape) check what agentGatewayRef.routing: Model generates.
 
 | File                     | Source                                                               | Pinned   | License    |
 |--------------------------|----------------------------------------------------------------------|----------|------------|
 | inferencepool.yaml       | kubernetes-sigs/gateway-api-inference-extension config/crd/bases      | v1.6.2   | Apache-2.0 |
 | agentgatewaypolicy.yaml  | agentgateway/agentgateway agentgateway-crds chart template            | v1.6.0   | Apache-2.0 |
+| agentgatewaymodel.yaml   | agentgateway/agentgateway agentgateway-crds chart template            | v1.6.0   | Apache-2.0 |
 | gateway.yaml             | Hand-made minimal stub (Gateway API v1 Gateway; permissive spec)      | -        | -          |
 | httproute.yaml           | Hand-made minimal stub (Gateway API v1 HTTPRoute)                     | -        | -          |
 
