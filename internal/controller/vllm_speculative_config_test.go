@@ -148,6 +148,19 @@ func TestAppendSpeculativeConfig(t *testing.T) {
 			},
 		},
 		{
+			name: "a method that needs no draft ignores a path the resolver picked",
+			cfg: &inferencev1alpha1.SpeculativeConfig{
+				Enabled:              ptrBool(true),
+				Method:               "mtp",
+				NumSpeculativeTokens: ptrInt32(2),
+			},
+			draftPath: "/models/stray",
+			want: map[string]interface{}{
+				"method":                 "mtp",
+				"num_speculative_tokens": float64(2),
+			},
+		},
+		{
 			name: "extraArgs --speculative-config wins",
 			cfg: &inferencev1alpha1.SpeculativeConfig{
 				Enabled:              ptrBool(true),
@@ -240,6 +253,87 @@ func TestAppendSpeculativeConfigEmitsNoLegacyFlags(t *testing.T) {
 				t.Fatalf("%s is not a vLLM flag and must never be emitted, got %v", legacy, args)
 			}
 		}
+	}
+}
+
+// TestDraftWeightsRefForPrefersTheVLLMBlock covers a service that carries both
+// speculative blocks, which is what a llama.cpp service looks like after it is
+// switched to vLLM. Only the vLLM block's path reaches the vLLM argv, so
+// resolving the llama block there would mount the wrong weights and hand vLLM
+// their path. The llama block still resolves when no enabled vLLM block names a
+// model, so a switched-over service that never set one keeps its old behavior.
+func TestDraftWeightsRefForPrefersTheVLLMBlock(t *testing.T) {
+	both := func(runtime string) *inferencev1alpha1.InferenceService {
+		return &inferencev1alpha1.InferenceService{
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				Runtime: runtime,
+				SpeculativeDecoding: &inferencev1alpha1.SpeculativeDecodingSpec{
+					Type: "draft-dspark", DraftModelRef: "llama-draft",
+				},
+				VLLMConfig: &inferencev1alpha1.VLLMConfig{
+					Speculative: &inferencev1alpha1.SpeculativeConfig{
+						Enabled: ptrBool(true),
+						Model:   "vllm-draft",
+					},
+				},
+			},
+		}
+	}
+
+	cases := []struct {
+		name      string
+		isvc      *inferencev1alpha1.InferenceService
+		wantRef   string
+		wantField string
+	}{
+		{
+			name:      "both blocks on a vllm service resolves the vllm field",
+			isvc:      both("vllm"),
+			wantRef:   "vllm-draft",
+			wantField: "spec.vllmConfig.speculative.model",
+		},
+		{
+			name:      "both blocks on a llama.cpp service resolves the llama field",
+			isvc:      both("llamacpp"),
+			wantRef:   "llama-draft",
+			wantField: "spec.speculativeDecoding.draftModelRef",
+		},
+		{
+			name: "a disabled vllm block leaves the llama field",
+			isvc: func() *inferencev1alpha1.InferenceService {
+				i := both("vllm")
+				i.Spec.VLLMConfig.Speculative.Enabled = ptrBool(false)
+				return i
+			}(),
+			wantRef:   "llama-draft",
+			wantField: "spec.speculativeDecoding.draftModelRef",
+		},
+		{
+			name: "a method-only vllm block leaves the llama field",
+			isvc: func() *inferencev1alpha1.InferenceService {
+				i := both("vllm")
+				i.Spec.VLLMConfig.Speculative.Model = ""
+				i.Spec.VLLMConfig.Speculative.Method = "mtp"
+				return i
+			}(),
+			wantRef:   "llama-draft",
+			wantField: "spec.speculativeDecoding.draftModelRef",
+		},
+		{
+			name:      "nil service resolves nothing",
+			isvc:      nil,
+			wantRef:   "",
+			wantField: "",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ref, field := draftWeightsRefFor(tc.isvc)
+			if ref != tc.wantRef || field != tc.wantField {
+				t.Fatalf("got (%q, %q), want (%q, %q)", ref, field, tc.wantRef, tc.wantField)
+			}
+		})
 	}
 }
 

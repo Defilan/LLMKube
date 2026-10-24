@@ -53,7 +53,9 @@ var _ = Describe("vLLM speculative decoding", func() {
 		}
 		if multiFile {
 			spec.Format = "safetensors"
-			spec.Source = "hf://example/draft"
+			// The cache key derives from the source, so a distinct repo per
+			// fixture keeps two drafts' staged paths distinguishable.
+			spec.Source = "hf://example/" + name
 			spec.Files = []string{"config.json", "model-00001-of-00001.safetensors"}
 		}
 		model := &inferencev1alpha1.Model{
@@ -85,12 +87,17 @@ var _ = Describe("vLLM speculative decoding", func() {
 	}
 
 	// reconcileAndRead reconciles once and returns the Deployment the
-	// reconciler wrote, which is the object that reaches the node.
+	// reconciler wrote, which is the object that reaches the node. A cache
+	// path is set so the models stage into the operator's cache the way a
+	// real deployment does, which is what makes the rendered draft path a
+	// cache-key directory rather than a flat file name.
 	reconcileAndRead := func(name string) (*appsv1.Deployment, *inferencev1alpha1.InferenceService) {
 		r := &InferenceServiceReconciler{
 			Client:             k8sClient,
 			Scheme:             k8sClient.Scheme(),
 			InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			ModelCachePath:     "/models",
+			ModelCacheMode:     ModelCacheModePerService,
 		}
 		_, err := r.Reconcile(ctx, reconcile.Request{
 			NamespacedName: types.NamespacedName{Name: name, Namespace: "default"},
@@ -199,7 +206,11 @@ var _ = Describe("vLLM speculative decoding", func() {
 		Expect(modelValue).NotTo(BeEmpty(), "args: %v", args)
 		Expect(modelValue).NotTo(Equal(draft.Name),
 			"the draft Model's name is not a path vLLM can load: %v", args)
-		Expect(modelValue).To(HavePrefix("/models/"), "args: %v", args)
+		// The mount point depends on whether the draft's claim collided with
+		// the target's and was remounted, so assert the cache-key directory
+		// the staging plan gives a multi-file draft, not a fixed prefix.
+		Expect(modelValue).To(ContainSubstring(effectiveModelCacheKey(draft)),
+			"the rendered path must be the draft's staged directory, got %q (args %v)", modelValue, args)
 		Expect(got["method"]).To(Equal("draft_model"), "args: %v", args)
 		Expect(got["num_speculative_tokens"]).To(Equal(float64(4)), "args: %v", args)
 		Expect(args).NotTo(ContainElement("--speculative-model"), "args: %v", args)
@@ -328,6 +339,55 @@ var _ = Describe("vLLM speculative decoding", func() {
 		}
 	})
 
+	// Both blocks on one vllm service is what a llama.cpp service looks like
+	// after it is switched to vLLM. The rendered model and the staged weights
+	// must both be the vLLM block's draft; resolving the llama block would
+	// hand vLLM the wrong Model's path.
+	It("resolves the vllm draft, not the llama block, when both are set", func() {
+		const name = "vllm-spec-both"
+		target := newSpecModel("vllm-spec-both-target", false)
+		llamaDraft := newSpecModel("vllm-spec-both-llamadraft", false)
+		vllmDraft := newSpecModel("vllm-spec-both-vllmdraft", true)
+		defer cleanup(name, target, llamaDraft, vllmDraft)
+
+		Expect(newSpecISvc(name, "vllm", target.Name, map[string]interface{}{
+			"speculativeDecoding": map[string]interface{}{
+				"type":          "draft-dspark",
+				"draftModelRef": llamaDraft.Name,
+			},
+			"vllmConfig": map[string]interface{}{
+				"speculative": map[string]interface{}{
+					"enabled":              true,
+					"model":                vllmDraft.Name,
+					"numSpeculativeTokens": int64(4),
+				},
+			},
+		})).To(Succeed())
+
+		dep, isvc := reconcileAndRead(name)
+		Expect(isvc.Status.Phase).NotTo(Equal(PhaseFailed), "status: %+v", isvc.Status)
+		args := servedArgs(dep)
+
+		got, ok := speculativeConfigValue(args)
+		Expect(ok).To(BeTrue(), "args carry no --speculative-config: %v", args)
+		rendered, _ := got["model"].(string)
+		// The staged path carries the Model's cache key, which for a multi-file
+		// Model is derived from its source.
+		vllmKey := effectiveModelCacheKey(vllmDraft)
+		Expect(vllmKey).NotTo(BeEmpty(), "fixture: the vLLM draft needs a cache key")
+		Expect(rendered).To(ContainSubstring(vllmKey),
+			"the rendered path must be the vLLM block's draft, got %q (args %v)", rendered, args)
+
+		// The llama field still mounts too (base behavior), but only the vLLM
+		// draft's path may reach the argv.
+		names := make([]string, 0, len(dep.Spec.Template.Spec.InitContainers))
+		for _, c := range dep.Spec.Template.Spec.InitContainers {
+			names = append(names, c.Name)
+		}
+		Expect(countString(names, "draft-model-downloader")).To(Equal(1),
+			"exactly one draft is staged, got %v", names)
+	})
+
 	// Parity: spec.speculativeDecoding (the llama.cpp field) feeds no vLLM
 	// argument; its draft still rides in the pod on both trees.
 	It("leaves spec.speculativeDecoding inert for the vllm argv", func() {
@@ -347,6 +407,15 @@ var _ = Describe("vLLM speculative decoding", func() {
 		args := servedArgs(dep)
 		Expect(args).NotTo(ContainElement("--speculative-config"), "args: %v", args)
 		Expect(args).NotTo(ContainElement("--speculative-model"), "args: %v", args)
+
+		// The block is inert for the argv but not for the pod: the draft is
+		// still staged, as it is on base.
+		names := make([]string, 0, len(dep.Spec.Template.Spec.InitContainers))
+		for _, c := range dep.Spec.Template.Spec.InitContainers {
+			names = append(names, c.Name)
+		}
+		Expect(countString(names, "draft-model-downloader")).To(Equal(1),
+			"a llama block still mounts its draft, got %v", names)
 	})
 
 	// Parity: extraArgs carrying --speculative-config wins, exactly once.

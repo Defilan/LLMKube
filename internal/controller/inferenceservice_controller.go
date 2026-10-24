@@ -450,13 +450,14 @@ func (r *InferenceServiceReconciler) getModelForInferenceService(ctx context.Con
 // mapping. They MUST agree: the resolver fails closed on a draft that is not
 // yet Ready, so a mapping that does not enqueue on that same draft leaves the
 // service Pending until the next full resync.
+//
+// The enabled vLLM block is consulted first because only its path reaches the
+// vLLM argv: a service switched from llama.cpp to vLLM can still carry a
+// speculativeDecoding block, and resolving that one would mount the wrong
+// weights and hand vLLM their path.
 func draftWeightsRefFor(isvc *inferencev1alpha1.InferenceService) (string, string) {
 	if isvc == nil {
 		return "", ""
-	}
-	sd := isvc.Spec.SpeculativeDecoding
-	if sd != nil && specTypeNeedsDraftWeights(sd.Type) && sd.DraftModelRef != "" {
-		return sd.DraftModelRef, "spec.speculativeDecoding.draftModelRef"
 	}
 	if isvc.Spec.Runtime == RuntimeVLLM {
 		cfg := isvc.Spec.VLLMConfig
@@ -464,6 +465,10 @@ func draftWeightsRefFor(isvc *inferencev1alpha1.InferenceService) (string, strin
 			*cfg.Speculative.Enabled && cfg.Speculative.Model != "" {
 			return cfg.Speculative.Model, "spec.vllmConfig.speculative.model"
 		}
+	}
+	sd := isvc.Spec.SpeculativeDecoding
+	if sd != nil && specTypeNeedsDraftWeights(sd.Type) && sd.DraftModelRef != "" {
+		return sd.DraftModelRef, "spec.speculativeDecoding.draftModelRef"
 	}
 	return "", ""
 }

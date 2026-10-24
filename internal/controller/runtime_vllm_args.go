@@ -204,7 +204,10 @@ func appendSpeculativeConfig(args []string, cfg *inferencev1alpha1.SpeculativeCo
 	if cfg.Method != "" {
 		payload.Method = cfg.Method
 	}
-	if draftPath != "" {
+	// Keyed on cfg.Model, not on draftPath: draftPath belongs to whichever
+	// Model the resolver picked, and a method that needs no draft must not
+	// carry the path of one.
+	if cfg.Model != "" {
 		// The path, not the CR name: vLLM loads what the pod mounted.
 		payload.Model = draftPath
 		if payload.Method == "" {
