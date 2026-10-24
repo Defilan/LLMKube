@@ -764,8 +764,8 @@ A vLLM or SGLang service needs its runtime image inside the perimeter,
 plus the curl init image from Step 1 when the source is `s3://` (a
 `pvc://` directory source runs no init container). The defaults the
 operator falls back to are compiled into each release (for example
-`vllm/vllm-openai:v0.25.1`, `lmsysorg/sglang:v0.5.15.post1-cu129`, and
-`lmsysorg/sglang:v0.5.15-rocm720-mi30x` for AMD GPU Models), so set
+`vllm/vllm-openai:v0.25.1`, `lmsysorg/sglang:v0.5.22-cu130`, and
+`lmsysorg/sglang:v0.5.22-rocm720-mi30x` for AMD GPU Models), so set
 them explicitly rather than relying on whatever your controller
 version picks.
 

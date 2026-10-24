@@ -71,10 +71,12 @@ spec:
 ```
 
 **On a 580-branch (or newer) driver, also use the CUDA 13 image and FlashInfer
-linear-attention prefill.** LLMKube's default SGLang image is `-cu129` so it
-runs on the 570 driver branch; FlashInfer's linear-attention prefill kernel on
-Blackwell needs CUDA 13. Set the image fleet-wide with the chart value
-`runtimeImages.sglang`, or per service:
+linear-attention prefill.** FlashInfer's linear-attention prefill kernel on
+Blackwell needs CUDA 13. LLMKube's default SGLang image has been the CUDA 13
+`v0.5.22-cu130` build since #2213, so on a current release only the attention
+flags are needed. On an older release whose default is `-cu129`, also set a
+`-cu130` image fleet-wide with the chart value `runtimeImages.sglang`, or per
+service:
 
 ```yaml
 spec:
@@ -87,9 +89,11 @@ spec:
     - flashinfer
 ```
 
-`attentionBackend` accepts SGLang v0.5.15's `--attention-backend` choices,
-including the Blackwell-native `trtllm_mha`, `trtllm_mla`, `fa4` and
-`cutlass_mla`.
+`attentionBackend` accepts SGLang's `--attention-backend` choices, including
+the Blackwell-native `trtllm_mha`, `trtllm_mla`, `cutedsl_mla` and `fa4`.
+`cutlass_mla` was removed in SGLang v0.5.20, so the default image rejects it;
+it still runs on an image at v0.5.19 or older, and the `SGLangSpecValid`
+condition says so.
 
 ## Not yet measured
 

@@ -46,24 +46,34 @@ const RuntimeSGLANG = "sglang"
 // fatal to reconciliation (e.g., speculative enabled without an algorithm).
 const ConditionSGLangSpecValid = "SGLangSpecValid"
 
-// sglangInvalidAttentionBackend is the one value the attentionBackend enum
-// admits that SGLang rejects: it is not among SGLang's --attention-backend
-// choices in any release checked (v0.4.6, v0.5.0, v0.5.12, v0.5.15).
+// sglangInvalidAttentionBackend is a value the attentionBackend enum admits
+// that SGLang rejects: it is not among SGLang's --attention-backend choices in
+// any release checked (v0.4.6, v0.5.0, v0.5.12, v0.5.15, v0.5.22).
 const sglangInvalidAttentionBackend = "flash_attn"
 
-// sglangCUDAImage is the pinned default CUDA image. Tag verified at PR time
-// against Docker Hub; bump in a follow-up if a newer SGLang release is required.
+// sglangRemovedAttentionBackends are enum values SGLang accepted through
+// v0.5.19 and removed from its --attention-backend choices in v0.5.20, so the
+// default image rejects them while an older pinned image still runs them
+// (#2213). The value maps to a replacement worth naming in the condition.
+var sglangRemovedAttentionBackends = map[string]string{
+	"cutlass_mla":           "trtllm_mla, cutedsl_mla or flashmla on Blackwell",
+	"dual_chunk_flash_attn": "leave it unset to let SGLang choose",
+}
+
 // sglangCUDAImage pins the newest stable SGLang CUDA image (verified
-// 2026-07-21 via github.com/sgl-project/sglang/releases and Docker Hub).
-// Blackwell is a first-class SGLang target (SM100 CuteDSL kernels since
-// v0.5.14, Blackwell MLA backend since v0.5.12). The -cu129 variant matches
-// the 570 driver branch; 580-branch fleets can pin -cu130 via
-// runtimeImages.sglang or spec.image.
-const sglangCUDAImage = "lmsysorg/sglang:v0.5.15.post1-cu129"
+// 2026-10-24 via github.com/sgl-project/sglang/releases and Docker Hub,
+// published for amd64 and arm64). It is a CUDA 13 build, so it needs the
+// R580 driver branch or newer, the same floor as the vLLM default. SGLang
+// stopped publishing -cu129 images at v0.5.20, and R570 reached end of life
+// in February 2026; nodes still on R570 can pin
+// lmsysorg/sglang:v0.5.19-cu129 via runtimeImages.sglang or spec.image
+// (#2213). Blackwell is a first-class SGLang target (SM100 CuteDSL kernels
+// since v0.5.14, Blackwell MLA backend since v0.5.12).
+const sglangCUDAImage = "lmsysorg/sglang:v0.5.22-cu130"
 
 // sglangROCmImage is the AMD ROCm variant. Selected by resolveRuntimeImage
 // when model.Spec.Hardware.GPU.Vendor == "amd".
-const sglangROCmImage = "lmsysorg/sglang:v0.5.15-rocm720-mi30x"
+const sglangROCmImage = "lmsysorg/sglang:v0.5.22-rocm720-mi30x"
 
 // SGLangBackend generates container configuration for the SGLang inference
 // server (https://github.com/sgl-project/sglang).
@@ -216,6 +226,13 @@ func ValidateSGLangConfig(isvc *inferencev1alpha1.InferenceService) (reason, mes
 	if cfg.AttentionBackend == sglangInvalidAttentionBackend {
 		return "AttentionBackendUnsupported",
 			"spec.sglangConfig.attentionBackend flash_attn is not an SGLang attention backend; SGLang exits at startup with an invalid-choice error. Use fa3 on Hopper, trtllm_mha or flashinfer on Blackwell, or leave it unset to let SGLang choose"
+	}
+	// Informational like the rest of this condition: the flag still renders,
+	// because a service pinned to an image at v0.5.19 or older runs it fine.
+	if instead, removed := sglangRemovedAttentionBackends[cfg.AttentionBackend]; removed {
+		return "AttentionBackendRemoved",
+			fmt.Sprintf("spec.sglangConfig.attentionBackend %s was removed in SGLang v0.5.20; the default image exits at startup with an invalid-choice error. It still runs on an image at v0.5.19 or older, such as lmsysorg/sglang:v0.5.19-cu129 set in spec.image; otherwise use %s",
+				cfg.AttentionBackend, instead)
 	}
 	if cfg.Speculative != nil && cfg.Speculative.Enabled != nil && *cfg.Speculative.Enabled {
 		if cfg.Speculative.Algorithm == "" || cfg.Speculative.DraftModelPath == "" {
