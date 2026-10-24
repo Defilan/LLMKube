@@ -86,6 +86,10 @@ federation-chart-crds: manifests ## Sync federation.llmkube.dev CRDs into the ma
 check-helm-rbac: manifests ## Verify the Helm charts' RBAC covers every kubebuilder-generated rule (#379).
 	@./scripts/check-helm-rbac.sh
 
+.PHONY: check-go-version
+check-go-version: ## Verify every golang builder image matches go.mod's go version (#2211).
+	@./scripts/check-go-version.sh
+
 .PHONY: check-helm-webhook-cert
 check-helm-webhook-cert: ## Verify the webhook serving cert names the capped Service (#1885).
 	@./scripts/check-helm-webhook-cert.sh
@@ -565,7 +569,7 @@ FOREMAN_OPERATOR_IMG     ?= ghcr.io/defilantech/llmkube-foreman-operator:dev
 FOREMAN_AGENT_IMG        ?= ghcr.io/defilantech/llmkube-foreman-agent:dev
 # Coder-Job builder image (#620) and in-cluster foreman-agent toolchain
 # image (#797): foreman-agent binary + go/make/git/golangci-lint/
-# controller-gen on the gate's golang:1.26 base, so the in-Job coder
+# controller-gen on a golang base pinned to go.mod's version, so the in-Job coder
 # and the in-cluster foreman-agent fast gate can run `make fmt vet lint
 # test`. Referenced by Agent.spec.execution.image.
 FOREMAN_AGENT_BUILDER_IMG ?= ghcr.io/defilantech/llmkube-foreman-agent-builder:dev
@@ -675,7 +679,7 @@ GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
 GOVULNCHECK = $(LOCALBIN)/govulncheck
 
 ## Tool Versions
-KUSTOMIZE_VERSION ?= v5.8.2
+KUSTOMIZE_VERSION ?= v5.8.3
 CONTROLLER_TOOLS_VERSION ?= v0.23.0
 #ENVTEST_VERSION is the version of controller-runtime release branch to fetch the envtest setup script (i.e. release-0.20)
 ENVTEST_VERSION ?= $(shell go list -m -f "{{ .Version }}" sigs.k8s.io/controller-runtime | awk -F'[v.]' '{printf "release-%d.%d", $$2, $$3}')

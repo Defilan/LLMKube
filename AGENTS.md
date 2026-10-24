@@ -1,7 +1,7 @@
 # AGENTS.md
 
 LLMKube is a Kubernetes operator that deploys and manages local LLM inference
-workloads. Go 1.26, built with controller-runtime / Kubebuilder.
+workloads. Go 1.27, built with controller-runtime / Kubebuilder.
 
 This file is the source of truth for the engineering conventions that agents and
 contributors share. The human onboarding narrative lives in
@@ -23,7 +23,7 @@ contributors share. The human onboarding narrative lives in
 
 ## Setup
 
-- Go 1.26.10+ (pinned in `go.mod`).
+- Go 1.27.3+ (pinned in `go.mod`).
 - `make test` downloads envtest binaries on first run; no cluster needed for
   unit tests.
 - `make test-chart` needs `helm` and the `helm-unittest` plugin.
@@ -70,6 +70,7 @@ contributors share. The human onboarding narrative lives in
 | Regenerate DeepCopy methods         | `make generate`         |
 | Regenerate CRDs into the Helm chart | `make chart-crds`       |
 | Check AGENTS.md references resolve  | `make check-agents-md`  |
+| Go builder images match `go.mod`    | `make check-go-version` |
 | Chart metal-agent RBAC vs manifest  | `make check-metal-agent-rbac` |
 
 ## Definition of done
@@ -163,7 +164,7 @@ A change is not done until all of these hold.
   The gate does not regenerate the Helm chart CRDs; run `make chart-crds`
   separately when `api/v1alpha1` types change. If
   staticcheck panics under your Go toolchain, set
-  `LINT_GOTOOLCHAIN=<version>` (for example go1.26.10).
+  `LINT_GOTOOLCHAIN=<version>` (for example go1.27.3).
 - Full suite (what CI and the Foreman gate run): `make test`, random seed and
   coverage profile, unchanged.
 - Editing `scripts/gate.sh`, `scripts/test-affected.sh`,

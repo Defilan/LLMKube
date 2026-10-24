@@ -341,7 +341,7 @@ func TestModelRouterProxySwitchDoesNotTouchForeignObjects(t *testing.T) {
 	}
 	if *deploy.Spec.Replicas != 1 || deploy.Spec.Template.Labels["app"] != "foreign" || len(deploy.OwnerReferences) != 0 {
 		t.Errorf("foreign Deployment was modified: replicas=%d labels=%v ownerRefs=%v",
-			deploy.Spec.Replicas, deploy.Spec.Template.Labels, deploy.OwnerReferences)
+			*deploy.Spec.Replicas, deploy.Spec.Template.Labels, deploy.OwnerReferences)
 	}
 }
 

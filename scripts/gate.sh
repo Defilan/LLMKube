@@ -22,7 +22,7 @@
 #   GO_TEST_TIMEOUT   go test -timeout for the test step (default 20m; go's
 #                     own 10m default is too close for internal/controller,
 #                     #2141)
-#   LINT_GOTOOLCHAIN  GOTOOLCHAIN for the lint step only, e.g. go1.26.10
+#   LINT_GOTOOLCHAIN  GOTOOLCHAIN for the lint step only, e.g. go1.27.3
 #                     (empty: use the default toolchain)
 #   ENVTEST_BIN, BIN_DIR, ENVTEST_K8S_VERSION
 #                     setup-envtest binary, local bin dir and k8s version;
