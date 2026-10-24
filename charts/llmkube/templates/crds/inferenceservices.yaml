@@ -6459,8 +6459,11 @@ spec:
                         description: |-
                           NumSpeculativeTokens is the number of draft tokens proposed per step,
                           rendered as the --speculative-config "num_speculative_tokens" key.
-                          Typical sweet spot is 3-5; higher values increase wasted work when the
-                          draft disagrees with the target model. Always emitted: 4 when unset, the
+                          With a separate draft model the typical sweet spot is 3-5; higher values
+                          increase wasted work when the draft disagrees with the target model. For
+                          mtp, set it to the number of MTP layers the checkpoint ships, usually 1:
+                          a larger value runs the same MTP layer again for each extra token, and
+                          vLLM warns that acceptance may drop. Always emitted: 4 when unset, the
                           same value the CRD defaults the field to, because vLLM requires one
                           whenever a speculative model is provided.
                         format: int32
