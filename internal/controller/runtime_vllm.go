@@ -208,9 +208,11 @@ func ValidateVLLMConfig(isvc *inferencev1alpha1.InferenceService) (reason, messa
 				"spec.vllmConfig.speculative.enabled is true but neither model nor method is set; vLLM rejects a speculative config without one, so the flags will be skipped"
 		}
 		// skipModelInit declines staging, so the draft's weights are not in
-		// the pod and the path handed to vLLM would not resolve. extraArgs is
-		// exempt: a user who sets --speculative-config themselves may point at
-		// weights they mount some other way.
+		// the pod and the path handed to vLLM would not resolve. A vLLM
+		// backend always NeedsModelInit, so skipModelInit is the only way its
+		// pod stages nothing (operatorStagesModel, runtime_hf_mirror.go).
+		// extraArgs is exempt: a user who sets --speculative-config themselves
+		// may point at weights they mount some other way.
 		if cfg.Speculative.Model != "" && !hasMatchingExtraArg(isvc.Spec.ExtraArgs, "speculative-config") &&
 			isvc.Spec.SkipModelInit != nil && *isvc.Spec.SkipModelInit {
 			return "SpeculativeDraftNotStaged",

@@ -1714,10 +1714,11 @@ type SpeculativeConfig struct {
 	// Method is the vLLM speculative method, rendered as the
 	// --speculative-config "method" key. Values current vLLM registers
 	// include draft_model, mtp, eagle, eagle3, medusa, dflash, dspark,
-	// ngram and suffix. Not an enum: vLLM adds a method per release (dspark
-	// and dflash arrived after v0.25.1's list), so the value must exist in
-	// the image you run or vLLM refuses to start. Optional: with a draft
-	// Model and no method, vLLM infers draft_model.
+	// ngram and suffix. Not an enum: vLLM adds and retires methods per
+	// release, so the set this operator would freeze is neither the one your
+	// image has nor the one it will have; the value must exist in the image
+	// you run or vLLM refuses to start. Optional: with a draft Model and no
+	// method, vLLM infers draft_model.
 	// +optional
 	Method string `json:"method,omitempty"`
 
@@ -1734,8 +1735,9 @@ type SpeculativeConfig struct {
 	// NumSpeculativeTokens is the number of draft tokens proposed per step,
 	// rendered as the --speculative-config "num_speculative_tokens" key.
 	// Typical sweet spot is 3-5; higher values increase wasted work when the
-	// draft disagrees with the target model. Emitted as 4 when unset while a
-	// draft model is configured, because vLLM requires it whenever one is.
+	// draft disagrees with the target model. Always emitted: 4 when unset, the
+	// same value the CRD defaults the field to, because vLLM refuses a draft
+	// model without one.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=16
 	// +kubebuilder:default=4

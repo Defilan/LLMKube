@@ -243,6 +243,35 @@ func TestAppendSpeculativeConfigEmitsNoLegacyFlags(t *testing.T) {
 	}
 }
 
+// TestMethodDocClaimsMatchThePinnedRelease guards the field doc that ships into
+// the CRD and `kubectl explain`. A claim that a method is newer than the pinned
+// image is a fact about the engine, and the first draft of this doc got it
+// backwards; the doc is checked against the same oracle the renderer is.
+func TestMethodDocClaimsMatchThePinnedRelease(t *testing.T) {
+	crds := []string{
+		"../../config/crd/bases/inference.llmkube.dev_inferenceservices.yaml",
+		"../../charts/llmkube/templates/crds/inferenceservices.yaml",
+	}
+	for _, path := range crds {
+		f, err := os.Open(path)
+		if err != nil {
+			t.Fatalf("open %s: %v", path, err)
+		}
+		sc := bufio.NewScanner(f)
+		for sc.Scan() {
+			line := sc.Text()
+			if strings.Contains(line, "arrived after") || strings.Contains(line, "does not yet support") {
+				t.Errorf("%s states when vLLM added a method; the pinned release is the only source for that and "+
+					"the claim is easy to get wrong:\n  %s", path, strings.TrimSpace(line))
+			}
+		}
+		if err := sc.Err(); err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		_ = f.Close()
+	}
+}
+
 // TestRenderedSpeculativeConfigUsesPinnedVLLMKeys asserts the rendered keys
 // against the field list the pinned image's own parser accepts, not against a
 // list this test wrote: vLLM builds SpeculativeConfig from the JSON with
