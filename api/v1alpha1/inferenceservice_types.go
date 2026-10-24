@@ -499,7 +499,9 @@ type InferenceServiceSpec struct {
 	Autoscaling *AutoscalingSpec `json:"autoscaling,omitempty"`
 
 	// Image is the container image for the inference runtime.
-	// For llamacpp runtime, defaults to ghcr.io/ggml-org/llama.cpp:server.
+	// For llamacpp runtime, defaults to a pinned upstream llama.cpp server build
+	// (ghcr.io/ggml-org/llama.cpp:server-<build>), or the matching CUDA build when
+	// the Model declares an NVIDIA GPU.
 	// For generic runtime, this field is required.
 	// +optional
 	Image string `json:"image,omitempty"`
