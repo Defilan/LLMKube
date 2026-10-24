@@ -108,10 +108,23 @@ func TestCachePrepAlwaysTemplatesUnchanged(t *testing.T) {
 
 // A reconciler built without the policy field (every test literal written
 // before the flag, and any embedding that constructs one by hand) must render
-// what it rendered before: the prep.
+// what it rendered before: the prep. Both cache branches, since they build
+// their container lists separately.
 func TestCachePrepEmptyPolicyRendersPrep(t *testing.T) {
-	cfg := buildCachedStorageConfig(cachePrepTripwireModel(), nil, "", "", "docker.io/curlimages/curl:8.18.0", 102, "", "")
-	if len(cfg.initContainers) < 1 || cfg.initContainers[0].Name != "model-cache-prep" {
-		t.Fatalf("empty policy rendered initContainers %v, want model-cache-prep first", containerNames(cfg.initContainers))
+	for _, tc := range []struct {
+		name  string
+		files []string
+	}{
+		{"single file", nil},
+		{"multi file", []string{"model.gguf", "mmproj.gguf"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			model := cachePrepTripwireModel()
+			model.Spec.Files = tc.files
+			cfg := buildCachedStorageConfig(model, nil, "", "", "docker.io/curlimages/curl:8.18.0", 102, "", "")
+			if len(cfg.initContainers) < 1 || cfg.initContainers[0].Name != "model-cache-prep" {
+				t.Fatalf("empty policy rendered initContainers %v, want model-cache-prep first", containerNames(cfg.initContainers))
+			}
+		})
 	}
 }

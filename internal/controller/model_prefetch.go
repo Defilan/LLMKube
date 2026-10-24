@@ -1219,8 +1219,8 @@ func (r *ModelReconciler) completePrefetch(ctx context.Context, model *inference
 //
 // Under --model-cache-prep=never the Job carries a Pod Security restricted
 // security context instead: the prep is the only root container, so its
-// absence is what lets the pod set pod-level runAsNonRoot and seccomp, and no
-// serving-side context can be borrowed for it.
+// absence is what lets the pod set a pod-level seccompProfile, which no
+// serving-side context can be borrowed for. runAsNonRoot is per container.
 //
 // ctx is needed only to read HF_ENDPOINT from the Model's sourceSecretRef, so
 // a prefetch from a mirror carries the bearer token as the serving pod does

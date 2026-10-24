@@ -1029,8 +1029,11 @@ func modelStagingErrorInitContainer(err error, model *inferencev1alpha1.Model, i
 //
 // When resolvedFSGroup > 0 the prep chowns to 0:<fsGroup> and grants group
 // rw on existing and future files/dirs (g+rwX). When resolvedFSGroup <= 0
-// (fsGroup disabled, e.g. OpenShift) the prep chowns to 100:100 and sets 770
-// so only the downloader can write.
+// (fsGroup disabled, e.g. OpenShift) the prep chowns to 100:100 and sets 770,
+// so only a uid-100 downloader can write: the default image runs as uid 101,
+// so on that profile the cache root is not writable by it. Left as it is
+// here because changing the owner is a behavior change with an upgrade
+// consequence (files already owned 100:100) and is tracked separately.
 //
 // Security: the prep runs as root (uid 0) with ALL capabilities dropped and
 // only CHOWN+FOWNER added, and is NOT privileged. Root is required, not

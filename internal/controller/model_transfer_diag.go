@@ -334,7 +334,9 @@ func podMountsModelCache(pod *corev1.Pod) bool {
 // writesModelCache reports whether a generated init container writes the model
 // cache, so a cache-write failure can only come from it. model-verify is the
 // exception among the containers that mount the cache: it runs on the
-// read-only prefetched mount and never creates anything.
+// read-only prefetched mount and never creates anything. The draft-prefixed
+// names are absent because isGeneratedInitContainer filters them out before
+// this is consulted.
 func writesModelCache(name string) bool {
 	return name == "model-cache-prep" || name == "model-downloader"
 }
