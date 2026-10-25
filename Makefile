@@ -190,14 +190,17 @@ test-affected: setup-envtest ## Test packages affected by changes since BASE_REF
 # cmd/affected-packages. check-envtest-sharing_test.sh is a source rule rather
 # than a script test, but it belongs to the same set: a test that starts its
 # own envtest control plane is what took internal/controller into go test's
-# timeout (#2141).
+# timeout (#2141). macos-sign_test.sh covers hack/macos-sign.sh, the release
+# hook that signs and notarizes the darwin binaries (#2084); its real-tool case
+# runs only on macOS with rcodesign on PATH.
 .PHONY: test-scripts
-test-scripts: ## Run the shell regression tests (gate, test-affected, affected-packages, GINKGO_SEED single evaluation, envtest sharing).
+test-scripts: ## Run the shell regression tests (gate, test-affected, affected-packages, GINKGO_SEED single evaluation, envtest sharing, macOS signing hook).
 	@bash scripts/gate_test.sh
 	@bash scripts/test-affected_test.sh
 	@bash scripts/affected-packages_test.sh
 	@bash scripts/check-ginkgo-seed_test.sh
 	@bash scripts/check-envtest-sharing_test.sh
+	@bash scripts/macos-sign_test.sh
 
 .PHONY: test-chart
 test-chart: ## Lint and unit-test the Helm charts (requires helm + helm-unittest plugin).
