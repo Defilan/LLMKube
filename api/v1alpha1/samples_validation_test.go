@@ -53,6 +53,8 @@ func objForKind(kind string) any {
 		return &InferenceService{}
 	case "ModelRouter":
 		return &ModelRouter{}
+	case "MetalNode":
+		return &MetalNode{}
 	default:
 		return nil
 	}

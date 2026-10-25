@@ -1,0 +1,19 @@
+# A Mac joined to the cluster. `llmkube metal token create mac-studio` creates
+# this object together with the ServiceAccount, the Lease and the per-Mac RBAC;
+# it is shown here for reference. The agent never writes it: it renews the
+# Lease named in spec.leaseName, and the controller fills status from that
+# Lease and verifies the Mac with a dial-back.
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: MetalNode
+metadata:
+  name: mac-studio
+  namespace: default
+spec:
+  serviceAccountName: llmkube-metal-mac-studio
+  leaseName: mac-studio
+  # Optional: an address you know reaches the Mac. Tried first, still verified.
+  # hostIP: 100.64.0.2
+  # Optional: run the verifier pod where the relay pods for this Mac run.
+  # verifier:
+  #   nodeSelector:
+  #     kubernetes.io/hostname: relay-node-1
