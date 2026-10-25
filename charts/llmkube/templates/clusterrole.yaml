@@ -160,6 +160,27 @@ rules:
   - patch
   - update
   - watch
+# MetalNodes are created by the admin (llmkube metal token create); the
+# controller only reads them and writes their status.
+- apiGroups:
+  - inference.llmkube.dev
+  resources:
+  - metalnodes
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+# The metal-agent's heartbeat Lease, read by the MetalNode controller.
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - get
+  - list
+  - watch
 - apiGroups:
   - inference.llmkube.dev
   resources:
@@ -176,6 +197,7 @@ rules:
   - gpuquotas/status
   - inferenceservices/status
   - loraadapters/status
+  - metalnodes/status
   - modelpools/status
   - modelrouters/status
   - models/status
