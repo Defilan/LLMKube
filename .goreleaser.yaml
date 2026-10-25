@@ -197,7 +197,12 @@ archives:
       - LICENSE
       - README.md
       - examples/metal-quickstart/*
-      - deployment/macos/*
+      # deployment/macos minus the *.Info.plist.tmpl files, which only the
+      # build hook uses (internal/machoplist/release_identity_test.go).
+      - deployment/macos/README.md
+      - deployment/macos/*.plist
+      - deployment/macos/*.yaml
+      - deployment/macos/sudoers.d/*
 
   - id: llmkube-foreman-agent
     ids:
@@ -212,7 +217,12 @@ archives:
     files:
       - LICENSE
       - README.md
-      - deployment/macos/*
+      # deployment/macos minus the *.Info.plist.tmpl files, which only the
+      # build hook uses (internal/machoplist/release_identity_test.go).
+      - deployment/macos/README.md
+      - deployment/macos/*.plist
+      - deployment/macos/*.yaml
+      - deployment/macos/sudoers.d/*
       - deployment/linux/*
 
 checksum:

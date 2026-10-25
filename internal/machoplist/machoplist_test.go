@@ -212,6 +212,9 @@ func TestInjectAddsInfoPlistSection(t *testing.T) {
 			if sect.Seg != "__TEXT" {
 				t.Fatalf("__info_plist is in segment %q, want __TEXT", sect.Seg)
 			}
+			if sect.Offset%16 != 0 {
+				t.Fatalf("__info_plist offset %d is not 16-byte aligned", sect.Offset)
+			}
 			if sect.Size != uint64(len(plist)) {
 				t.Fatalf("__info_plist size = %d, want %d", sect.Size, len(plist))
 			}

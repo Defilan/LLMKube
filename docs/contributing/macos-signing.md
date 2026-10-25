@@ -211,6 +211,10 @@ codesign -dv --verbose=4 llmkube-metal-agent            # Identifier=dev.llmkube
   and the `AssociatedBundleIdentifiers` of the launchd plists in
   `deployment/macos/`; `internal/machoplist/release_identity_test.go` checks
   that they do.
+- The plist has to fit in the header padding the Go linker leaves, about 1680
+  bytes on darwin/amd64 today. The same test caps each rendered template at
+  1400 bytes and keeps the templates out of the release archives, which list
+  `deployment/macos/` by pattern: a new file there needs a matching pattern.
 - To update rcodesign, change the version and the SHA-256 of the
   `x86_64-unknown-linux-musl` tarball in the "Install rcodesign" step.
 - A Developer ID certificate is valid for five years. After renewing it,

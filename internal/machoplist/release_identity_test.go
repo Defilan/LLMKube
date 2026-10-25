@@ -77,6 +77,10 @@ type goreleaserConfig struct {
 			Post []goreleaserHook `json:"post"`
 		} `json:"hooks"`
 	} `json:"builds"`
+	Archives []struct {
+		ID    string   `json:"id"`
+		Files []string `json:"files"`
+	} `json:"archives"`
 	Notarize any `json:"notarize"`
 }
 
@@ -177,10 +181,20 @@ func assertTemplate(t *testing.T, want releaseIdentity, binary string) {
 	if _, ok := dict["CFBundlePackageType"]; ok {
 		t.Errorf("%s: CFBundlePackageType is for bundles, not a bare executable", want.template)
 	}
-	if _, err := Inject(darwinBinary(t, target{arch: "arm64", stripped: true}), rendered); err != nil {
-		t.Errorf("%s does not embed into a release-shaped binary: %v", want.template, err)
+	// darwin/amd64 is the tight case: no linker signature, so Inject keeps
+	// room for codesign's LC_CODE_SIGNATURE. Measured on the real 0.10.12
+	// amd64 binaries (sizeofcmds 2288), a plist of up to 1680 bytes fits; the
+	// cap leaves headroom for a Go upgrade that adds load commands, so a
+	// growing template fails here rather than in a tagged release.
+	if len(rendered) > maxTemplateBytes {
+		t.Errorf("%s renders to %d bytes, over the %d-byte cap", want.template, len(rendered), maxTemplateBytes)
+	}
+	if _, err := Inject(darwinBinary(t, target{arch: "amd64", stripped: true}), rendered); err != nil {
+		t.Errorf("%s does not embed into a release-shaped amd64 binary: %v", want.template, err)
 	}
 }
+
+const maxTemplateBytes = 1400
 
 // TestLaunchdPlistsAssociateBundleIdentifiers checks TN3179's advice for a
 // launchd agent not installed with SMAppService: name the signed bundle
@@ -264,4 +278,73 @@ func parsePlistDict(t *testing.T, raw []byte) map[string]any {
 		}
 	}
 	return out
+}
+
+// TestArchivesShipDeploymentMacosWithoutTemplates checks the agent archives
+// carry every file under deployment/macos except the Info.plist templates,
+// which only the build uses (their __VERSION__ placeholder would confuse an
+// archive reader next to the real launchd plists). Expanding the archive globs
+// against the tree also catches a new file the globs would miss.
+func TestArchivesShipDeploymentMacosWithoutTemplates(t *testing.T) {
+	cfg := loadGoreleaser(t)
+	var want []string
+	err := filepath.WalkDir(filepath.Join(repoRoot, "deployment/macos"), func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || strings.HasSuffix(p, ".tmpl") {
+			return err
+		}
+		rel, err := filepath.Rel(repoRoot, p)
+		want = append(want, rel)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"llmkube-metal-agent", "llmkube-foreman-agent"} {
+		t.Run(id, func(t *testing.T) {
+			var files []string
+			found := false
+			for _, a := range cfg.Archives {
+				if a.ID == id {
+					files, found = a.Files, true
+				}
+			}
+			if !found {
+				t.Fatalf("archive %q not in .goreleaser.yaml", id)
+			}
+			got := map[string]bool{}
+			for _, glob := range files {
+				if !strings.HasPrefix(glob, "deployment/macos/") {
+					continue
+				}
+				matches, err := filepath.Glob(filepath.Join(repoRoot, glob))
+				if err != nil {
+					t.Fatalf("glob %q: %v", glob, err)
+				}
+				// GoReleaser archives a matched directory with everything in it.
+				for _, m := range matches {
+					err := filepath.WalkDir(m, func(p string, d os.DirEntry, err error) error {
+						if err != nil || d.IsDir() {
+							return err
+						}
+						rel, err := filepath.Rel(repoRoot, p)
+						got[rel] = true
+						return err
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			for f := range got {
+				if strings.HasSuffix(f, ".tmpl") {
+					t.Errorf("archive %s ships the build-only template %s", id, f)
+				}
+			}
+			for _, f := range want {
+				if !got[f] {
+					t.Errorf("archive %s no longer ships %s", id, f)
+				}
+			}
+		})
+	}
 }
