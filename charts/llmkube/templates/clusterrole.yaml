@@ -186,6 +186,7 @@ rules:
   resources:
   - inferenceservices/finalizers
   - loraadapters/finalizers
+  - metalnodes/finalizers
   - modelpools/finalizers
   - modelrouters/finalizers
   - models/finalizers

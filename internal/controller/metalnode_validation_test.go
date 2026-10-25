@@ -60,15 +60,15 @@ func TestMetalNodeCRDValidation(t *testing.T) {
 			mutate:  func(s *inferencev1alpha1.MetalNodeSpec) { s.LeaseName = "ns/mac-a" },
 			wantErr: "spec.leaseName",
 		},
+		// spec.hostIP has no CEL rule: isIP() needs Kubernetes 1.31 and the
+		// chart installs this CRD everywhere. The controller reports a bad
+		// value instead (TestMetalNodeInvalidHostIP); only the length is
+		// enforced here.
+		{name: "hostname as hostIP is left to the controller", mutate: func(s *inferencev1alpha1.MetalNodeSpec) { s.HostIP = "mac-a.local" }},
 		{
-			name:    "hostname as hostIP",
-			mutate:  func(s *inferencev1alpha1.MetalNodeSpec) { s.HostIP = "mac-a.local" },
-			wantErr: "hostIP must be an IP address",
-		},
-		{
-			name:    "CIDR as hostIP",
-			mutate:  func(s *inferencev1alpha1.MetalNodeSpec) { s.HostIP = "10.0.0.0/8" },
-			wantErr: "hostIP must be an IP address",
+			name:    "overlong hostIP",
+			mutate:  func(s *inferencev1alpha1.MetalNodeSpec) { s.HostIP = strings.Repeat("1", 46) },
+			wantErr: "spec.hostIP",
 		},
 	}
 	for _, tc := range cases {

@@ -198,7 +198,8 @@ func TestBuildMetalNodeVerifierPod(t *testing.T) {
 	if got := c.Command[3:]; !slices.Equal(got, wantArgs) {
 		t.Errorf("positional args = %q, want %q", got, wantArgs)
 	}
-	for _, want := range []string{`--pinnedpubkey "sha256//$pin"`, "--max-time 3", "--connect-timeout 3", "-o /dev/null",
+	// -q first (no .curlrc), and no proxy: the check must test the direct path.
+	for _, want := range []string{"curl -q ", `--noproxy '*'`, `--pinnedpubkey "sha256//$pin"`, "--max-time 3", "--connect-timeout 3", "-o /dev/null",
 		"/dev/termination-log", "/health"} {
 		if !strings.Contains(metalNodeVerifierScript, want) {
 			t.Errorf("verifier script lacks %q", want)
@@ -210,6 +211,11 @@ func checkVerifierPodSpec(t *testing.T, mn *inferencev1alpha1.MetalNode, spec co
 	t.Helper()
 	if spec.RestartPolicy != corev1.RestartPolicyNever {
 		t.Errorf("restartPolicy = %s, want Never", spec.RestartPolicy)
+	}
+	// A deleted verifier must stop at once: sh as PID 1 ignores SIGTERM, so a
+	// grace period would leave it probing.
+	if spec.TerminationGracePeriodSeconds == nil || *spec.TerminationGracePeriodSeconds != 0 {
+		t.Errorf("terminationGracePeriodSeconds = %v, want 0", spec.TerminationGracePeriodSeconds)
 	}
 	if spec.ActiveDeadlineSeconds == nil || *spec.ActiveDeadlineSeconds != 60 {
 		t.Errorf("activeDeadlineSeconds = %v, want 60", spec.ActiveDeadlineSeconds)

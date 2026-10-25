@@ -30,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -40,14 +41,15 @@ import (
 type metalNodeFixture struct {
 	t   *testing.T
 	c   client.Client
+	cfg *rest.Config
 	r   *MetalNodeReconciler
 	now time.Time
 }
 
 func newMetalNodeFixture(t *testing.T) *metalNodeFixture {
 	t.Helper()
-	c, _, _ := sharedTestEnv(t, baseCRDPath)
-	f := &metalNodeFixture{t: t, c: c, now: time.Now().UTC().Truncate(time.Second)}
+	c, cfg, _ := sharedTestEnv(t, baseCRDPath)
+	f := &metalNodeFixture{t: t, c: c, cfg: cfg, now: time.Now().UTC().Truncate(time.Second)}
 	f.r = &MetalNodeReconciler{
 		Client:             c,
 		Scheme:             scheme.Scheme,
@@ -456,6 +458,10 @@ func TestMetalNodeReconcileAgentConnectedReasons(t *testing.T) {
 	valid := encodeReport(t, testReport(metalnode.Candidate{Address: "100.64.0.2", Source: metalnode.SourceTailnet}))
 	badPin := testReport(metalnode.Candidate{Address: "100.64.0.2", Source: metalnode.SourceTailnet})
 	badPin.IngressSPKI = "not-a-sha256-pin"
+	// A privileged port is refused, so the dial-back cannot be pointed at
+	// 22, 443 and the like.
+	lowPort := testReport(metalnode.Candidate{Address: "100.64.0.2", Source: metalnode.SourceTailnet})
+	lowPort.IngressPort = 443
 
 	cases := []struct {
 		name       string
@@ -468,6 +474,10 @@ func TestMetalNodeReconcileAgentConnectedReasons(t *testing.T) {
 		{name: "missing", lease: false, reason: inferencev1alpha1.MetalNodeReasonLeaseNotFound},
 		{name: "malformed", lease: true, annotation: `{"version":`, reason: inferencev1alpha1.MetalNodeReasonReportInvalid},
 		{name: "badpin", lease: true, annotation: encodeReport(t, badPin), reason: inferencev1alpha1.MetalNodeReasonReportInvalid},
+		{name: "lowport", lease: true, annotation: encodeReport(t, lowPort), reason: inferencev1alpha1.MetalNodeReasonReportInvalid},
+		// A renewTime well in the future never goes stale on its own, so it
+		// counts as stale now.
+		{name: "future", lease: true, renew: time.Hour, annotation: valid, reason: inferencev1alpha1.MetalNodeReasonHeartbeatStale},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -484,6 +494,9 @@ func TestMetalNodeReconcileAgentConnectedReasons(t *testing.T) {
 			}
 			if pods := f.verifierPods(name); len(pods) != 0 {
 				t.Errorf("%d verifier pods for an agent that is not connected, want 0", len(pods))
+			}
+			if hb := mn.Status.LastHeartbeatTime; hb != nil && hb.Time.After(f.now) {
+				t.Errorf("lastHeartbeatTime = %v, a time in the future copied from the Lease", hb)
 			}
 		})
 	}

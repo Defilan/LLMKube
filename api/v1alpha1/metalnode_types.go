@@ -44,6 +44,8 @@ const (
 	MetalNodeReasonNoneReachable     = "NoneReachable"
 	MetalNodeReasonPinMissing        = "PinMissing"
 	MetalNodeReasonVerifierFailed    = "VerifierFailed"
+	MetalNodeReasonAgentNotConnected = "AgentNotConnected"
+	MetalNodeReasonInvalidSpec       = "InvalidSpec"
 )
 
 // LabelMetalNode names the MetalNode an object belongs to. The controller
@@ -73,9 +75,11 @@ type MetalNodeSpec struct {
 	// HostIP is an address the admin knows reaches this Mac. It is tried
 	// before the agent's own candidates and is still verified by the
 	// dial-back; it is never trusted on its own.
+	// The controller validates it (Reachable=False, reason InvalidSpec, when
+	// it is not an IP address) rather than a CEL rule, whose isIP() would
+	// need Kubernetes 1.31.
 	// +optional
 	// +kubebuilder:validation:MaxLength=45
-	// +kubebuilder:validation:XValidation:rule="isIP(self)",message="hostIP must be an IP address"
 	HostIP string `json:"hostIP,omitempty"`
 
 	// Verifier places the dial-back verifier pod. Point it at the nodes the
@@ -177,6 +181,16 @@ type MetalNodeVerification struct {
 	// it sets the retry backoff.
 	// +optional
 	ConsecutiveFailures int32 `json:"consecutiveFailures,omitempty"`
+
+	// LastStartTime is when the controller last started a verifier pod.
+	// Starts are at least 30 seconds apart, whatever the Mac reports.
+	// +optional
+	LastStartTime *metav1.Time `json:"lastStartTime,omitempty"`
+
+	// PodUID is the UID of the verifier pod the controller last created.
+	// Only that pod's results are read.
+	// +optional
+	PodUID string `json:"podUID,omitempty"`
 }
 
 // MetalNodeStatus is written only by the controller.
@@ -211,7 +225,9 @@ type MetalNodeStatus struct {
 	// +optional
 	HostIP string `json:"hostIP,omitempty"`
 
-	// LastHeartbeatTime is the Lease's renewTime.
+	// LastHeartbeatTime is the Lease's renewTime, accurate to about a
+	// minute: it advances when AgentConnected changes or when it is more
+	// than 60 seconds behind. The Lease holds the exact time.
 	// +optional
 	LastHeartbeatTime *metav1.Time `json:"lastHeartbeatTime,omitempty"`
 

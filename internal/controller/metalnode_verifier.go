@@ -53,6 +53,9 @@ const (
 
 // metalNodeVerifierScript probes each candidate once with the pinned key and
 // writes "<address> <curl exit code>" per line to the termination message.
+// -q (first) ignores any .curlrc in the image and --noproxy '*' keeps a
+// cluster-wide proxy setting from testing the proxy path instead of the
+// direct one.
 // It is a constant: the pin, port and addresses arrive as positional
 // arguments, so nothing the agent reports is ever parsed as shell. A
 // completed handshake is exit 0 whatever the HTTP status (the ingress answers
@@ -63,7 +66,7 @@ const metalNodeVerifierScript = `pin="$1"; port="$2"; shift 2
 out=""
 for a in "$@"; do
   case "$a" in *:*) h="[$a]" ;; *) h="$a" ;; esac
-  curl -sS -o /dev/null --max-time 3 --connect-timeout 3 -k --pinnedpubkey "sha256//$pin" "https://$h:$port/health"
+  curl -q -sS --noproxy '*' -o /dev/null --max-time 3 --connect-timeout 3 -k --pinnedpubkey "sha256//$pin" "https://$h:$port/health"
   rc=$?
   out="$out$a $rc
 "
@@ -150,26 +153,19 @@ func dialableAddresses(candidates []inferencev1alpha1.MetalNodeCandidate) []stri
 	return out
 }
 
-// metalNodeInputHash identifies everything a dial-back result depends on:
-// the pin, the port, the candidate list (with what is allowed) and where the
-// verifier runs. Any change makes the last result stale.
-func metalNodeInputHash(pin string, port int32, candidates []inferencev1alpha1.MetalNodeCandidate,
-	verifier *inferencev1alpha1.MetalNodeVerifier) string {
-	type entry struct {
-		Address string `json:"a"`
-		Source  string `json:"s"`
-		Allowed bool   `json:"ok"`
-	}
+// metalNodeInputHash identifies what a dial-back result depends on: the pin,
+// the port, the addresses the verifier dials (in order) and where it runs.
+// Source strings and NotAllowed addresses are left out on purpose: they
+// change no probe, and letting them change the hash would let a Mac start a
+// new verifier just by rewording its report.
+func metalNodeInputHash(pin string, port int32, dialable []string, verifier *inferencev1alpha1.MetalNodeVerifier) string {
 	in := struct {
-		Pin        string                               `json:"pin"`
-		Port       int32                                `json:"port"`
-		Candidates []entry                              `json:"candidates"`
-		Verifier   *inferencev1alpha1.MetalNodeVerifier `json:"verifier,omitempty"`
-	}{Pin: pin, Port: port, Verifier: verifier}
-	for _, c := range candidates {
-		in.Candidates = append(in.Candidates, entry{c.Address, c.Source, c.Result != inferencev1alpha1.CandidateNotAllowed})
-	}
-	raw, _ := json.Marshal(in) // a struct of strings, ints, maps and slices always marshals
+		Pin       string                               `json:"pin"`
+		Port      int32                                `json:"port"`
+		Addresses []string                             `json:"addresses"`
+		Verifier  *inferencev1alpha1.MetalNodeVerifier `json:"verifier,omitempty"`
+	}{Pin: pin, Port: port, Addresses: dialable, Verifier: verifier}
+	raw, _ := json.Marshal(in) // strings, ints, maps and slices always marshal
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
 }
@@ -279,12 +275,15 @@ func buildMetalNodeVerifierPod(mn *inferencev1alpha1.MetalNode, image, pin strin
 			Annotations: map[string]string{annotationMetalNodeVerifyHash: hash},
 		},
 		Spec: corev1.PodSpec{
-			RestartPolicy:                corev1.RestartPolicyNever,
-			ActiveDeadlineSeconds:        int64Ptr(metalNodeVerifierDeadlineSeconds),
-			AutomountServiceAccountToken: boolPtr(false),
-			EnableServiceLinks:           boolPtr(false),
-			NodeSelector:                 nodeSelector,
-			Tolerations:                  tolerations,
+			RestartPolicy: corev1.RestartPolicyNever,
+			// sh as PID 1 ignores SIGTERM, so any grace period would leave a
+			// deleted verifier probing until SIGKILL.
+			TerminationGracePeriodSeconds: int64Ptr(0),
+			ActiveDeadlineSeconds:         int64Ptr(metalNodeVerifierDeadlineSeconds),
+			AutomountServiceAccountToken:  boolPtr(false),
+			EnableServiceLinks:            boolPtr(false),
+			NodeSelector:                  nodeSelector,
+			Tolerations:                   tolerations,
 			SecurityContext: &corev1.PodSecurityContext{
 				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 			},

@@ -75,11 +75,11 @@ spec:
                   HostIP is an address the admin knows reaches this Mac. It is tried
                   before the agent's own candidates and is still verified by the
                   dial-back; it is never trusted on its own.
+                  The controller validates it (Reachable=False, reason InvalidSpec, when
+                  it is not an IP address) rather than a CEL rule, whose isIP() would
+                  need Kubernetes 1.31.
                 maxLength: 45
                 type: string
-                x-kubernetes-validations:
-                - message: hostIP must be an IP address
-                  rule: isIP(self)
               leaseName:
                 description: |-
                   LeaseName is the coordination.k8s.io Lease, in this namespace, that the
@@ -297,7 +297,10 @@ spec:
                   the relay complete TLS only against this key.
                 type: string
               lastHeartbeatTime:
-                description: LastHeartbeatTime is the Lease's renewTime.
+                description: |-
+                  LastHeartbeatTime is the Lease's renewTime, accurate to about a
+                  minute: it advances when AgentConnected changes or when it is more
+                  than 60 seconds behind. The Lease holds the exact time.
                 format: date-time
                 type: string
               observedGeneration:
@@ -323,6 +326,17 @@ spec:
                   lastCheckTime:
                     description: LastCheckTime is when the last completed check finished.
                     format: date-time
+                    type: string
+                  lastStartTime:
+                    description: |-
+                      LastStartTime is when the controller last started a verifier pod.
+                      Starts are at least 30 seconds apart, whatever the Mac reports.
+                    format: date-time
+                    type: string
+                  podUID:
+                    description: |-
+                      PodUID is the UID of the verifier pod the controller last created.
+                      Only that pod's results are read.
                     type: string
                 type: object
             type: object

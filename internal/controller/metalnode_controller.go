@@ -40,6 +40,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -69,7 +70,42 @@ const (
 	// metalNodeMaxLeaseDuration caps the agent-written leaseDurationSeconds,
 	// so a Mac cannot claim a heartbeat that stays fresh for hours.
 	metalNodeMaxLeaseDuration = 5 * time.Minute
+	// metalNodeMinStartSpacing is the least time between two verifier starts
+	// for one MetalNode, whatever changed.
+	metalNodeMinStartSpacing = 30 * time.Second
+	// metalNodeMaxClockSkew is how far in the future a renewTime may be
+	// before it counts as stale rather than fresh.
+	metalNodeMaxClockSkew = 30 * time.Second
+	// metalNodeHeartbeatResolution is how far status.lastHeartbeatTime may
+	// lag the Lease before it is advanced.
+	metalNodeHeartbeatResolution = 60 * time.Second
+	// metalNodeRenewGap is a renewal gap that means the agent was away (it
+	// renews every 15 s), so the update reconciles at once.
+	metalNodeRenewGap = 45 * time.Second
 )
+
+// metalNodeLeaseUpdateMatters reports whether a Lease update should
+// reconcile its MetalNode. An on-schedule renewal that changes nothing but
+// renewTime does not: the 60 s resync turns a stopped agent stale, and the
+// dial-back depends only on the report. A changed report, label, holder or
+// duration does, and so does the first renewal or one after a gap (the agent
+// came back), so AgentConnected turns True promptly.
+func metalNodeLeaseUpdateMatters(old, updated *coordinationv1.Lease) bool {
+	if old == nil || updated == nil {
+		return true
+	}
+	if !apiequality.Semantic.DeepEqual(old.Labels, updated.Labels) ||
+		old.Annotations[metalnode.ReportAnnotation] != updated.Annotations[metalnode.ReportAnnotation] ||
+		!apiequality.Semantic.DeepEqual(old.Spec.HolderIdentity, updated.Spec.HolderIdentity) ||
+		!apiequality.Semantic.DeepEqual(old.Spec.LeaseDurationSeconds, updated.Spec.LeaseDurationSeconds) {
+		return true
+	}
+	o, n := old.Spec.RenewTime, updated.Spec.RenewTime
+	if o == nil || n == nil {
+		return o != n
+	}
+	return n.Sub(o.Time) > metalNodeRenewGap
+}
 
 // MetalNodeReconciler fills MetalNode status from the agent's Lease and
 // verifies the Mac is reachable with a dial-back verifier pod. The agent
@@ -94,6 +130,7 @@ type MetalNodeReconciler struct {
 
 // +kubebuilder:rbac:groups=inference.llmkube.dev,resources=metalnodes,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=inference.llmkube.dev,resources=metalnodes/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=inference.llmkube.dev,resources=metalnodes/finalizers,verbs=update
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;create;delete
 
@@ -110,16 +147,11 @@ func (r *MetalNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	requeue := metalNodeResyncInterval
-	var consumed []corev1.Pod
-	if report != nil {
-		var after time.Duration
-		after, consumed, err = r.reconcileDialBack(ctx, mn, report, connected, now)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		requeue = min(requeue, after)
-	}
+	// A dial-back error (a Forbidden pod create, a failed list) must not
+	// cost the MetalNode its observed status: store what is known first,
+	// then return the error so the request is retried.
+	requeue, toDelete, dialErr := r.reconcileDialBack(ctx, mn, report, connected, now)
+	requeue = min(metalNodeResyncInterval, requeue)
 	if meta.FindStatusCondition(mn.Status.Conditions, inferencev1alpha1.MetalNodeConditionReachable) == nil {
 		r.setCondition(mn, inferencev1alpha1.MetalNodeConditionReachable, metav1.ConditionUnknown,
 			inferencev1alpha1.MetalNodeReasonNotVerified, "no dial-back has completed yet")
@@ -132,10 +164,13 @@ func (r *MetalNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 	// Finished verifier pods go only after their result is stored: a lost
 	// status write then re-reads the same pod instead of losing the result.
-	for i := range consumed {
-		if err := r.Delete(ctx, &consumed[i], client.PropagationPolicy(metav1.DeletePropagationBackground)); client.IgnoreNotFound(err) != nil {
-			return ctrl.Result{}, fmt.Errorf("delete verifier pod %s: %w", consumed[i].Name, err)
+	for i := range toDelete {
+		if err := r.Delete(ctx, &toDelete[i], client.PropagationPolicy(metav1.DeletePropagationBackground)); client.IgnoreNotFound(err) != nil {
+			return ctrl.Result{}, fmt.Errorf("delete verifier pod %s: %w", toDelete[i].Name, err)
 		}
+	}
+	if dialErr != nil {
+		return ctrl.Result{}, dialErr
 	}
 	return ctrl.Result{RequeueAfter: requeue}, nil
 }
@@ -157,56 +192,82 @@ func (r *MetalNodeReconciler) setCondition(mn *inferencev1alpha1.MetalNode, cond
 	})
 }
 
-// observeLease reads the agent's Lease, sets AgentConnected and
-// lastHeartbeatTime, and copies a valid report's facts into status. It
-// returns the report when it is valid (stale or not) and whether the
-// heartbeat is fresh. Messages never quote the agent's values.
+// observeLease reads the agent's Lease, sets AgentConnected, advances
+// lastHeartbeatTime (throttled) and copies a valid report's facts into
+// status. It returns the report when it is valid (stale or not) and whether
+// the heartbeat is fresh. Messages never quote the agent's values.
 func (r *MetalNodeReconciler) observeLease(ctx context.Context, mn *inferencev1alpha1.MetalNode, now time.Time) (*metalnode.Report, bool, error) {
-	setConnected := func(status metav1.ConditionStatus, reason, msg string) {
-		r.setCondition(mn, inferencev1alpha1.MetalNodeConditionAgentConnected, status, reason, msg)
-	}
+	wasConnected := meta.IsStatusConditionTrue(mn.Status.Conditions, inferencev1alpha1.MetalNodeConditionAgentConnected)
 	lease := &coordinationv1.Lease{}
 	key := types.NamespacedName{Namespace: mn.Namespace, Name: mn.Spec.LeaseName}
 	if err := r.APIReader.Get(ctx, key, lease); err != nil {
 		if apierrors.IsNotFound(err) {
-			setConnected(metav1.ConditionFalse, inferencev1alpha1.MetalNodeReasonLeaseNotFound,
+			r.setCondition(mn, inferencev1alpha1.MetalNodeConditionAgentConnected, metav1.ConditionFalse,
+				inferencev1alpha1.MetalNodeReasonLeaseNotFound,
 				fmt.Sprintf("Lease %s not found; create it with llmkube metal token create", key))
 			return nil, false, nil
 		}
 		return nil, false, fmt.Errorf("get Lease %s: %w", key, err)
 	}
-	if rt := lease.Spec.RenewTime; rt != nil {
-		mn.Status.LastHeartbeatTime = &metav1.Time{Time: rt.Time}
-	}
 
+	obs := evaluateLease(lease, key, now)
+	if obs.report != nil {
+		copyReportFacts(&mn.Status, *obs.report)
+	}
+	r.setCondition(mn, inferencev1alpha1.MetalNodeConditionAgentConnected, obs.status, obs.reason, obs.message)
+	connected := obs.status == metav1.ConditionTrue
+	if rt := lease.Spec.RenewTime; rt != nil && !rt.Time.After(now.Add(metalNodeMaxClockSkew)) {
+		advanceHeartbeat(&mn.Status, rt.Time, connected != wasConnected)
+	}
+	return obs.report, connected, nil
+}
+
+// leaseObservation is what one read of the agent's Lease says.
+type leaseObservation struct {
+	status  metav1.ConditionStatus
+	reason  string
+	message string
+	// report is the decoded report when it is valid, stale or not.
+	report *metalnode.Report
+}
+
+func evaluateLease(lease *coordinationv1.Lease, key types.NamespacedName, now time.Time) leaseObservation {
 	raw, ok := lease.Annotations[metalnode.ReportAnnotation]
 	if !ok {
-		setConnected(metav1.ConditionFalse, inferencev1alpha1.MetalNodeReasonReportInvalid,
-			fmt.Sprintf("Lease %s carries no %s annotation", key, metalnode.ReportAnnotation))
-		return nil, false, nil
+		return leaseObservation{status: metav1.ConditionFalse, reason: inferencev1alpha1.MetalNodeReasonReportInvalid,
+			message: fmt.Sprintf("Lease %s carries no %s annotation", key, metalnode.ReportAnnotation)}
 	}
 	report, err := metalnode.Decode(raw)
 	if err == nil {
 		err = checkIngressClaims(report)
 	}
 	if err != nil {
-		setConnected(metav1.ConditionFalse, inferencev1alpha1.MetalNodeReasonReportInvalid,
-			fmt.Sprintf("the report on Lease %s is invalid: %v", key, err))
-		return nil, false, nil
+		return leaseObservation{status: metav1.ConditionFalse, reason: inferencev1alpha1.MetalNodeReasonReportInvalid,
+			message: fmt.Sprintf("the report on Lease %s is invalid: %v", key, err)}
 	}
-	copyReportFacts(&mn.Status, report)
-
 	if fresh, msg := heartbeatFresh(lease, now); !fresh {
-		setConnected(metav1.ConditionFalse, inferencev1alpha1.MetalNodeReasonHeartbeatStale, msg)
-		return &report, false, nil
+		return leaseObservation{status: metav1.ConditionFalse, reason: inferencev1alpha1.MetalNodeReasonHeartbeatStale,
+			message: msg, report: &report}
 	}
-	setConnected(metav1.ConditionTrue, inferencev1alpha1.MetalNodeReasonHeartbeatFresh,
-		fmt.Sprintf("the agent is renewing Lease %s", key))
-	return &report, true, nil
+	return leaseObservation{status: metav1.ConditionTrue, reason: inferencev1alpha1.MetalNodeReasonHeartbeatFresh,
+		message: fmt.Sprintf("the agent is renewing Lease %s", key), report: &report}
+}
+
+// advanceHeartbeat moves lastHeartbeatTime the way the kubelet's node status
+// does since node Leases (KEP-589): when AgentConnected changes, or when the
+// stored time is a minute behind. Each Mac renews every 15 seconds, and a
+// status write per renewal would add one MetalNode write per Mac per renewal
+// for no reader's benefit; the Lease holds the exact time.
+func advanceHeartbeat(st *inferencev1alpha1.MetalNodeStatus, renewed time.Time, flipped bool) {
+	stored := st.LastHeartbeatTime
+	if stored == nil || flipped || renewed.Before(stored.Time) || renewed.Sub(stored.Time) >= metalNodeHeartbeatResolution {
+		st.LastHeartbeatTime = &metav1.Time{Time: renewed}
+	}
 }
 
 // checkIngressClaims applies the relay's own pin rule, so the dial-back
-// never pins a key the relay would refuse.
+// never pins a key the relay would refuse. The port floor is enforced by
+// metalnode.Decode.
 func checkIngressClaims(report metalnode.Report) error {
 	if report.IngressSPKI == "" {
 		return nil
@@ -221,16 +282,22 @@ func checkIngressClaims(report metalnode.Report) error {
 }
 
 // heartbeatFresh reports whether the Lease was renewed within three lease
-// durations (2 minutes when the duration is unset).
+// durations (2 minutes when the duration is unset). A renewTime more than
+// metalNodeMaxClockSkew in the future is not fresh: it would otherwise never
+// go stale.
 func heartbeatFresh(lease *coordinationv1.Lease, now time.Time) (bool, string) {
 	if lease.Spec.RenewTime == nil {
 		return false, fmt.Sprintf("Lease %s has never been renewed; is the agent running with --metal-node?", lease.Name)
+	}
+	renewed := lease.Spec.RenewTime.Time
+	if renewed.After(now.Add(metalNodeMaxClockSkew)) {
+		return false, fmt.Sprintf("Lease %s has a renewTime more than %s in the future; check the Mac's clock",
+			lease.Name, metalNodeMaxClockSkew)
 	}
 	window := metalNodeHeartbeatWindowUnset
 	if d := lease.Spec.LeaseDurationSeconds; d != nil && *d > 0 {
 		window = 3 * min(time.Duration(*d)*time.Second, metalNodeMaxLeaseDuration)
 	}
-	renewed := lease.Spec.RenewTime.Time
 	if now.Sub(renewed) > window {
 		return false, fmt.Sprintf("Lease %s was last renewed at %s, more than %s ago",
 			lease.Name, renewed.UTC().Format(time.RFC3339), window)
@@ -257,51 +324,90 @@ func copyReportFacts(st *inferencev1alpha1.MetalNodeStatus, report metalnode.Rep
 	st.Capacity = capacity
 }
 
-// reconcileDialBack keeps the candidate list current, harvests finished
-// verifier pods, and starts a new verifier when one is due. It returns how
-// soon to look again and the finished pods to delete once status is stored.
+// reconcileDialBack keeps the candidate list current, harvests this
+// MetalNode's verifier pods, and starts a new verifier when one is due. It
+// returns how soon to look again, the pods to delete once status is stored,
+// and an error that must be returned after the status write.
+//
+// The Mac controls its report, so nothing in it may make the controller run
+// more pods: every verifier pod this MetalNode owns counts as busy until it
+// is gone (terminating ones included), and starts are at least
+// metalNodeMinStartSpacing apart whatever changed.
 func (r *MetalNodeReconciler) reconcileDialBack(ctx context.Context, mn *inferencev1alpha1.MetalNode, report *metalnode.Report,
 	connected bool, now time.Time) (time.Duration, []corev1.Pod, error) {
 	st := &mn.Status
-	desired := metalNodeDesiredCandidates(mn.Spec.HostIP, *report, r.AllowedCIDRs)
-	hash := metalNodeInputHash(report.IngressSPKI, report.IngressPort, desired, mn.Spec.Verifier)
-	if st.Verification == nil || st.Verification.InputHash != hash || !sameCandidates(st.Candidates, desired) {
-		st.Candidates = desired
+	hostIP, hostIPValid := specHostIP(mn)
+	var hash string
+	if report != nil {
+		desired := metalNodeDesiredCandidates(hostIP, *report, r.AllowedCIDRs)
+		hash = metalNodeInputHash(report.IngressSPKI, report.IngressPort, dialableAddresses(desired), mn.Spec.Verifier)
+		keep := st.Verification != nil && st.Verification.InputHash == hash
+		st.Candidates = mergeCandidates(st.Candidates, desired, keep)
 	}
 
-	busy, consumed, err := r.harvestVerifiers(ctx, mn, hash, now)
+	pods, err := r.ownedVerifiers(ctx, mn)
 	if err != nil {
 		return 0, nil, err
 	}
-	if !connected {
-		return metalNodeResyncInterval, consumed, nil
+	switch {
+	case !hostIPValid:
+		r.setReachable(mn, metav1.ConditionFalse, inferencev1alpha1.MetalNodeReasonInvalidSpec,
+			"spec.hostIP is not an IP address; nothing is dialed until it is fixed")
+		return metalNodeResyncInterval, stopVerifiers(pods), nil
+	case report == nil || !connected:
+		r.setReachable(mn, metav1.ConditionUnknown, inferencev1alpha1.MetalNodeReasonAgentNotConnected,
+			"the agent is not connected (see AgentConnected); reachability is not checked until it is")
+		return metalNodeResyncInterval, stopVerifiers(pods), nil
 	}
+
+	busy, toDelete := r.harvestVerifiers(mn, pods, hash, now)
 	addrs := dialableAddresses(st.Candidates)
 	switch {
 	case report.IngressSPKI == "":
 		r.setReachable(mn, metav1.ConditionFalse, inferencev1alpha1.MetalNodeReasonPinMissing,
 			"the agent reports no ingress SPKI pin (is it running with --legacy-direct-endpoints?); nothing to verify against")
-		return metalNodeResyncInterval, consumed, nil
+		return metalNodeResyncInterval, toDelete, nil
 	case len(addrs) == 0:
 		r.setReachable(mn, metav1.ConditionFalse, inferencev1alpha1.MetalNodeReasonNoCandidates,
 			fmt.Sprintf("no candidate address is inside the allowed CIDRs (%d reported); set spec.hostIP or widen --metal-node-allowed-cidrs",
 				len(st.Candidates)))
-		return metalNodeResyncInterval, consumed, nil
+		return metalNodeResyncInterval, toDelete, nil
 	case busy:
-		return metalNodeVerifierPollInterval, consumed, nil
+		return metalNodeVerifierPollInterval, toDelete, nil
 	}
 	if wait := dialBackWait(mn, hash, now); wait > 0 {
-		return wait, consumed, nil
+		return wait, toDelete, nil
 	}
+
+	v := verification(mn)
+	started := metav1.NewTime(now)
+	v.LastStartTime = &started
+	v.PodUID = ""
 	pod := buildMetalNodeVerifierPod(mn, r.verifierImage(), report.IngressSPKI, report.IngressPort, addrs, hash)
 	if err := controllerutil.SetControllerReference(mn, pod, r.Scheme); err != nil {
-		return 0, nil, fmt.Errorf("own verifier pod: %w", err)
+		return 0, toDelete, fmt.Errorf("own verifier pod: %w", err)
 	}
-	if err := r.Create(ctx, pod); err != nil && !apierrors.IsAlreadyExists(err) {
-		return 0, nil, fmt.Errorf("create verifier pod %s: %w", pod.Name, err)
+	if err := r.Create(ctx, pod); err != nil {
+		r.recordVerifierFailure(mn, hash, now,
+			"the controller could not create the verifier pod; see the controller log")
+		return metalNodeVerifierPollInterval, toDelete, fmt.Errorf("create verifier pod %s: %w", pod.Name, err)
 	}
+	v.PodUID = string(pod.UID)
 	log.FromContext(ctx).V(1).Info("started MetalNode dial-back", "pod", pod.Name, "candidates", len(addrs))
-	return metalNodeVerifierPollInterval, consumed, nil
+	return metalNodeVerifierPollInterval, toDelete, nil
+}
+
+// specHostIP returns spec.hostIP in canonical form and whether it is usable
+// (empty, or an IP address without a zone).
+func specHostIP(mn *inferencev1alpha1.MetalNode) (string, bool) {
+	if mn.Spec.HostIP == "" {
+		return "", true
+	}
+	addr, err := netip.ParseAddr(mn.Spec.HostIP)
+	if err != nil || addr.Zone() != "" {
+		return "", false
+	}
+	return addr.Unmap().String(), true
 }
 
 func (r *MetalNodeReconciler) verifierImage() string {
@@ -311,58 +417,95 @@ func (r *MetalNodeReconciler) verifierImage() string {
 	return defaultPrefetchImage
 }
 
-// sameCandidates compares address, source and allowed-ness, not results.
-func sameCandidates(a, b []inferencev1alpha1.MetalNodeCandidate) bool {
-	if len(a) != len(b) {
-		return false
+// mergeCandidates is the desired list, carrying over the last result for an
+// address that is still dialed when the inputs that decide the probe are
+// unchanged (keep). A reworded source keeps its result; new inputs start
+// Pending.
+func mergeCandidates(current, desired []inferencev1alpha1.MetalNodeCandidate, keep bool) []inferencev1alpha1.MetalNodeCandidate {
+	if !keep {
+		return desired
 	}
-	for i := range a {
-		aAllowed := a[i].Result != inferencev1alpha1.CandidateNotAllowed
-		bAllowed := b[i].Result != inferencev1alpha1.CandidateNotAllowed
-		if a[i].Address != b[i].Address || a[i].Source != b[i].Source || aAllowed != bAllowed {
-			return false
+	prev := map[string]inferencev1alpha1.MetalNodeCandidate{}
+	for _, c := range current {
+		if c.Result != inferencev1alpha1.CandidateNotAllowed {
+			prev[c.Address] = c
 		}
 	}
-	return true
+	out := make([]inferencev1alpha1.MetalNodeCandidate, len(desired))
+	for i, c := range desired {
+		if p, ok := prev[c.Address]; ok && c.Result != inferencev1alpha1.CandidateNotAllowed {
+			c.Result, c.CheckedAt = p.Result, p.CheckedAt
+		}
+		out[i] = c
+	}
+	return out
 }
 
 // dialBackWait is how long until the next check is due: at once for new
-// inputs, after the backoff while Reachable is False, and after
-// metalNodeRecheckInterval otherwise.
+// inputs, after the backoff while Reachable is not True, and after
+// metalNodeRecheckInterval otherwise; and never sooner than
+// metalNodeMinStartSpacing after the last start.
 func dialBackWait(mn *inferencev1alpha1.MetalNode, hash string, now time.Time) time.Duration {
 	v := mn.Status.Verification
-	if v == nil || v.LastCheckTime == nil || v.InputHash != hash {
+	if v == nil {
 		return 0
 	}
-	interval := metalNodeRecheckInterval
-	if c := meta.FindStatusCondition(mn.Status.Conditions, inferencev1alpha1.MetalNodeConditionReachable); c != nil && c.Status != metav1.ConditionTrue {
-		interval = metalNodeDialBackBackoff(v.ConsecutiveFailures)
+	var wait time.Duration
+	if v.LastCheckTime != nil && v.InputHash == hash {
+		interval := metalNodeRecheckInterval
+		if c := meta.FindStatusCondition(mn.Status.Conditions, inferencev1alpha1.MetalNodeConditionReachable); c != nil && c.Status != metav1.ConditionTrue {
+			interval = metalNodeDialBackBackoff(v.ConsecutiveFailures)
+		}
+		wait = interval - now.Sub(v.LastCheckTime.Time)
 	}
-	return max(0, interval-now.Sub(v.LastCheckTime.Time))
+	if v.LastStartTime != nil {
+		wait = max(wait, metalNodeMinStartSpacing-now.Sub(v.LastStartTime.Time))
+	}
+	return max(0, wait)
 }
 
-// harvestVerifiers looks at this MetalNode's verifier pods. A finished pod
-// for the current inputs that has not been read yet becomes the result; a
-// pod for older inputs, a finished pod, or one stuck past
-// metalNodeVerifierTimeout is returned for deletion. busy is true while a
-// verifier for the current inputs is still running (or still terminating),
-// so only one runs at a time.
-func (r *MetalNodeReconciler) harvestVerifiers(ctx context.Context, mn *inferencev1alpha1.MetalNode, hash string,
-	now time.Time) (busy bool, consumed []corev1.Pod, err error) {
+// ownedVerifiers lists the verifier pods this MetalNode controls.
+func (r *MetalNodeReconciler) ownedVerifiers(ctx context.Context, mn *inferencev1alpha1.MetalNode) ([]corev1.Pod, error) {
 	pods := &corev1.PodList{}
 	if err := r.List(ctx, pods, client.InNamespace(mn.Namespace),
 		client.MatchingLabels{"app.kubernetes.io/component": metalNodeVerifierComponent}); err != nil {
-		return false, nil, fmt.Errorf("list verifier pods: %w", err)
+		return nil, fmt.Errorf("list verifier pods: %w", err)
 	}
+	var out []corev1.Pod
 	for _, pod := range pods.Items {
-		if owner := metav1.GetControllerOf(&pod); owner == nil || owner.UID != mn.UID {
-			continue
+		if owner := metav1.GetControllerOf(&pod); owner != nil && owner.UID == mn.UID {
+			out = append(out, pod)
 		}
-		current := pod.Annotations[annotationMetalNodeVerifyHash] == hash
+	}
+	return out, nil
+}
+
+// stopVerifiers is every verifier pod not already being deleted.
+func stopVerifiers(pods []corev1.Pod) []corev1.Pod {
+	var out []corev1.Pod
+	for _, p := range pods {
+		if p.DeletionTimestamp == nil {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// harvestVerifiers looks at this MetalNode's verifier pods. Only the pod the
+// controller last created (status.verification.podUID), for the current
+// inputs, can report a result, and only once. Any other pod, a finished
+// pod, or one stuck past metalNodeVerifierTimeout is returned for deletion.
+// busy is true while any verifier pod exists, terminating ones included.
+func (r *MetalNodeReconciler) harvestVerifiers(mn *inferencev1alpha1.MetalNode, pods []corev1.Pod, hash string,
+	now time.Time) (busy bool, toDelete []corev1.Pod) {
+	for _, pod := range pods {
+		busy = true
 		if pod.DeletionTimestamp != nil {
-			busy = busy || current
 			continue
 		}
+		v := mn.Status.Verification
+		tracked := v != nil && v.PodUID != "" && v.PodUID == string(pod.UID)
+		current := tracked && pod.Annotations[annotationMetalNodeVerifyHash] == hash
 		term := verifierTerminated(&pod)
 		switch {
 		case term != nil || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed:
@@ -373,19 +516,17 @@ func (r *MetalNodeReconciler) harvestVerifiers(ctx context.Context, mn *inferenc
 			if current && unread(mn, finished) {
 				r.applyVerifierResult(mn, &pod, term, hash, finished)
 			}
-			consumed = append(consumed, pod)
+			toDelete = append(toDelete, pod)
 		case !current:
-			consumed = append(consumed, pod)
+			toDelete = append(toDelete, pod)
 		case now.Sub(pod.CreationTimestamp.Time) > metalNodeVerifierTimeout:
 			r.recordVerifierFailure(mn, hash, now, fmt.Sprintf(
 				"verifier pod %s did not finish within %s; check that spec.verifier lets it schedule and pull %s",
 				pod.Name, metalNodeVerifierTimeout, pod.Spec.Containers[0].Image))
-			consumed = append(consumed, pod)
-		default:
-			busy = true
+			toDelete = append(toDelete, pod)
 		}
 	}
-	return busy, consumed, nil
+	return busy, toDelete
 }
 
 // unread reports whether a verifier that finished at finished has not been
@@ -402,6 +543,14 @@ func verifierTerminated(pod *corev1.Pod) *corev1.ContainerStateTerminated {
 		}
 	}
 	return nil
+}
+
+// verification returns status.verification, creating it if needed.
+func verification(mn *inferencev1alpha1.MetalNode) *inferencev1alpha1.MetalNodeVerification {
+	if mn.Status.Verification == nil {
+		mn.Status.Verification = &inferencev1alpha1.MetalNodeVerification{}
+	}
+	return mn.Status.Verification
 }
 
 func (r *MetalNodeReconciler) applyVerifierResult(mn *inferencev1alpha1.MetalNode, pod *corev1.Pod,
@@ -435,35 +584,25 @@ func (r *MetalNodeReconciler) applyVerifierResult(mn *inferencev1alpha1.MetalNod
 			st.HostIP = c.Address
 		}
 	}
-	v := &inferencev1alpha1.MetalNodeVerification{InputHash: hash, LastCheckTime: &checkedAt}
+	v := verification(mn)
+	v.InputHash, v.LastCheckTime = hash, &checkedAt
 	if st.HostIP != "" {
-		st.Verification = v
+		v.ConsecutiveFailures = 0
 		r.setReachable(mn, metav1.ConditionTrue, inferencev1alpha1.MetalNodeReasonDialBackSucceeded,
 			fmt.Sprintf("a verifier pod completed TLS with %s:%d against the agent's SPKI pin", st.HostIP, st.IngressPort))
 		return
 	}
-	v.ConsecutiveFailures = failuresSoFar(mn) + 1
-	st.Verification = v
+	v.ConsecutiveFailures++
 	r.setReachable(mn, metav1.ConditionFalse, inferencev1alpha1.MetalNodeReasonNoneReachable,
 		"no candidate completed TLS against the agent's SPKI pin: "+summarizeResults(counts))
 }
 
 func (r *MetalNodeReconciler) recordVerifierFailure(mn *inferencev1alpha1.MetalNode, hash string, at time.Time, msg string) {
 	checkedAt := metav1.NewTime(at)
-	mn.Status.HostIP = ""
-	mn.Status.Verification = &inferencev1alpha1.MetalNodeVerification{
-		InputHash:           hash,
-		LastCheckTime:       &checkedAt,
-		ConsecutiveFailures: failuresSoFar(mn) + 1,
-	}
+	v := verification(mn)
+	v.InputHash, v.LastCheckTime = hash, &checkedAt
+	v.ConsecutiveFailures++
 	r.setReachable(mn, metav1.ConditionFalse, inferencev1alpha1.MetalNodeReasonVerifierFailed, msg)
-}
-
-func failuresSoFar(mn *inferencev1alpha1.MetalNode) int32 {
-	if mn.Status.Verification == nil {
-		return 0
-	}
-	return mn.Status.Verification.ConsecutiveFailures
 }
 
 // setReachable sets the Reachable condition and keeps the invariant that
@@ -539,7 +678,12 @@ func (r *MetalNodeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&inferencev1alpha1.MetalNode{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&corev1.Pod{}).
 		WatchesRawSource(source.Kind(leaseCache, &coordinationv1.Lease{},
-			handler.TypedEnqueueRequestsFromMapFunc(r.metalNodesForLease))).
+			handler.TypedEnqueueRequestsFromMapFunc(r.metalNodesForLease),
+			predicate.TypedFuncs[*coordinationv1.Lease]{
+				UpdateFunc: func(e event.TypedUpdateEvent[*coordinationv1.Lease]) bool {
+					return metalNodeLeaseUpdateMatters(e.ObjectOld, e.ObjectNew)
+				},
+			})).
 		Named("metalnode").
 		Complete(r)
 }

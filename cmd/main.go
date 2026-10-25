@@ -535,8 +535,10 @@ func main() {
 
 	// The watch canary (#2069) scopes the manager's Lease informer to exactly
 	// its own lease: ByObject keys by GVK, so this must never cover a GVK
-	// another controller watches (the ModelRouter and the CA-cert path watch
-	// ConfigMaps; nothing else watches Leases). Scope only when enabled.
+	// another controller watches through the manager cache (the ModelRouter
+	// and the CA-cert path watch ConfigMaps). The MetalNode controller does
+	// watch Leases, but through a label-scoped cache of its own, so this
+	// scope does not narrow it. Scope only when enabled.
 	var cacheOpts cache.Options
 	canaryNamespace := watchcanary.ResolveNamespace(watchCanaryNamespace, leaderElectionNamespace)
 	if watchCanaryInterval > 0 {
