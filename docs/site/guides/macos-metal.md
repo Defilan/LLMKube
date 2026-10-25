@@ -461,6 +461,160 @@ Operationally:
   <string>phi-4-mini,qwen-coder</string>
   ```
 
+## MetalNode: the Mac as a cluster object
+
+A `MetalNode` (short name `mn`) is one Mac, as the cluster sees it:
+its hardware, the agent version, the address the cluster verified it
+can reach, and whether the agent is alive. It is a custom resource,
+not a Kubernetes `Node`, so nothing schedules pods onto it.
+
+```bash
+kubectl get mn
+# NAME         HOST IP      MEMORY   CHIP           REACHABLE   VERSION   AGE
+# mac-studio   100.64.0.2   128Gi    Apple M5 Max   True        0.11.0    3m
+```
+
+Three parties each write only what they know:
+
+- **The admin** creates the MetalNode, a ServiceAccount for the Mac,
+  and a `coordination.k8s.io` Lease for its heartbeat. `spec` names
+  the ServiceAccount and the Lease, and can carry an optional
+  `hostIP` (an address you know reaches the Mac; tried first and
+  still verified) and `verifier` placement (`nodeSelector`,
+  `tolerations`).
+- **The agent** never writes the MetalNode. Started with
+  `--metal-node <name>`, it renews the Lease every 15 seconds and
+  puts what it knows in the Lease's `llmkube.ai/metal-node-report`
+  annotation: version, chip, memory, GPU cores, Metal version, the
+  ingress port, the ingress SPKI pin, and the addresses it thinks the
+  cluster can reach it at, in order of preference.
+- **The controller** is the only writer of MetalNode status. It
+  copies the report into status, sets `AgentConnected` from the
+  Lease's `renewTime`, and proves reachability with a dial-back
+  before setting `Reachable` and `status.hostIP`.
+
+### Running the agent with a MetalNode
+
+Add the flag to the agent's launchd plist (or command line):
+
+```xml
+<string>--metal-node</string>
+<string>mac-studio</string>
+```
+
+The agent renews the Lease with the same name as the MetalNode;
+`--metal-node-lease <name>` picks a different one. It only ever gets
+and updates that Lease. If the Lease does not exist, the agent logs
+`Lease <namespace>/<name> not found; run llmkube metal token create`
+at most once a minute and keeps serving. Without `--metal-node` the
+agent makes no Lease call at all.
+
+The candidate addresses follow the route to the API server (the
+`server:` in the agent's kubeconfig): `--host-ip` first; for a
+cluster on the same Mac (API server on loopback, as with kind on
+Docker Desktop), `192.168.65.254`, then LAN, then tailnet; for a
+cluster reached over a tailnet or VPN (`100.64.0.0/10`, or a route
+through a `utun` interface), the Mac's address on that interface
+first; otherwise the address the Mac's kernel sends from toward the
+API server, then its other private addresses. The list is
+recomputed at every renewal, so a network change reaches the cluster
+within 15 seconds and triggers a new dial-back.
+
+### Creating the objects
+
+`llmkube metal token create` will create all of this for you. Until
+then, apply it yourself in the namespace the agent watches:
+
+```yaml
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: MetalNode
+metadata:
+  name: mac-studio
+spec:
+  serviceAccountName: llmkube-metal-mac-studio
+  leaseName: mac-studio
+---
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: mac-studio
+  labels:
+    # The controller watches only Leases with this label. An unlabeled
+    # Lease is still read, but only on the controller's 60 s resync.
+    inference.llmkube.dev/metal-node: mac-studio
+spec:
+  holderIdentity: mac-studio
+  leaseDurationSeconds: 45
+```
+
+The agent's ServiceAccount needs the shared agent Role (see
+[`deployment/macos/README.md`](https://github.com/defilantech/LLMKube/blob/main/deployment/macos/README.md))
+plus a small per-Mac Role that grants `get` and `update` on its own
+Lease only, by `resourceNames`. The README shows that Role.
+
+### The dial-back
+
+`Reachable` means a pod inside the cluster completed a TLS handshake
+with the agent's ingress and the ingress presented the key the agent
+reported. The controller runs it as a short-lived verifier pod in the
+MetalNode's namespace, owned by the MetalNode, placed by
+`spec.verifier`:
+
+- It uses the operator's `--init-container-image` (curl), runs as a
+  non-root user with a read-only root filesystem, no capabilities and
+  no service account token, and is killed after 60 seconds.
+- For each candidate it runs `curl --pinnedpubkey sha256//<pin>`
+  against `https://<address>:<ingressPort>/health`. The ingress
+  answers 401 without a relay token, which is enough: the handshake
+  only completes against the pinned key, so the result proves both
+  the path and the Mac's identity, and the controller needs no token.
+- Per-candidate results are `Reachable`, `Timeout`, `Refused`,
+  `PinMismatch`, `NotAllowed` or `Error`. The first `Reachable`
+  address in order becomes `status.hostIP`, which is set only while
+  `Reachable` is True.
+
+The check reruns when the pin, port, candidates or placement change,
+every 10 minutes, and after a failure with a backoff of 30 seconds
+growing to 5 minutes. Put the verifier where the relay pods for this
+Mac run, so it tests the path the relay will use.
+
+### Security notes
+
+- **The agent cannot mark itself reachable.** It has no write access
+  to the MetalNode; only the controller sets `Reachable` and
+  `hostIP`. Everything in the Lease report is treated as a claim:
+  bounded, validated (a malformed report or pin is
+  `AgentConnected=False`, reason `ReportInvalid`), and verified where
+  it can be.
+- **The dial-back is no looser than the relay.** It completes TLS
+  only against the SPKI pin the agent reported, checked with the
+  same rule the relay uses, copies no response body or curl error
+  into status, and never passes an agent value through a shell:
+  addresses must be IP literals and reach the pod as arguments.
+- **Allowed CIDRs.** The verifier only dials candidates inside the
+  controller's `--metal-node-allowed-cidrs` (default
+  `10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10`, which
+  covers Docker Desktop's `192.168.65.254`). Anything else is marked
+  `NotAllowed`. Loopback, link-local (where cloud metadata services
+  live) and multicast addresses are never dialed, whatever the list
+  says. A Mac still chooses which allowed addresses and which port
+  get a single TLS probe; narrow the list to your Mac networks if
+  that matters in your cluster.
+
+### Conditions
+
+| Condition | Reason | Meaning |
+|---|---|---|
+| `AgentConnected` | `HeartbeatFresh` | The Lease was renewed within three lease durations. |
+| `AgentConnected` | `HeartbeatStale` | The agent stopped renewing (or never started). |
+| `AgentConnected` | `LeaseNotFound` | The Lease in `spec.leaseName` does not exist. |
+| `AgentConnected` | `ReportInvalid` | The report annotation is missing, malformed, or carries an invalid pin. |
+| `Reachable` | `DialBackSucceeded` | A verifier reached `status.hostIP` with the pinned key. |
+| `Reachable` | `NoneReachable` | No candidate answered with the pinned key; see `status.candidates`. |
+| `Reachable` | `NoCandidates` | No reported address is inside the allowed CIDRs. |
+| `Reachable` | `PinMissing` | The agent reports no ingress pin (legacy mode). |
+| `Reachable` | `VerifierFailed` | The verifier pod failed or never finished (check `spec.verifier` placement and the image pull). |
+
 ## Optional: Apple Silicon power metrics
 
 For [InferCost](https://github.com/defilantech/infercost) (LLMKube's

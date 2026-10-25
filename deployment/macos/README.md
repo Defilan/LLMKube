@@ -447,6 +447,96 @@ your cluster's admins removed that binding, the ServiceAccount above needs it
 granted explicitly, for example
 `kubectl create clusterrolebinding llmkube-metal-agent-discovery --clusterrole=system:discovery --serviceaccount="$NS:llmkube-metal-agent"`.
 
+### `--metal-node` flag (MetalNode reporting) and the per-Mac Role
+
+`--metal-node <name>` makes the agent report to its `MetalNode`, the
+cluster's object for this Mac (see the
+[macOS Metal guide](https://llmkube.com/docs/guides/macos-metal) for the
+resource, its conditions and the controller's dial-back). The agent never
+writes the MetalNode. Every 15 seconds it gets and updates one Lease in
+`--namespace` (named like the MetalNode, or `--metal-node-lease <name>`),
+setting `renewTime`, `holderIdentity` and the `llmkube.ai/metal-node-report`
+annotation with its version, hardware, ingress port and SPKI pin, and the
+addresses it believes the cluster can reach it at. It never creates the
+Lease: if the Lease is missing it logs
+`Lease <namespace>/<name> not found; run llmkube metal token create` at most
+once a minute and keeps serving. Without the flag the agent makes no Lease
+call at all.
+
+The shared Role in `metal-agent-rbac.yaml` does not grant Leases, and must
+not: RBAC cannot scope a shared rule to "the caller's own Lease", so it would
+let every Mac renew every other Mac's heartbeat. Each Mac instead gets its own
+ServiceAccount, bound to the shared Role, plus a small per-Mac Role scoped by
+`resourceNames` to that Mac's objects. `llmkube metal token create` will
+create all of it; until then, apply it yourself (here for a Mac named
+`mac-studio`):
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: llmkube-metal-mac-studio
+automountServiceAccountToken: false
+---
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: mac-studio
+  labels:
+    inference.llmkube.dev/metal-node: mac-studio   # lets the controller watch it
+spec:
+  holderIdentity: mac-studio
+  leaseDurationSeconds: 45
+---
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: MetalNode
+metadata:
+  name: mac-studio
+spec:
+  serviceAccountName: llmkube-metal-mac-studio
+  leaseName: mac-studio
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: llmkube-metal-mac-studio
+rules:
+  # The agent's heartbeat and report. get and update only: the Lease is
+  # pre-created, and RBAC cannot restrict create by name.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["mac-studio"]
+    verbs: ["get", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: llmkube-metal-mac-studio
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: llmkube-metal-mac-studio
+subjects:
+  - kind: ServiceAccount
+    name: llmkube-metal-mac-studio
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: llmkube-metal-agent-mac-studio
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: llmkube-metal-agent
+subjects:
+  - kind: ServiceAccount
+    name: llmkube-metal-mac-studio
+```
+
+`cmd/metal-agent/rbac_test.go` keeps the two apart: the shared Role must grant
+exactly the agent's shared calls and no Lease rule. Deleting the Mac's
+ServiceAccount revokes every token minted for it.
+
 ### `--host-ip` flag (remote cluster)
 
 When your Kubernetes cluster runs on a different machine (Linux server, cloud, etc.), the Metal Agent needs to register the Mac's reachable IP address so that the in-cluster relay can reach the agent's ingress (see "Network exposure" under "Security model"):
