@@ -23,6 +23,8 @@
 #   MACHOPLIST              prebuilt machoplist binary (the release builds it
 #                           once in a before hook); unset: go run ./cmd/machoplist.
 #   RCODESIGN               rcodesign to use (default: rcodesign on PATH).
+#   MACOS_SIGNING_REQUIRED  true: fail unless the .p12, its password and the
+#                           notary key are all set (no ad-hoc fallback).
 #
 # Without rcodesign and without MACOS_SIGN_P12 the binary is left exactly as
 # built, with a warning: embedding the plist breaks the Go linker's ad-hoc
@@ -69,6 +71,18 @@ esac
 [[ -n "$p12" || -z "$password" ]] || die "MACOS_SIGN_PASSWORD is set but MACOS_SIGN_P12 is empty"
 [[ -z "$p12" || -n "$password" ]] || die "MACOS_SIGN_P12 is set but MACOS_SIGN_PASSWORD is empty"
 [[ -n "$p12" || $notarize == false ]] || die "the notary key is set but MACOS_SIGN_P12 is empty: notarization needs a Developer ID signature"
+
+# Once the secrets exist the release must not quietly fall back to an ad-hoc
+# or un-notarized binary (a secret renamed, deleted or out of the job's scope
+# reads as empty), so the maintainer sets MACOS_SIGNING_REQUIRED=true.
+case "${MACOS_SIGNING_REQUIRED:-}" in
+  true)
+    [[ -n "$p12" ]] || die "MACOS_SIGNING_REQUIRED=true but MACOS_SIGN_P12 is empty"
+    [[ $notarize == true ]] || die "MACOS_SIGNING_REQUIRED=true but the notary key is not set: missing ${notary_missing[*]}"
+    ;;
+  false | "") ;;
+  *) die "MACOS_SIGNING_REQUIRED must be true, false or empty, not '${MACOS_SIGNING_REQUIRED}'" ;;
+esac
 
 rcodesign="${RCODESIGN:-rcodesign}"
 if ! command -v "$rcodesign" >/dev/null 2>&1; then

@@ -101,8 +101,8 @@ hook() {
   while [[ "$1" != "--" ]]; do envs+=("$1"); shift; done
   shift
   OUT="$(env -u MACOS_SIGN_P12 -u MACOS_SIGN_PASSWORD -u MACOS_NOTARY_KEY \
-    -u MACOS_NOTARY_KEY_ID -u MACOS_NOTARY_ISSUER_ID -u MACHOPLIST -u RCODESIGN \
-    -u GOOS -u GOARCH \
+    -u MACOS_NOTARY_KEY_ID -u MACOS_NOTARY_ISSUER_ID -u MACOS_SIGNING_REQUIRED \
+    -u MACHOPLIST -u RCODESIGN -u GOOS -u GOARCH \
     PATH="$STUB:$PATH" CAP="$CAP" MACHOPLIST="$STUB/machoplist" \
     ${envs[@]+"${envs[@]}"} bash "$HOOK" "$@" 2>&1)" && CODE=0 || CODE=$?
 }
@@ -272,6 +272,36 @@ if [[ "$(cat "$CAP/p8" 2>/dev/null)" == "$P8_RAW" && "$(cat "$CAP/p8.perm")" == 
   pass "notary: .p8 decoded owner-only, zip holds just the binary, no secret printed"
 else
   fail "notary: .p8 decoded owner-only, zip holds just the binary, no secret printed" "zip '$(cat "$CAP/zip.list" 2>/dev/null)'"
+fi
+
+# --- MACOS_SIGNING_REQUIRED=true: no silent downgrade -----------------------------
+misconfig "required, no secrets: fails" "MACOS_SIGN_P12" MACOS_SIGNING_REQUIRED=true
+misconfig "required, P12 without the notary key: fails" "MACOS_NOTARY_KEY" \
+  MACOS_SIGNING_REQUIRED=true MACOS_SIGN_P12="$P12_B64" MACOS_SIGN_PASSWORD="$PASSWORD"
+misconfig "required, everything set but rcodesign missing: fails" "rcodesign" \
+  MACOS_SIGNING_REQUIRED=true RCODESIGN=rcodesign-not-installed "${NOTARY[@]}"
+misconfig "required set to an unrecognized value: fails" "MACOS_SIGNING_REQUIRED" \
+  MACOS_SIGNING_REQUIRED=yes "${NOTARY[@]}"
+bin="$(new_bin)"
+hook MACOS_SIGNING_REQUIRED=true "${NOTARY[@]}" -- darwin "$bin" 1.2.3 dev.llmkube.metal-agent "$TEMPLATE"
+if [[ $CODE == 0 && "$(calls rcodesign)" == *notary-submit* ]]; then
+  pass "required, everything set: signs and notarizes"
+else
+  fail "required, everything set: signs and notarizes" "exit $CODE, rcodesign '$(calls rcodesign)'"
+fi
+bin="$(new_bin)"
+hook MACOS_SIGNING_REQUIRED=true -- linux "$bin" 1.2.3 dev.llmkube.cli
+if [[ $CODE == 0 && "$(content "$bin")" == original-binary ]]; then
+  pass "required does not affect non-darwin builds"
+else
+  fail "required does not affect non-darwin builds" "exit $CODE"
+fi
+bin="$(new_bin)"
+hook MACOS_SIGNING_REQUIRED=false -- darwin "$bin" 1.2.3 dev.llmkube.metal-agent "$TEMPLATE"
+if [[ $CODE == 0 && "$(content "$bin")" == original-binaryINJECTEDSIGNED ]]; then
+  pass "required=false keeps the ad-hoc fallback"
+else
+  fail "required=false keeps the ad-hoc fallback" "exit $CODE"
 fi
 
 # --- failures propagate -----------------------------------------------------------

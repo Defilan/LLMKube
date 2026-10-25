@@ -111,7 +111,9 @@ jobs:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           # Read by hack/macos-sign.sh (docs/contributing/macos-signing.md).
           # Unset: the darwin binaries are ad-hoc signed and not notarized.
-          # A partial set fails the release.
+          # A partial set fails the release, and so does any missing secret
+          # once the repository variable MACOS_SIGNING_REQUIRED is true.
+          MACOS_SIGNING_REQUIRED: ${{ vars.MACOS_SIGNING_REQUIRED }}
           MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
           MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
           MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}

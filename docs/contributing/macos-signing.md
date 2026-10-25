@@ -40,6 +40,7 @@ What the secrets select:
 | `MACOS_SIGN_P12`, `MACOS_SIGN_PASSWORD` | Developer ID signature, hardened runtime, secure timestamp       |
 | all five                             | Developer ID signature, notarized                                   |
 | any other combination                | the release fails with the missing variable named                   |
+| anything short of all five, with `MACOS_SIGNING_REQUIRED=true` | the release fails before signing |
 
 The ad-hoc fallback keeps forks and secret-less runs working: embedding the
 plist breaks the Go linker's own ad-hoc signature, and macOS kills an arm64
@@ -47,8 +48,21 @@ binary whose signature does not verify, so the binary is re-signed either way.
 
 ## The secrets
 
-Set them on `defilantech/LLMKube` (ideally in a protected environment used only
-by the release job). All are read from the GoReleaser step's environment.
+Store them as repository secrets on `defilantech/LLMKube` (Settings, Secrets
+and variables, Actions, Repository secrets). Do not put them in an environment:
+the `goreleaser` job has no `environment:` key, so environment secrets would
+read as empty and the release would quietly fall back to ad-hoc signing. Moving
+them into a protected environment later means adding `environment: <name>` to
+that job in the same change. All five are read from the GoReleaser step's
+environment.
+
+Once all five are stored, set the
+repository variable `MACOS_SIGNING_REQUIRED` to `true` (Settings, Secrets and
+variables, Actions, Variables, or
+`gh variable set MACOS_SIGNING_REQUIRED --repo defilantech/LLMKube --body true`).
+From then on a release fails, before any binary is signed, if any of the five
+is empty, instead of shipping ad-hoc or un-notarized binaries. Forks and runs
+without the variable keep the ad-hoc fallback.
 
 | Secret                   | Value                                                         |
 |--------------------------|---------------------------------------------------------------|
