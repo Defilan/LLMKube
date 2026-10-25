@@ -319,6 +319,18 @@ if [[ $CODE != 0 && "$OUT" == *"stub rcodesign: sign failed"* ]] && no_secrets_i
 else
   fail "a signing failure fails the hook and shows rcodesign's error" "exit $CODE"
 fi
+if [[ "$OUT" == *"hint:"*"-legacy"*"docs/contributing/macos-signing.md"* ]]; then
+  pass "a Developer ID signing failure points at the .p12 re-encode docs"
+else
+  fail "a Developer ID signing failure points at the .p12 re-encode docs" "no hint in output"
+fi
+bin="$(new_bin)"
+hook RC_FAIL=sign -- darwin "$bin" 1.2.3 dev.llmkube.metal-agent "$TEMPLATE"
+if [[ $CODE != 0 && "$OUT" != *"hint:"* ]]; then
+  pass "an ad-hoc signing failure has no .p12 hint"
+else
+  fail "an ad-hoc signing failure has no .p12 hint" "exit $CODE"
+fi
 bin="$(new_bin)"
 hook MACOS_SIGN_P12='!!!not base64!!!' MACOS_SIGN_PASSWORD="$PASSWORD" -- darwin "$bin" 1.2.3 dev.llmkube.metal-agent "$TEMPLATE"
 if [[ $CODE != 0 && "$OUT" == *MACOS_SIGN_P12* && "$(calls rcodesign)" != *sign* ]]; then

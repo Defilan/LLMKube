@@ -95,10 +95,13 @@ tmp_root="${TMPDIR:-/tmp}"
 work="$(mktemp -d "${tmp_root%/}/macos-sign.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 
-# rc runs rcodesign quietly and shows its log only when it fails.
+# rc runs rcodesign quietly and shows its log only when it fails, followed by
+# $rc_hint when that is set.
+rc_hint=""
 rc() {
   if ! "$rcodesign" "$@" >"$work/rcodesign.log" 2>&1; then
     cat "$work/rcodesign.log" >&2
+    [[ -z "$rc_hint" ]] || log "hint: $rc_hint"
     die "rcodesign $1 failed for $bin"
   fi
 }
@@ -133,6 +136,8 @@ fi
 
 decode_secret MACOS_SIGN_P12 "$work/cert.p12"
 (umask 077 && printf '%s' "$password" >"$work/p12.password")
+rc_hint="rcodesign 0.29.0 reports an AES-encrypted .p12 (the OpenSSL 3 default) as an incorrect password; \
+re-encode it with openssl pkcs12 -legacy, see \"rcodesign rejects the .p12\" in docs/contributing/macos-signing.md"
 rc sign --p12-file "$work/cert.p12" --p12-password-file "$work/p12.password" \
   --binary-identifier "$identifier" --code-signature-flags runtime --for-notarization "$bin"
 rm -f "$work/cert.p12" "$work/p12.password"

@@ -56,8 +56,8 @@ them into a protected environment later means adding `environment: <name>` to
 that job in the same change. All five are read from the GoReleaser step's
 environment.
 
-Once all five are stored, set the
-repository variable `MACOS_SIGNING_REQUIRED` to `true` (Settings, Secrets and
+Once all five are stored (after the local dry run below), set the repository
+variable `MACOS_SIGNING_REQUIRED` to `true` (Settings, Secrets and
 variables, Actions, Variables, or
 `gh variable set MACOS_SIGNING_REQUIRED --repo defilantech/LLMKube --body true`).
 From then on a release fails, before any binary is signed, if any of the five
@@ -81,13 +81,7 @@ without the variable keep the ad-hoc fallback.
 2. In Keychain Access, find "Developer ID Application: <team>" under My
    Certificates, expand it to confirm the private key is there, and export
    both as a `.p12` with a strong password.
-3. Store it, then delete the file:
-
-   ```bash
-   base64 -i developer-id.p12 | gh secret set MACOS_SIGN_P12 --repo defilantech/LLMKube
-   gh secret set MACOS_SIGN_PASSWORD --repo defilantech/LLMKube   # prompts for the value
-   rm developer-id.p12
-   ```
+3. Keep `developer-id.p12` until the dry run below passes.
 
 ### App Store Connect API key
 
@@ -95,14 +89,92 @@ without the variable keep the ad-hoc fallback.
    create a Team Key with the Developer role (enough for notarization).
 2. Download `AuthKey_<KEYID>.p8`; Apple offers the download only once. Note the
    key ID and the issuer ID.
-3. Store them, then delete the key file:
 
-   ```bash
-   base64 -i AuthKey_<KEYID>.p8 | gh secret set MACOS_NOTARY_KEY --repo defilantech/LLMKube
-   gh secret set MACOS_NOTARY_KEY_ID --repo defilantech/LLMKube --body <KEYID>
-   gh secret set MACOS_NOTARY_ISSUER_ID --repo defilantech/LLMKube --body <issuer-id>
-   rm AuthKey_<KEYID>.p8
-   ```
+### Dry run on a Mac before storing anything
+
+GoReleaser runs only after release-please has tagged a release, so a bad secret
+found there leaves a tagged release without assets. Run the release's own hook
+on a Mac first. It signs, notarizes (a real submission to Apple, a few minutes)
+and checks a freshly built metal-agent, with the values held only by a
+subshell. You need rcodesign 0.29.0: the
+`apple-codesign-0.29.0-aarch64-apple-darwin.tar.gz` release asset (SHA-256
+`d1a532150adaf90048260d76359261aa716abafc45c53c5dc18845029184334a`) or
+`brew install rcodesign`.
+
+```bash
+cd <your LLMKube checkout>
+mkdir -p /tmp/llmkube-sign-test
+bin=/tmp/llmkube-sign-test/llmkube-metal-agent
+CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags '-s -w' \
+  -o "$bin" ./cmd/metal-agent
+(
+  export MACOS_SIGNING_REQUIRED=true
+  export MACOS_SIGN_P12="$(base64 -i developer-id.p12)"
+  printf '.p12 password: '; read -rs MACOS_SIGN_PASSWORD; echo; export MACOS_SIGN_PASSWORD
+  export MACOS_NOTARY_KEY="$(base64 -i AuthKey_<KEYID>.p8)"
+  export MACOS_NOTARY_KEY_ID=<KEYID>
+  export MACOS_NOTARY_ISSUER_ID=<issuer-id>
+  ./hack/macos-sign.sh darwin "$bin" 0.0.0 dev.llmkube.metal-agent \
+    deployment/macos/metal-agent.Info.plist.tmpl
+)
+codesign -dv --verbose=4 "$bin"
+spctl --assess --type install -vv "$bin"
+"$bin" --version
+```
+
+The hook should end with `macos-sign: notarized ...`. `codesign` should show
+`Identifier=dev.llmkube.metal-agent`, `Authority=Developer ID Application: ...`,
+your `TeamIdentifier`, a `Timestamp`, the `runtime` flag and
+`Info.plist entries=9`. `spctl` should print `accepted` and
+`source=Notarized Developer ID`. Use `--type install`: `--type execute` assesses
+app bundles and rejects any bare executable, notarized or not, with "does not
+seem to be an app".
+
+### rcodesign rejects the .p12
+
+rcodesign 0.29.0 cannot read a `.p12` encrypted with PBES2/AES-256, the default
+of OpenSSL 3 (and possibly of your Keychain Access export), and reports it as
+`Error: incorrect password given when decrypting PFX data` even when the
+password is right; the hook then prints a hint pointing here. Check the format
+with `openssl pkcs12 -in developer-id.p12 -info -noout` (Homebrew `openssl@3`;
+the system `openssl` is LibreSSL): `PBES2, PBKDF2, AES-256-CBC` is the
+unreadable kind. Re-encode it in the legacy format. The certificates, which are
+public, go through a file; the decrypted private key only goes through a pipe:
+
+```bash
+openssl=$(brew --prefix openssl@3)/bin/openssl
+(
+  printf 'current .p12 password: '; read -rs P12_IN; echo; export P12_IN
+  printf 'new .p12 password: '; read -rs P12_OUT; echo; export P12_OUT
+  "$openssl" pkcs12 -in developer-id.p12 -nokeys -passin env:P12_IN -out developer-id-certs.pem
+  "$openssl" pkcs12 -in developer-id.p12 -nocerts -nodes -passin env:P12_IN \
+    | "$openssl" pkcs12 -export -legacy -inkey /dev/stdin -in developer-id-certs.pem \
+        -out developer-id-legacy.p12 -passout env:P12_OUT
+)
+rm developer-id-certs.pem
+```
+
+`-inkey /dev/stdin` with the certificates from a file matters: given only the
+pipe, `openssl pkcs12 -export` reads its input twice and fails with "Could not
+find certificates". Run the dry run again with `developer-id-legacy.p12` and
+the new password.
+
+### Store the secrets
+
+When the dry run passes, store the values and delete the files:
+
+```bash
+base64 -i developer-id.p12 | gh secret set MACOS_SIGN_P12 --repo defilantech/LLMKube
+gh secret set MACOS_SIGN_PASSWORD --repo defilantech/LLMKube   # prompts for the value
+base64 -i AuthKey_<KEYID>.p8 | gh secret set MACOS_NOTARY_KEY --repo defilantech/LLMKube
+gh secret set MACOS_NOTARY_KEY_ID --repo defilantech/LLMKube --body <KEYID>
+gh secret set MACOS_NOTARY_ISSUER_ID --repo defilantech/LLMKube --body <issuer-id>
+gh variable set MACOS_SIGNING_REQUIRED --repo defilantech/LLMKube --body true
+rm developer-id.p12 developer-id-legacy.p12 AuthKey_<KEYID>.p8
+```
+
+Use the `.p12` file that passed the dry run (the `-legacy` one if you
+re-encoded it).
 
 The hook decodes the secrets into a private temporary directory, passes them to
 rcodesign as files, never prints them, and removes the directory when it exits.
