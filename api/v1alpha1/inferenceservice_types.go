@@ -1527,8 +1527,9 @@ type VLLMConfig struct {
 	// dtype), which is what unlocks 128K+ context on consumer VRAM for agentic
 	// workloads. fp8 is vLLM's platform-resolved alias, passed through
 	// unrewritten: it is fp8_e4m3 on CUDA and ROCm, fp8_inc on Gaudi. float16
-	// and bfloat16 pin an unquantized cache; bfloat16 is the opt-out for models
-	// whose cache defaults to fp8 (DeepSeekV3.2, for example).
+	// pins a 16-bit cache. bfloat16 is the opt-out for models whose cache
+	// defaults to fp8 (DeepSeek-V3.2), and vLLM documents it as an invalid
+	// option for models that do not default to fp8.
 	// Maps to vLLM --kv-cache-dtype flag.
 	// For cache types not in the enum (fp8_ds_mla, nvfp4, the turboquant_* and
 	// *_per_token_head families), use KVCacheCustomDtype instead.
@@ -1538,8 +1539,8 @@ type VLLMConfig struct {
 	KVCacheDtype *string `json:"kvCacheDtype,omitempty"`
 
 	// KVCacheCustomDtype sets a custom vLLM KV cache element type that is not
-	// in the standard enum. Covers build-or hardware-specific formats (turbo2
-	// and fp8_ds_mla from v0.20+) and values added by a vLLM image newer than
+	// in the standard enum. Covers build- or hardware-specific formats
+	// (fp8_ds_mla from v0.20+) and values added by a vLLM image newer than
 	// the operator's default. Maps to vLLM --kv-cache-dtype. The runtime image
 	// must understand the value or vLLM will fail to start; LLMKube does not
 	// validate the string. Mirrors the llama.cpp-side CacheTypeCustomK/V

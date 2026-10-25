@@ -242,7 +242,7 @@ var _ = Describe("InferenceService vllmConfig.kvCacheDtype CRD validation", func
 
 	for _, dt := range []string{"fp8_ds_mla", "fp8_inc", "nvfp4", "turboquant_3bit_nc", "not-a-dtype"} {
 		It("still rejects kvCacheDtype="+dt, func() {
-			err := k8sClient.Create(ctx, newDtypeISvc("kv-dtype-bad-"+dt, dt))
+			err := k8sClient.Create(ctx, newDtypeISvc("kv-dtype-bad-"+kubeName(dt), dt))
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("kvCacheDtype"))
 		})
@@ -284,7 +284,7 @@ var _ = Describe("InferenceService vllmConfig.kvCacheDtype CRD validation", func
 
 	for _, dt := range []string{"fp8", "float16"} {
 		It("still rejects sglangConfig.kvCacheDtype="+dt, func() {
-			err := k8sClient.Create(ctx, newSGLangDtypeISvc("sglang-kv-dtype-bad-"+dt, dt))
+			err := k8sClient.Create(ctx, newSGLangDtypeISvc("sglang-kv-dtype-bad-"+kubeName(dt), dt))
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("kvCacheDtype"))
 		})

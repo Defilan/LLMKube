@@ -16,7 +16,8 @@ Long-context inference is bandwidth-bound on the KV cache, not the weights. At f
 | vLLM | auto (default) | follows dtype | varies | Reference / baseline |
 | vLLM | fp8 / fp8_e4m3 | 8 | ~16 GB | Production agentic on H100/L4 |
 | vLLM | fp8_e5m2 | 8 | ~16 GB | Same scale, different exponent bias |
-| vLLM | float16 / bfloat16 | 16 | ~32 GB | Unquantized cache, pinned explicitly |
+| vLLM | float16 | 16 | ~32 GB | Explicit 16-bit cache |
+| vLLM | bfloat16 | 16 | ~32 GB | Opt-out for a model whose cache defaults to fp8 |
 | vLLM | turbo2 (v0.20+) | 2 | ~4 GB | Maximum context per VRAM |
 
 ## Two runtimes, two fields each
@@ -49,7 +50,7 @@ spec:
 
 vLLM does not split K and V into separate flags — `--kv-cache-dtype` controls both.
 
-`fp8` is the spelling vLLM's own recipes use, and vLLM resolves it per platform: it is `fp8_e4m3` on CUDA and ROCm and `fp8_inc` on Intel Gaudi. LLMKube passes whichever value you set through unchanged rather than rewriting the alias. `float16` and `bfloat16` pin an unquantized cache, which is how you opt out of an fp8 default on models that set one (DeepSeek-V3.2 and its descendants). An fp8 KV cache takes its scales from the checkpoint; without them vLLM assumes scales of 1.0, which can cost accuracy, so prefer a checkpoint whose scales are calibrated.
+`fp8` is the spelling vLLM's own recipes use, and vLLM resolves it per platform: it is `fp8_e4m3` on CUDA and ROCm and `fp8_inc` on Intel Gaudi. LLMKube passes whichever value you set through unchanged rather than rewriting the alias. `float16` pins a 16-bit cache. `bfloat16` is not a general-purpose unquantized cache: it is how you opt out of an fp8 default on the models that set one (DeepSeek-V3.2 and its descendants), and vLLM documents it as an invalid option for models that do not default to fp8. An fp8 KV cache takes its scales from the checkpoint; without them vLLM assumes scales of 1.0, which can cost accuracy, so prefer a checkpoint whose scales are calibrated.
 
 ## When to use which field
 
