@@ -2138,8 +2138,11 @@ type SGLangConfig struct {
 	// glm and glm45 both select the GLM-4.5/4.7 MoE detector; SGLang
 	// v0.5.15.post1 also logs a deprecation warning for a passed glm45 and
 	// rewrites it to glm (server_args.py), so either spelling works. qwen3 and
-	// functionary are kept for objects written against earlier releases even
-	// though the pinned image no longer registers them.
+	// functionary are kept for objects written against earlier LLMKube
+	// releases: no SGLang release checked registers either, so the server
+	// exits at startup with an invalid-choice error, and SGLangSpecValid
+	// reports them with reason ToolCallParserUnsupported. qwen25 covers Qwen3
+	// models; qwen3_coder covers Qwen3-Coder and Qwen3.5 or newer.
 	// +kubebuilder:validation:Enum=llama3;qwen3;qwen25;hermes;functionary;mistral;glm;glm45;glm47
 	// +optional
 	ToolCallParser string `json:"toolCallParser,omitempty"`

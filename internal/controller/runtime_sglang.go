@@ -60,6 +60,26 @@ var sglangRemovedAttentionBackends = map[string]string{
 	"dual_chunk_flash_attn": "leave it unset to let SGLang choose",
 }
 
+// sglangRelease is the release both default images pin. The tool-call parser
+// message names it from here so the release claim cannot drift from the
+// constant, and the parser fixture is named after it, so a bump that forgets to
+// regenerate the fixture fails to open its oracle instead of shipping a stale
+// claim (#2219).
+const sglangRelease = "v0.5.22"
+
+// sglangUnsupportedToolCallParsers are toolCallParser values no release checked
+// registers, so --tool-call-parser exits at argument parsing with an
+// invalid-choice error. They stay in the enum so objects written against
+// earlier LLMKube releases remain valid, and SGLangSpecValid reports them. The
+// value is the advice the message gives. The captures behind the check are
+// testdata/sglang-tool-call-parsers-v0.5.15.post1.txt and
+// testdata/sglang-tool-call-parsers-v0.5.22.txt; the values are also absent from
+// v0.4.9, v0.5.5.post1, v0.5.12, v0.5.19 and v0.5.20, checked by hand.
+var sglangUnsupportedToolCallParsers = map[string]string{
+	"qwen3":       "Use qwen25 for Qwen3 models, or qwen3_coder for Qwen3-Coder and for Qwen3.5 or newer",
+	"functionary": "Leave it unset, or name the tool-call parser SGLang registers for your model family",
+}
+
 // sglangCUDAImage pins the newest stable SGLang CUDA image (verified
 // 2026-10-24 via github.com/sgl-project/sglang/releases and Docker Hub,
 // published for amd64 and arm64). It is a CUDA 13 build, so it needs the
@@ -69,11 +89,11 @@ var sglangRemovedAttentionBackends = map[string]string{
 // lmsysorg/sglang:v0.5.19-cu129 via runtimeImages.sglang or spec.image
 // (#2213). Blackwell is a first-class SGLang target (SM100 CuteDSL kernels
 // since v0.5.14, Blackwell MLA backend since v0.5.12).
-const sglangCUDAImage = "lmsysorg/sglang:v0.5.22-cu130"
+const sglangCUDAImage = "lmsysorg/sglang:" + sglangRelease + "-cu130"
 
 // sglangROCmImage is the AMD ROCm variant. Selected by resolveRuntimeImage
 // when model.Spec.Hardware.GPU.Vendor == "amd".
-const sglangROCmImage = "lmsysorg/sglang:v0.5.22-rocm720-mi30x"
+const sglangROCmImage = "lmsysorg/sglang:" + sglangRelease + "-rocm720-mi30x"
 
 // SGLangBackend generates container configuration for the SGLang inference
 // server (https://github.com/sgl-project/sglang).
@@ -233,6 +253,14 @@ func ValidateSGLangConfig(isvc *inferencev1alpha1.InferenceService) (reason, mes
 		return "AttentionBackendRemoved",
 			fmt.Sprintf("spec.sglangConfig.attentionBackend %s was removed in SGLang v0.5.20; the default image exits at startup with an invalid-choice error. It still runs on an image at v0.5.19 or older, such as lmsysorg/sglang:v0.5.19-cu129 set in spec.image; otherwise use %s",
 				cfg.AttentionBackend, instead)
+	}
+	// The ordering invariant: a value that keeps the pod from starting outranks
+	// one that only skips flags, so this sits after the attention-backend
+	// checks and before the speculative ones.
+	if advice, unsupported := sglangUnsupportedToolCallParsers[cfg.ToolCallParser]; unsupported {
+		return "ToolCallParserUnsupported",
+			fmt.Sprintf("spec.sglangConfig.toolCallParser %s is not a parser SGLang %s registers, so SGLang exits at startup with an invalid-choice error. %s",
+				cfg.ToolCallParser, sglangRelease, advice)
 	}
 	if cfg.Speculative != nil && cfg.Speculative.Enabled != nil && *cfg.Speculative.Enabled {
 		if cfg.Speculative.Algorithm == "" || cfg.Speculative.DraftModelPath == "" {

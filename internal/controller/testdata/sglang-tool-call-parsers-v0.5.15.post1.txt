@@ -1,0 +1,39 @@
+# --tool-call-parser choices SGLang v0.5.15.post1 registers, one per line.
+#
+# Oracle: https://github.com/sgl-project/sglang/blob/v0.5.15.post1/python/sglang/srt/function_call/function_call_parser.py
+# (FunctionCallParser.ToolCallParserEnum; this release has no parser_names.py).
+#
+# Regenerate:
+#   gh api -H 'Accept: application/vnd.github.raw' \
+#     "repos/sgl-project/sglang/contents/python/sglang/srt/function_call/function_call_parser.py?ref=v0.5.15.post1" \
+#     | sed -n '/ToolCallParserEnum/,/^    }/p' | grep -o '^        "[^"]*"' | tr -d ' "'
+apertus2509
+cohere_command4
+deepseekv3
+deepseekv31
+deepseekv32
+deepseekv4
+glm
+glm45
+glm47
+gpt-oss
+kimi_k2
+lfm2
+llama3
+mimo
+minicpm5
+mistral
+poolside_v1
+pythonic
+qwen
+qwen25
+qwen3_coder
+step3
+step3p5
+minimax-m2
+trinity
+interns1
+hermes
+hunyuan
+gigachat3
+gemma4
