@@ -32,6 +32,7 @@ import (
 	"go.uber.org/zap/zapcore"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -94,6 +95,8 @@ type AgentConfig struct {
 	IngressPort               int
 	StateDir                  string
 	LegacyDirectEndpoints     bool
+	MetalNode                 string
+	MetalNodeLease            string
 
 	// AllowModelMemoryBudgetOverride: see agent.MetalAgentConfig.
 	AllowModelMemoryBudgetOverride bool
@@ -118,6 +121,27 @@ func splitCSV(s string) []string {
 		return nil
 	}
 	return out
+}
+
+// validateMetalNodeFlags checks --metal-node and --metal-node-lease: both are
+// object names (DNS-1123 subdomains), and a Lease override means nothing
+// without the MetalNode it reports for.
+func validateMetalNodeFlags(node, lease string) error {
+	if node == "" {
+		if lease != "" {
+			return fmt.Errorf("--metal-node-lease requires --metal-node")
+		}
+		return nil
+	}
+	if errs := validation.IsDNS1123Subdomain(node); len(errs) > 0 {
+		return fmt.Errorf("--metal-node %q is not a valid object name: %s", node, strings.Join(errs, "; "))
+	}
+	if lease != "" {
+		if errs := validation.IsDNS1123Subdomain(lease); len(errs) > 0 {
+			return fmt.Errorf("--metal-node-lease %q is not a valid object name: %s", lease, strings.Join(errs, "; "))
+		}
+	}
+	return nil
 }
 
 // loadKubeconfig defers to controller-runtime's standard discovery chain:
@@ -507,6 +531,13 @@ func main() {
 	flag.BoolVar(&cfg.LegacyDirectEndpoints, "legacy-direct-endpoints", false,
 		"DEPRECATED, removed in a future release: bind engines on all interfaces without authentication and "+
 			"register them directly, as before the ingress. Only for a controller that predates relay support.")
+	flag.StringVar(&cfg.MetalNode, "metal-node", "",
+		"Name of this Mac's MetalNode in --namespace. When set, the agent renews the MetalNode's Lease every 15s "+
+			"and reports its version, hardware, ingress pin and candidate addresses on it; it never writes the "+
+			"MetalNode itself. The Lease must already exist (llmkube metal token create). Empty (default) disables "+
+			"MetalNode reporting.")
+	flag.StringVar(&cfg.MetalNodeLease, "metal-node-lease", "",
+		"Lease the agent renews for --metal-node. Default: the MetalNode's own name.")
 	flag.StringVar(&cfg.LogLevel, "log-level", "info", "Log level (debug, info, warn, error)")
 	flag.StringVar(&cfg.HostIP, "host-ip", "", "IP address to register in Kubernetes endpoints (auto-detected if empty)")
 	flag.Float64Var(&cfg.MemoryFraction, "memory-fraction", 0,
@@ -603,6 +634,11 @@ func main() {
 		_ = baseLogger.Sync()
 	}()
 	logger := baseLogger.Sugar()
+
+	if err := validateMetalNodeFlags(cfg.MetalNode, cfg.MetalNodeLease); err != nil {
+		logger.Errorw("invalid MetalNode flags", "error", err)
+		os.Exit(1)
+	}
 
 	// Create, vet and pin the model store before anything uses it.
 	if err := configureModelStore(cfg); err != nil {
@@ -795,8 +831,21 @@ func main() {
 		IngressPort:               cfg.IngressPort,
 		StateDir:                  cfg.StateDir,
 		LegacyDirectEndpoints:     cfg.LegacyDirectEndpoints,
+		MetalNode:                 cfg.MetalNode,
+		MetalNodeLease:            cfg.MetalNodeLease,
+		APIServerHost:             k8sConfig.Host,
 
 		AllowModelMemoryBudgetOverride: cfg.AllowModelMemoryBudgetOverride,
+	}
+	if cfg.MetalNode != "" {
+		// Collected once: hardware does not change while the agent runs.
+		capacity := agent.DetectHostCapacity()
+		capacity.GPUCores = int32(min(caps.GPUCores, math.MaxInt32)) //nolint:gosec // G115: clamped to MaxInt32
+		capacity.MetalVersion = agent.MetalVersionString(caps.MetalVersion)
+		agentCfg.HostCapacity = capacity
+		logger.Infow("MetalNode reporting enabled",
+			"metalNode", cfg.MetalNode, "chip", capacity.Chip, "memoryBytes", capacity.MemoryBytes,
+			"gpuCores", capacity.GPUCores, "metalVersion", capacity.MetalVersion)
 	}
 	if cfg.WatchdogInterval > 0 {
 		agentCfg.WatchdogConfig = &agent.MemoryWatchdogConfig{

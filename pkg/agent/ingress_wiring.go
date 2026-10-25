@@ -132,6 +132,7 @@ func (a *MetalAgent) prepareIngress() (*ingress.Server, error) {
 	if err := a.registry.EnableIngress(a.config.IngressPort, pin); err != nil {
 		return nil, fmt.Errorf("enable ingress registration: %w", err)
 	}
+	a.ingressPin = pin
 	a.logger.Infow("relay mode: engines bind 127.0.0.1, served through the ingress",
 		"ingressPort", a.config.IngressPort, "spkiPin", pin, "stateDir", stateDir,
 		"identityDir", filepath.Join(stateDir, "ingress"))

@@ -1,0 +1,186 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package agent
+
+import (
+	"context"
+	"time"
+
+	"go.uber.org/zap"
+	coordinationv1 "k8s.io/api/coordination/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/defilantech/llmkube/pkg/metalnode"
+)
+
+const (
+	// metalNodeRenewInterval is how often the agent renews its Lease.
+	metalNodeRenewInterval = 15 * time.Second
+	// metalNodeLeaseDurationSeconds is the duration the agent writes; the
+	// controller counts the agent connected for three of them.
+	metalNodeLeaseDurationSeconds = int32(45)
+	// metalNodeWarnInterval rate-limits the reporter's warnings, so a missing
+	// Lease or RBAC does not log every 15 seconds.
+	metalNodeWarnInterval = time.Minute
+)
+
+// metalNodeReporter is the agent's only presence on its MetalNode: it renews
+// the Lease the admin pre-created (llmkube metal token create) and carries
+// the agent's report in an annotation on it. It only ever gets and updates
+// that one Lease, the two verbs the per-Mac Role grants on it; it never
+// creates it and never writes the MetalNode.
+type metalNodeReporter struct {
+	client    client.Client
+	namespace string
+	node      string
+	lease     string
+	report    func(ctx context.Context) metalnode.Report
+	logger    *zap.SugaredLogger
+	now       func() time.Time
+	// timeout bounds one renewal (the address lookup and both API calls);
+	// zero means metalNodeRenewInterval. A hung call must not stall the
+	// heartbeat for good.
+	timeout time.Duration
+
+	lastWarn time.Time
+}
+
+// run renews at once and then every metalNodeRenewInterval until ctx ends.
+func (r *metalNodeReporter) run(ctx context.Context) {
+	ticker := time.NewTicker(metalNodeRenewInterval)
+	defer ticker.Stop()
+	for {
+		r.renew(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// renew performs one heartbeat. Failures are logged (rate-limited) and
+// retried on the next tick; the agent keeps serving either way.
+func (r *metalNodeReporter) renew(ctx context.Context) {
+	timeout := r.timeout
+	if timeout <= 0 {
+		timeout = metalNodeRenewInterval
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	key := types.NamespacedName{Namespace: r.namespace, Name: r.lease}
+	lease := &coordinationv1.Lease{}
+	if err := r.client.Get(ctx, key, lease); err != nil {
+		if apierrors.IsNotFound(err) {
+			r.warn("Lease "+key.String()+" not found; run llmkube metal token create", "metalNode", r.node)
+			return
+		}
+		r.warn("cannot read the MetalNode Lease", "lease", key.String(), "error", err)
+		return
+	}
+
+	report := r.report(ctx)
+	raw, err := metalnode.Encode(report)
+	if err == nil {
+		// The controller rejects a report it cannot decode; catching that
+		// here names the cause in the agent's own log.
+		_, err = metalnode.Decode(raw)
+	}
+	if err != nil {
+		r.warn("not renewing the MetalNode Lease: the report is invalid", "lease", key.String(), "error", err)
+		return
+	}
+
+	holder := r.node
+	duration := metalNodeLeaseDurationSeconds
+	renewed := metav1.NewMicroTime(r.now())
+	lease.Spec.HolderIdentity = &holder
+	lease.Spec.LeaseDurationSeconds = &duration
+	lease.Spec.RenewTime = &renewed
+	if lease.Annotations == nil {
+		lease.Annotations = map[string]string{}
+	}
+	lease.Annotations[metalnode.ReportAnnotation] = raw
+	if err := r.client.Update(ctx, lease); err != nil {
+		if apierrors.IsConflict(err) {
+			r.logger.Debugw("MetalNode Lease changed underneath; renewing on the next tick", "lease", key.String())
+			return
+		}
+		r.warn("cannot renew the MetalNode Lease", "lease", key.String(), "error", err)
+		return
+	}
+	r.lastWarn = time.Time{}
+}
+
+func (r *metalNodeReporter) warn(msg string, kv ...any) {
+	now := r.now()
+	if !r.lastWarn.IsZero() && now.Sub(r.lastWarn) < metalNodeWarnInterval {
+		return
+	}
+	r.lastWarn = now
+	r.logger.Warnw(msg, kv...)
+}
+
+// startMetalNodeReporter starts the Lease reporter when --metal-node is set
+// and reports whether it did. With no MetalNode configured the agent makes
+// no Lease call at all, exactly as before the feature existed.
+func (a *MetalAgent) startMetalNodeReporter(ctx context.Context) bool {
+	if a.config.MetalNode == "" {
+		return false
+	}
+	lease := a.config.MetalNodeLease
+	if lease == "" {
+		lease = a.config.MetalNode
+	}
+	r := &metalNodeReporter{
+		client:    a.config.K8sClient,
+		namespace: a.config.Namespace,
+		node:      a.config.MetalNode,
+		lease:     lease,
+		report:    a.metalNodeReport,
+		logger:    a.logger.With("subsystem", "metal-node"),
+		now:       time.Now,
+	}
+	a.logger.Infow("reporting to MetalNode through its Lease",
+		"metalNode", a.config.MetalNode, "lease", a.config.Namespace+"/"+lease, "interval", metalNodeRenewInterval)
+	go r.run(ctx)
+	return true
+}
+
+// metalNodeReport is what the agent knows about itself right now. The
+// candidate addresses are recomputed every time, so a network change shows
+// up within one renewal.
+func (a *MetalAgent) metalNodeReport(ctx context.Context) metalnode.Report {
+	capacity := a.config.HostCapacity
+	report := metalnode.Report{
+		Version:      a.config.Version,
+		Chip:         capacity.Chip,
+		MemoryBytes:  capacity.MemoryBytes,
+		GPUCores:     capacity.GPUCores,
+		MetalVersion: capacity.MetalVersion,
+	}
+	if p := a.config.IngressPort; a.ingressPin != "" && p > 0 && p <= 65535 {
+		report.IngressSPKI = a.ingressPin
+		report.IngressPort = int32(p)
+	}
+	env := newCandidateGatherer().gather(ctx, a.config.HostIP, a.config.APIServerHost)
+	report.Candidates = buildMetalNodeCandidates(env)
+	return report
+}

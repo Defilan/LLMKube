@@ -262,6 +262,19 @@ type MetalAgentConfig struct {
 	// as "<isvc>", no ingress is started. Only for a controller that
 	// predates relay support; removed in a future release.
 	LegacyDirectEndpoints bool
+
+	// MetalNode is the MetalNode this agent reports for (--metal-node).
+	// Empty disables reporting: no Lease call is made.
+	MetalNode string
+	// MetalNodeLease names the Lease the agent renews (--metal-node-lease);
+	// empty means the MetalNode's own name.
+	MetalNodeLease string
+	// APIServerHost is the kubeconfig's server URL. The route to it decides
+	// the order of the candidate addresses the agent reports.
+	APIServerHost string
+	// HostCapacity is the hardware reported to the MetalNode, collected once
+	// at startup.
+	HostCapacity HostCapacity
 }
 
 // processInspectorFactory builds the inspector NewMetalAgent hands the engine
@@ -272,7 +285,10 @@ var processInspectorFactory = newProcessInspector
 // MetalAgent watches Kubernetes InferenceService resources and manages
 // native inference processes with Metal acceleration
 type MetalAgent struct {
-	config         MetalAgentConfig
+	config MetalAgentConfig
+	// ingressPin is the SPKI pin of the ingress identity, set by
+	// prepareIngress in relay mode and reported to the MetalNode.
+	ingressPin     string
 	watcher        *InferenceServiceWatcher
 	executors      map[string]ProcessExecutor // runtime name -> executor
 	registry       *ServiceRegistry
@@ -703,6 +719,10 @@ func (a *MetalAgent) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+
+	// Heartbeat and report through the MetalNode's Lease (--metal-node), now
+	// that the ingress pin is known. Off by default.
+	a.startMetalNodeReporter(ctx)
 
 	// The ingress is the only way the cluster reaches an engine in relay
 	// mode, so losing it (a bind failure included) is fatal.

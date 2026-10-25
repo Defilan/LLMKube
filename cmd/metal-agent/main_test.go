@@ -431,3 +431,25 @@ func TestResolveMaxDownloadBytes(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateMetalNodeFlags(t *testing.T) {
+	for _, tc := range []struct {
+		node, lease string
+		wantErr     string
+	}{
+		{node: "", lease: ""},
+		{node: "mac-studio", lease: ""},
+		{node: "mac-studio", lease: "mac-studio-heartbeat"},
+		{node: "", lease: "mac-studio", wantErr: "--metal-node-lease requires --metal-node"},
+		{node: "Mac_Studio", lease: "", wantErr: "--metal-node"},
+		{node: "mac-studio", lease: "ns/lease", wantErr: "--metal-node-lease"},
+	} {
+		err := validateMetalNodeFlags(tc.node, tc.lease)
+		switch {
+		case tc.wantErr == "" && err != nil:
+			t.Errorf("validateMetalNodeFlags(%q, %q) = %v, want nil", tc.node, tc.lease, err)
+		case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+			t.Errorf("validateMetalNodeFlags(%q, %q) = %v, want an error mentioning %q", tc.node, tc.lease, err, tc.wantErr)
+		}
+	}
+}
