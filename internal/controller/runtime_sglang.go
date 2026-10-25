@@ -76,7 +76,7 @@ const sglangRelease = "v0.5.22"
 // testdata/sglang-tool-call-parsers-v0.5.22.txt; the values are also absent from
 // v0.4.9, v0.5.5.post1, v0.5.12, v0.5.19 and v0.5.20, checked by hand.
 var sglangUnsupportedToolCallParsers = map[string]string{
-	"qwen3":       "Use qwen25, which SGLang's own Qwen3 deployment guide passes, or qwen3_coder for Qwen3-Coder models",
+	"qwen3":       "Use qwen25 for Qwen3 models, or qwen3_coder for Qwen3-Coder and for Qwen3.5 or newer",
 	"functionary": "Leave it unset, or name the tool-call parser SGLang registers for your model family",
 }
 
@@ -259,7 +259,7 @@ func ValidateSGLangConfig(isvc *inferencev1alpha1.InferenceService) (reason, mes
 	// checks and before the speculative ones.
 	if advice, unsupported := sglangUnsupportedToolCallParsers[cfg.ToolCallParser]; unsupported {
 		return "ToolCallParserUnsupported",
-			fmt.Sprintf("spec.sglangConfig.toolCallParser %s is not a parser SGLang %s registers, so --tool-call-parser exits at startup with an invalid-choice error. %s",
+			fmt.Sprintf("spec.sglangConfig.toolCallParser %s is not a parser SGLang %s registers, so SGLang exits at startup with an invalid-choice error. %s",
 				cfg.ToolCallParser, sglangRelease, advice)
 	}
 	if cfg.Speculative != nil && cfg.Speculative.Enabled != nil && *cfg.Speculative.Enabled {

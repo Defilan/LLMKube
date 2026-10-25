@@ -181,7 +181,7 @@ func TestSGLangToolCallParserMessage(t *testing.T) {
 		parser string
 		wants  []string
 	}{
-		{parser: "qwen3", wants: []string{"qwen3", "qwen25", "qwen3_coder"}},
+		{parser: "qwen3", wants: []string{"qwen3", "qwen25", "qwen3_coder", "Qwen3.5"}},
 		{parser: "functionary", wants: []string{"functionary", "Leave it unset"}},
 	}
 	for _, tc := range cases {
