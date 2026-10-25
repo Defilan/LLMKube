@@ -764,7 +764,7 @@ A vLLM or SGLang service needs its runtime image inside the perimeter,
 plus the curl init image from Step 1 when the source is `s3://` (a
 `pvc://` directory source runs no init container). The defaults the
 operator falls back to are compiled into each release (for example
-`vllm/vllm-openai:v0.25.1`, `lmsysorg/sglang:v0.5.22-cu130`, and
+`vllm/vllm-openai:v0.32.0`, `lmsysorg/sglang:v0.5.22-cu130`, and
 `lmsysorg/sglang:v0.5.22-rocm720-mi30x` for AMD GPU Models), so set
 them explicitly rather than relying on whatever your controller
 version picks.
@@ -773,13 +773,13 @@ Pull the platform your GPU nodes run, which is not necessarily the
 platform of the machine doing the pulling:
 
 ```bash
-docker pull --platform linux/amd64 vllm/vllm-openai:v0.25.1
-docker save vllm/vllm-openai:v0.25.1 > vllm-openai-v0.25.1.tar
+docker pull --platform linux/amd64 vllm/vllm-openai:v0.32.0
+docker save vllm/vllm-openai:v0.32.0 > vllm-openai-v0.32.0.tar
 # transfer, then on the air-gapped side:
-docker load < vllm-openai-v0.25.1.tar
-docker tag vllm/vllm-openai:v0.25.1 registry.internal.corp/vllm/vllm-openai:v0.25.1
-docker push registry.internal.corp/vllm/vllm-openai:v0.25.1
-crane digest registry.internal.corp/vllm/vllm-openai:v0.25.1
+docker load < vllm-openai-v0.32.0.tar
+docker tag vllm/vllm-openai:v0.32.0 registry.internal.corp/vllm/vllm-openai:v0.32.0
+docker push registry.internal.corp/vllm/vllm-openai:v0.32.0
+crane digest registry.internal.corp/vllm/vllm-openai:v0.32.0
 ```
 
 Pin the digest your registry reports. A `docker save`/`load` round

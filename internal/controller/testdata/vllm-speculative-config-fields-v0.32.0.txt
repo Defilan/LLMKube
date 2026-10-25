@@ -6,18 +6,20 @@
 # asserts against vLLM's parser rather than against our reading of it (#1031).
 #
 # spec-fields.txt
-#   Source: vllm-project/vllm @ tag v0.25.1 (the tag VLLMBackend.DefaultImage
-#   pins, vllm/vllm-openai:v0.25.1), file vllm/config/speculative.py,
-#   `class SpeculativeConfig` through the last field (line ~230).
+#   Source: vllm-project/vllm @ tag v0.32.0 (the tag VLLMBackend.DefaultImage
+#   pins, vllm/vllm-openai:v0.32.0), file vllm/config/speculative.py,
+#   `class SpeculativeConfig` through its last field.
 #   Extracted with:
 #     gh api -H 'Accept: application/vnd.github.raw' \
-#       'repos/vllm-project/vllm/contents/vllm/config/speculative.py?ref=v0.25.1' \
-#       | awk '/^class SpeculativeConfig:/{f=1} f && /^    [a-z_]+:/ {split($1,a,":"); print a[1]} f && /^RejectionSampleMethod/ {exit}'
+#       'repos/vllm-project/vllm/contents/vllm/config/speculative.py?ref=v0.32.0' \
+#       | awk '/^class SpeculativeConfig:/{f=1;next} f && /^[^ #]/ {exit} f && /^    [a-z_]+:/ {split($1,a,":"); print a[1]}'
 #
-#   The class is a pydantic dataclass built by vllm/config/utils.py:69
+#   The awk stops at the first top-level line after the class. The earlier
+#   stop marker, RejectionSampleMethod, moved above the class in v0.32.0.
+#
+#   The class is a pydantic dataclass built by vllm/config/utils.py:71
 #   (ConfigDict(extra="forbid")), so a key outside this list is a startup
-#   error, not a warning. That is why only keys present here are typed:
-#   enable_adaptive_verification exists in v0.32.0 only.
+#   error, not a warning. That is why only keys present here are typed.
 enforce_eager
 num_speculative_tokens
 model
@@ -27,10 +29,13 @@ tensor_parallel_size
 quantization
 moe_backend
 attention_backend
+kv_cache_dtype
 max_model_len
 revision
 code_revision
+index_share_for_mtp_iteration
 disable_padded_drafter_batch
+disable_eagle_block_drop
 use_local_argmax_reduction
 use_heterogeneous_vocab
 prompt_lookup_max
@@ -49,4 +54,6 @@ draft_load_config
 rejection_sample_method
 synthetic_acceptance_rates
 synthetic_acceptance_length
+enable_adaptive_verification
 draft_sample_method
+dspark_draft_topk

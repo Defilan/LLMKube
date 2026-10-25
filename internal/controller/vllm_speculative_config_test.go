@@ -467,9 +467,9 @@ func TestMethodDocClaimsMatchThePinnedRelease(t *testing.T) {
 // against the field list the pinned image's own parser accepts, not against a
 // list this test wrote: vLLM builds SpeculativeConfig from the JSON with
 // extra="forbid", so an unknown key is a container that exits on startup.
-// See testdata/vllm-speculative-config-fields-v0.25.1.txt for provenance.
+// See testdata/vllm-speculative-config-fields-v0.32.0.txt for provenance.
 func TestRenderedSpeculativeConfigUsesPinnedVLLMKeys(t *testing.T) {
-	f, err := os.Open("testdata/vllm-speculative-config-fields-v0.25.1.txt")
+	f, err := os.Open("testdata/vllm-speculative-config-fields-v0.32.0.txt")
 	if err != nil {
 		t.Fatalf("open oracle: %v", err)
 	}
@@ -519,7 +519,7 @@ func TestRenderedSpeculativeConfigUsesPinnedVLLMKeys(t *testing.T) {
 		}
 		for key := range doc {
 			if !accepted[key] {
-				t.Errorf("shape %d renders key %q, which the pinned vLLM (v0.25.1) SpeculativeConfig does not accept; "+
+				t.Errorf("shape %d renders key %q, which the pinned vLLM (v0.32.0) SpeculativeConfig does not accept; "+
 					"its parser forbids unknown keys, so the container would exit at startup", i, key)
 			}
 		}
