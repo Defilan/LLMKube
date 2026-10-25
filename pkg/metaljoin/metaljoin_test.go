@@ -339,3 +339,40 @@ func TestEncodeAlwaysWritesCurrentVersion(t *testing.T) {
 		t.Errorf("decoded version = %d, want %d", got.V, Version)
 	}
 }
+
+// TestDecodeIgnoresLineBreaksInsideThePastedString: chat and mail clients
+// wrap long lines. base64url never contains whitespace, so any of it inside
+// the string is dropped before decoding.
+func TestDecodeIgnoresLineBreaksInsideThePastedString(t *testing.T) {
+	p := validPayload(t)
+	s, err := Encode(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wrapped strings.Builder
+	for i, r := range s {
+		if i > 0 && i%60 == 0 {
+			wrapped.WriteString([]string{"\n", "\r\n", " ", "\t"}[i/60%4])
+		}
+		wrapped.WriteRune(r)
+	}
+	got, err := Decode(wrapped.String())
+	if err != nil {
+		t.Fatalf("Decode of a wrapped string: %v", err)
+	}
+	if !reflect.DeepEqual(got, p) {
+		t.Errorf("wrapped string decoded to %v, want %v", got, p)
+	}
+}
+
+// TestDecodeBoundsInputBeforeStrippingWhitespace: whitespace does not count
+// toward the length limit, but it cannot make the input unbounded either.
+func TestDecodeBoundsInputBeforeStrippingWhitespace(t *testing.T) {
+	s, err := Encode(validPayload(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decode(s + strings.Repeat(" ", 4*MaxEncodedLen)); !errors.Is(err, ErrMalformed) {
+		t.Errorf("Decode of a string padded past the bound: err = %v, want ErrMalformed", err)
+	}
+}

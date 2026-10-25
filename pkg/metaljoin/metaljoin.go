@@ -215,11 +215,21 @@ func Encode(p Payload) (string, error) {
 }
 
 // Decode parses and validates a join string, including the CA against its
-// pin. Surrounding whitespace is ignored. An unknown version is refused
-// before any other field is looked at, so a newer format fails with
-// ErrUnsupportedVersion rather than a confusing field error.
+// pin. ASCII whitespace anywhere is ignored, so a string a chat or mail
+// client wrapped over several lines still decodes (base64url has none). An
+// unknown version is refused before any other field is looked at, so a newer
+// format fails with ErrUnsupportedVersion rather than a confusing field error.
 func Decode(s string) (Payload, error) {
-	s = strings.TrimSpace(s)
+	if len(s) > 4*MaxEncodedLen {
+		return Payload{}, fmt.Errorf("%w: longer than %d bytes", ErrMalformed, MaxEncodedLen)
+	}
+	s = strings.Map(func(r rune) rune {
+		switch r {
+		case ' ', '\t', '\n', '\r', '\v', '\f':
+			return -1
+		}
+		return r
+	}, s)
 	if len(s) > MaxEncodedLen {
 		return Payload{}, fmt.Errorf("%w: longer than %d bytes", ErrMalformed, MaxEncodedLen)
 	}
