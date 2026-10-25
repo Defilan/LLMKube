@@ -150,10 +150,11 @@ func parseCertificates(pemBytes []byte) ([]*x509.Certificate, error) {
 
 // resolveJoinTLS reads the API server's certificate and returns the CA and
 // the TLS server name the Mac must use. It checks Server, the address the
-// Mac will dial; when that is not reachable from here (a --server only the
-// Mac can reach) it reads the certificate from the kubeconfig's server
-// instead, the same API server. explicit is --tls-server-name.
-func resolveJoinTLS(ctx context.Context, t *metalTarget, explicit string,
+// Mac will dial. When that is not reachable from here (a --server only the
+// Mac can reach), it refuses unless assumeSameServer, in which case it reads
+// the certificate from the kubeconfig's server instead, unverified to be the
+// same API server. explicit is --tls-server-name.
+func resolveJoinTLS(ctx context.Context, t *metalTarget, explicit string, assumeSameServer bool,
 	log io.Writer) (*x509.Certificate, string, error) {
 	if explicit == "" {
 		explicit = t.TLSServerName
@@ -168,8 +169,13 @@ func resolveJoinTLS(ctx context.Context, t *metalTarget, explicit string,
 		if !errors.As(err, &dialErr) {
 			return nil, "", err
 		}
-		_, _ = fmt.Fprintf(log, "cannot reach %s from here (%v); checking the certificate %s presents instead\n",
-			t.Server, err, t.KubeServer)
+		if !assumeSameServer {
+			return nil, "", fmt.Errorf("%w; token create checks the certificate --server presents before it "+
+				"creates anything. Run it where %s is reachable, or pass --assume-same-server to check the "+
+				"certificate %s presents instead", err, t.Server, t.KubeServer)
+		}
+		_, _ = fmt.Fprintf(log, "cannot reach %s from here (%v); checking the certificate %s presents instead "+
+			"(--assume-same-server: not verified that %s serves it)\n", t.Server, err, t.KubeServer, t.Server)
 		chain, err = fetchServerChain(ctx, t.KubeServer, explicit, t.CAs)
 	}
 	if err != nil {
@@ -189,9 +195,9 @@ func resolveJoinTLS(ctx context.Context, t *metalTarget, explicit string,
 
 // fetchServerChain completes a TLS handshake with server, trusting only the
 // kubeconfig CAs, and returns the certificates it presented. A handshake
-// that fails only because the certificate does not cover the name still
-// returns the chain (chooseJoinTLS then picks a name the certificate does
-// cover); any other verification failure is an error. No request is sent,
+// that fails on the name alone still returns the chain once the chain
+// itself verifies against those CAs (chooseJoinTLS then picks a name the
+// certificate does cover); any other failure is an error. No request is sent,
 // so no credential crosses this connection.
 func fetchServerChain(ctx context.Context, server, sni string, cas []*x509.Certificate) ([]*x509.Certificate, error) {
 	u, err := url.Parse(server)
@@ -217,7 +223,18 @@ func fetchServerChain(ctx context.Context, server, sni string, cas []*x509.Certi
 		var verr *tls.CertificateVerificationError
 		var herr x509.HostnameError
 		if errors.As(err, &verr) && errors.As(verr.Err, &herr) && len(verr.UnverifiedCertificates) > 0 {
-			return verr.UnverifiedCertificates, nil
+			// x509 checks the name before it builds the chain, so a name
+			// mismatch says nothing about the chain: verify it here.
+			chain := verr.UnverifiedCertificates
+			intermediates := x509.NewCertPool()
+			for _, c := range chain[1:] {
+				intermediates.AddCert(c)
+			}
+			if _, cerr := chain[0].Verify(x509.VerifyOptions{Roots: roots, Intermediates: intermediates}); cerr != nil {
+				return nil, fmt.Errorf("TLS handshake with %s against the kubeconfig's certificate authority: %w",
+					server, cerr)
+			}
+			return chain, nil
 		}
 		return nil, fmt.Errorf("TLS handshake with %s against the kubeconfig's certificate authority: %w", server, err)
 	}

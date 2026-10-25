@@ -294,7 +294,7 @@ func TestResolveJoinTLSAgainstALiveServer(t *testing.T) {
 		srv, requests := tlsAPIServer(t, ca.issue(t, []string{"kubernetes"}, nil))
 		target := &metalTarget{Server: srv.URL, KubeServer: srv.URL, CAs: []*x509.Certificate{ca.cert}}
 		var log bytes.Buffer
-		gotCA, name, err := resolveJoinTLS(context.Background(), target, "", &log)
+		gotCA, name, err := resolveJoinTLS(context.Background(), target, "", false, &log)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -318,10 +318,19 @@ func TestResolveJoinTLSAgainstALiveServer(t *testing.T) {
 		dead := "https://" + ln.Addr().String()
 		_ = ln.Close()
 		target := &metalTarget{Server: dead, KubeServer: srv.URL, CAs: []*x509.Certificate{ca.cert}}
+		// Without --assume-same-server, nothing proves --server is this API
+		// server, so the command refuses.
+		if _, _, err := resolveJoinTLS(context.Background(), target, "", false, &bytes.Buffer{}); err == nil ||
+			!strings.Contains(err.Error(), "--assume-same-server") {
+			t.Fatalf("unreachable --server without --assume-same-server: err = %v, want a refusal naming the flag", err)
+		}
 		var log bytes.Buffer
-		_, name, err := resolveJoinTLS(context.Background(), target, "", &log)
+		_, name, err := resolveJoinTLS(context.Background(), target, "", true, &log)
 		if err != nil {
 			t.Fatal(err)
+		}
+		if !strings.Contains(log.String(), "not verified") {
+			t.Errorf("stderr does not say --server was not verified: %q", log.String())
 		}
 		// The join server's host (127.0.0.1) is in the certificate.
 		if name != "" {
@@ -340,8 +349,25 @@ func TestResolveJoinTLSAgainstALiveServer(t *testing.T) {
 		dead := "https://" + ln.Addr().String()
 		_ = ln.Close()
 		target := &metalTarget{Server: dead, KubeServer: dead, CAs: []*x509.Certificate{ca.cert}}
-		if _, _, err := resolveJoinTLS(context.Background(), target, "", &bytes.Buffer{}); err == nil {
+		if _, _, err := resolveJoinTLS(context.Background(), target, "", true, &bytes.Buffer{}); err == nil {
 			t.Fatal("resolveJoinTLS succeeded against a closed port")
 		}
 	})
+}
+
+// TestFetchServerChainRejectsAForeignCA: a certificate from another CA is an
+// error whether or not it also misses the host name. (x509 checks the name
+// before the chain, so a name mismatch alone says nothing about the chain.)
+func TestFetchServerChainRejectsAForeignCA(t *testing.T) {
+	good := newTestCA(t, "cluster-ca")
+	evil := newTestCA(t, "evil-ca")
+	for name, sans := range map[string][]net.IP{"name mismatch": nil, "name matches": {net.ParseIP("127.0.0.1")}} {
+		t.Run(name, func(t *testing.T) {
+			srv, _ := tlsAPIServer(t, evil.issue(t, []string{"kubernetes"}, sans))
+			chain, err := fetchServerChain(context.Background(), srv.URL, "", []*x509.Certificate{good.cert})
+			if err == nil {
+				t.Fatalf("fetchServerChain accepted a certificate from a foreign CA (chain of %d)", len(chain))
+			}
+		})
+	}
 }

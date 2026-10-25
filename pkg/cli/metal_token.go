@@ -61,6 +61,9 @@ type metalTokenOptions struct {
 	server        string
 	tlsServerName string
 	output        string
+	// assumeSameServer lets an unreachable --server be checked against the
+	// certificate the kubeconfig's server presents.
+	assumeSameServer bool
 }
 
 // metalTokenOutput is what token create prints; the JSON keys are for
@@ -108,6 +111,9 @@ one. The Mac never sees your credentials.`,
 		"Name the Mac verifies the API server's certificate against (default: set automatically when the "+
 			"server's address is not in the certificate)")
 	cmd.Flags().StringVarP(&opts.output, "output", "o", "text", "Output format: text or json")
+	cmd.Flags().BoolVar(&opts.assumeSameServer, "assume-same-server", false,
+		"When --server cannot be reached from here, check the certificate the kubeconfig's server presents "+
+			"instead, assuming --server is the same API server (the Mac still verifies it when it joins)")
 	return cmd
 }
 
@@ -130,8 +136,8 @@ func validateMetalTokenOptions(mac string, opts *metalTokenOptions) error {
 		return fmt.Errorf("--output %q: must be text or json", opts.output)
 	}
 	if opts.server != "" {
-		if err := checkHTTPSServer(opts.server, "--server"); err != nil {
-			return err
+		if err := metaljoin.ValidateServer(opts.server); err != nil {
+			return fmt.Errorf("--server: %w", err)
 		}
 	}
 	return nil
@@ -153,7 +159,7 @@ func runMetalTokenCreate(cmd *cobra.Command, mac string, opts *metalTokenOptions
 	}
 	// Settle what the Mac will trust before creating anything, so a join
 	// string that could not work leaves nothing behind.
-	ca, tlsServerName, err := resolveJoinTLS(ctx, target, opts.tlsServerName, log)
+	ca, tlsServerName, err := resolveJoinTLS(ctx, target, opts.tlsServerName, opts.assumeSameServer, log)
 	if err != nil {
 		return err
 	}

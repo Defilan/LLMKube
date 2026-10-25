@@ -179,6 +179,10 @@ func TestMetalCommandsValidateBeforeAnyAPICall(t *testing.T) {
 		{"token create long ttl", []string{"token", "create", "mac-a", "--ttl", "25h"}, "24h"},
 		{"token create bad output", []string{"token", "create", "mac-a", "-o", "yaml"}, "yaml"},
 		{"token create http server", []string{"token", "create", "mac-a", "--server", "http://10.0.0.1:6443"}, "https"},
+		{"server with credentials", []string{"token", "create", "mac-a", "--server", "https://u:p@10.0.0.1:6443"},
+			"credentials"},
+		{"server with query", []string{"token", "create", "mac-a", "--server", "https://10.0.0.1:6443/?x=1"}, "query"},
+		{"server with fragment", []string{"token", "create", "mac-a", "--server", "https://10.0.0.1:6443#f"}, "fragment"},
 		{"remove bad mac", []string{"remove", "-mac"}, "-mac"},
 		{"token create no mac", []string{"token", "create"}, "arg"},
 	} {

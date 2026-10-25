@@ -143,7 +143,7 @@ func (p Payload) Validate() error {
 		return fmt.Errorf("%w %d: this llmkube reads version %d; use a matching llmkube",
 			ErrUnsupportedVersion, p.V, Version)
 	}
-	if err := validateServer(p.Server); err != nil {
+	if err := ValidateServer(p.Server); err != nil {
 		return err
 	}
 	if len(p.CA) == 0 {
@@ -177,7 +177,10 @@ func (p Payload) Validate() error {
 	return nil
 }
 
-func validateServer(server string) error {
+// ValidateServer checks a server URL the way a join string's is checked:
+// https, a host, no credentials, query or fragment. A path prefix is
+// allowed. token create calls it on --server before writing anything.
+func ValidateServer(server string) error {
 	if server == "" {
 		return fmt.Errorf("%w: no server", ErrMalformed)
 	}
