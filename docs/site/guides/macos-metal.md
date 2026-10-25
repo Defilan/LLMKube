@@ -562,9 +562,11 @@ MetalNode's namespace, owned by the MetalNode, placed by
 
 - It uses the operator's `--init-container-image` (curl), runs as a
   non-root user with a read-only root filesystem, no capabilities and
-  no service account token, and is killed after 60 seconds.
+  no service account token, is killed after 60 seconds, and stops at
+  once when deleted (no termination grace period).
 - For each candidate it runs `curl --pinnedpubkey sha256//<pin>`
-  against `https://<address>:<ingressPort>/health`. The ingress
+  against `https://<address>:<ingressPort>/health`, ignoring any
+  `.curlrc` and any proxy settings, so it tests the direct path. The ingress
   answers 401 without a relay token, which is enough: the handshake
   only completes against the pinned key, so the result proves both
   the path and the Mac's identity, and the controller needs no token.
@@ -573,19 +575,36 @@ MetalNode's namespace, owned by the MetalNode, placed by
   address in order becomes `status.hostIP`, which is set only while
   `Reachable` is True.
 
-The check reruns when the pin, port, candidates or placement change,
-every 10 minutes, and after a failure with a backoff of 30 seconds
-growing to 5 minutes. Put the verifier where the relay pods for this
-Mac run, so it tests the path the relay will use.
+The check reruns when the pin, the port, the addresses it dials or
+the placement change, every 10 minutes, and after a failure with a
+backoff of 30 seconds growing to 5 minutes. Two rules hold whatever
+the Mac reports: at most one verifier pod exists per MetalNode at a
+time (a pod being deleted still counts), and two verifier starts are
+at least 30 seconds apart. Rewording a candidate's source or changing
+an address that is never dialed is not a change. Only the verifier
+pod the controller created (recorded by UID in
+`status.verification.podUID`) can report a result. Put the verifier
+where the relay pods for this Mac run, so it tests the path the relay
+will use.
+
+While `AgentConnected` is not True, nothing is dialed: `Reachable`
+is `Unknown` (reason `AgentNotConnected`), `status.hostIP` is
+cleared, and any verifier pod is deleted. `status.lastHeartbeatTime`
+is accurate to about a minute: it advances when `AgentConnected`
+changes or when it is more than 60 seconds behind the Lease, which
+holds the exact time. A Lease update that only advances `renewTime`
+on schedule does not wake the controller; its 60 s resync does.
 
 ### Security notes
 
 - **The agent cannot mark itself reachable.** It has no write access
   to the MetalNode; only the controller sets `Reachable` and
   `hostIP`. Everything in the Lease report is treated as a claim:
-  bounded, validated (a malformed report or pin is
-  `AgentConnected=False`, reason `ReportInvalid`), and verified where
-  it can be.
+  bounded, validated (a malformed report or pin, an ingress port below
+  1024, or text with non-printable characters such as bidi overrides
+  is `AgentConnected=False`, reason `ReportInvalid`), and verified
+  where it can be. A `renewTime` more than 30 seconds in the future
+  counts as stale.
 - **The dial-back is no looser than the relay.** It completes TLS
   only against the SPKI pin the agent reported, checked with the
   same rule the relay uses, copies no response body or curl error
@@ -598,22 +617,34 @@ Mac run, so it tests the path the relay will use.
   `NotAllowed`. Loopback, link-local (where cloud metadata services
   live) and multicast addresses are never dialed, whatever the list
   says. A Mac still chooses which allowed addresses and which port
-  get a single TLS probe; narrow the list to your Mac networks if
-  that matters in your cluster.
+  (1024 or above) get a single TLS probe, at most once every 30
+  seconds. Narrow the list to your Mac networks, and keep your pod
+  and Service CIDRs out of it, if that matters in your cluster.
+- **The dial-back results are visible to the Mac.** The Mac can read
+  its own MetalNode, including the per-candidate results. They stay
+  coarse on purpose (`Reachable`, `Timeout`, `Refused`, `PinMismatch`,
+  `NotAllowed`, `Error`), with no response bodies, curl errors or
+  timings.
+- **No Kubernetes version floor.** The MetalNode CRD uses no CEL
+  rule that needs a newer Kubernetes than the rest of LLMKube;
+  `spec.hostIP` is checked by the controller (`Reachable=False`,
+  reason `InvalidSpec`, when it is not an IP address).
 
 ### Conditions
 
 | Condition | Reason | Meaning |
 |---|---|---|
 | `AgentConnected` | `HeartbeatFresh` | The Lease was renewed within three lease durations. |
-| `AgentConnected` | `HeartbeatStale` | The agent stopped renewing (or never started). |
+| `AgentConnected` | `HeartbeatStale` | The agent stopped renewing (or never started), or `renewTime` is more than 30 s in the future. |
 | `AgentConnected` | `LeaseNotFound` | The Lease in `spec.leaseName` does not exist. |
-| `AgentConnected` | `ReportInvalid` | The report annotation is missing, malformed, or carries an invalid pin. |
+| `AgentConnected` | `ReportInvalid` | The report annotation is missing, malformed, or carries an invalid pin, a port below 1024, or non-printable text. |
 | `Reachable` | `DialBackSucceeded` | A verifier reached `status.hostIP` with the pinned key. |
 | `Reachable` | `NoneReachable` | No candidate answered with the pinned key; see `status.candidates`. |
 | `Reachable` | `NoCandidates` | No reported address is inside the allowed CIDRs. |
 | `Reachable` | `PinMissing` | The agent reports no ingress pin (legacy mode). |
-| `Reachable` | `VerifierFailed` | The verifier pod failed or never finished (check `spec.verifier` placement and the image pull). |
+| `Reachable` | `VerifierFailed` | The verifier pod could not be created, failed, or never finished (check the controller log, `spec.verifier` placement and the image pull). |
+| `Reachable` | `AgentNotConnected` | `Unknown`: the agent is not connected, so nothing is dialed and `hostIP` is empty. |
+| `Reachable` | `InvalidSpec` | `spec.hostIP` is not an IP address; nothing is dialed until it is fixed. |
 
 ## Optional: Apple Silicon power metrics
 

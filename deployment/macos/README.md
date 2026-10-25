@@ -461,7 +461,9 @@ addresses it believes the cluster can reach it at. It never creates the
 Lease: if the Lease is missing it logs
 `Lease <namespace>/<name> not found; run llmkube metal token create` at most
 once a minute and keeps serving. Without the flag the agent makes no Lease
-call at all.
+call at all. With `--metal-node`, `--ingress-port` must be 1024 or above: the
+cluster refuses to dial a privileged port, and the agent logs why instead of
+renewing with a report the controller would reject.
 
 The shared Role in `metal-agent-rbac.yaml` does not grant Leases, and must
 not: RBAC cannot scope a shared rule to "the caller's own Lease", so it would
