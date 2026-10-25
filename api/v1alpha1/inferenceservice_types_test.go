@@ -802,7 +802,7 @@ func TestCacheTypeEnum(t *testing.T) {
 // TestVLLMKVCacheDtypeEnum verifies the documented vLLM KV cache dtype
 // values are accepted by the type.
 func TestVLLMKVCacheDtypeEnum(t *testing.T) {
-	dtypes := []string{"auto", "fp8_e5m2", "fp8_e4m3"}
+	dtypes := []string{"auto", "fp8_e5m2", "fp8_e4m3", "fp8", "float16", "bfloat16"}
 	for _, dt := range dtypes {
 		t.Run(dt, func(t *testing.T) {
 			cfg := VLLMConfig{KVCacheDtype: ptrString(dt)}

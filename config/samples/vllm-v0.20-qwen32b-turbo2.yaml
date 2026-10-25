@@ -4,9 +4,10 @@
 # LLMKube does not validate the kvCacheCustomDtype string.
 #
 # Why this manifest exists: turbo2 is not in the standard kvCacheDtype enum
-# (auto/fp8_e5m2/fp8_e4m3). The kvCacheCustomDtype escape hatch passes the
-# value straight through to vLLM's --kv-cache-dtype flag without LLMKube CRD
-# validation. Mirrors the llama.cpp-side cacheTypeCustomK/V pattern.
+# (auto/fp8_e5m2/fp8_e4m3/fp8/float16/bfloat16). The kvCacheCustomDtype escape
+# hatch passes the value straight through to vLLM's --kv-cache-dtype flag
+# without LLMKube CRD validation. Mirrors the llama.cpp-side
+# cacheTypeCustomK/V pattern.
 #
 # Apply:
 #   kubectl apply -f config/samples/vllm-v0.20-qwen32b-turbo2.yaml

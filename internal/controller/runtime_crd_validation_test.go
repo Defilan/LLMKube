@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -164,5 +165,134 @@ var _ = Describe("InferenceService spec.sglangConfig.stallDetection CRD validati
 		isvc := newSGLangStallISvc("sglang-stall-no-window", &inferencev1alpha1.SGLangStallDetection{})
 		Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
 		_ = k8sClient.Delete(ctx, isvc)
+	})
+})
+
+// These specs run spec.vllmConfig.kvCacheDtype and spec.sglangConfig.kvCacheDtype
+// through the envtest apiserver, so they pin the generated CRD schema rather
+// than the Go type. The Go type carries no enum: widening or narrowing the
+// +kubebuilder:validation:Enum marker is invisible to every unit test, and only
+// the schema decides what admission accepts (#2191).
+//
+// The rejections here are deliberate. vLLM accepts more cache types than the
+// enum (fp8_ds_mla, fp8_inc, nvfp4, the turboquant_* family) but those are
+// version- and hardware-specific and belong on kvCacheCustomDtype. SGLang's
+// --kv-cache-dtype rejects fp8 and float16 outright, so its enum must not grow
+// with vLLM's.
+var _ = Describe("InferenceService vllmConfig.kvCacheDtype CRD validation", func() {
+	ctx := context.Background()
+
+	// kubeName turns a dtype into an RFC 1123 label: fp8_e4m3 carries
+	// underscores, which object names reject.
+	kubeName := func(dtype string) string {
+		return strings.ReplaceAll(dtype, "_", "-")
+	}
+
+	newDtypeISvc := func(name, dtype string) *inferencev1alpha1.InferenceService {
+		return &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: "kv-dtype-crd-model",
+				Runtime:  "vllm",
+				VLLMConfig: &inferencev1alpha1.VLLMConfig{
+					KVCacheDtype: &dtype,
+				},
+			},
+		}
+	}
+
+	for _, dt := range []string{"fp8", "float16", "bfloat16"} {
+		It("admits kvCacheDtype="+dt, func() {
+			isvc := newDtypeISvc("kv-dtype-"+dt, dt)
+			Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+
+			stored := &inferencev1alpha1.InferenceService{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvc.Name, Namespace: "default"}, stored)).To(Succeed())
+			Expect(stored.Spec.VLLMConfig.KVCacheDtype).NotTo(BeNil())
+			Expect(*stored.Spec.VLLMConfig.KVCacheDtype).To(Equal(dt))
+			Expect(k8sClient.Delete(ctx, isvc)).To(Succeed())
+		})
+	}
+
+	for _, dt := range []string{"auto", "fp8_e5m2", "fp8_e4m3"} {
+		It("still admits kvCacheDtype="+dt, func() {
+			isvc := newDtypeISvc("kv-dtype-keep-"+kubeName(dt), dt)
+			Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, isvc)).To(Succeed())
+		})
+	}
+
+	It("stores the auto default when kvCacheDtype is unset", func() {
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "kv-dtype-unset", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef:   "kv-dtype-crd-model",
+				Runtime:    "vllm",
+				VLLMConfig: &inferencev1alpha1.VLLMConfig{},
+			},
+		}
+		Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+
+		stored := &inferencev1alpha1.InferenceService{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvc.Name, Namespace: "default"}, stored)).To(Succeed())
+		Expect(stored.Spec.VLLMConfig.KVCacheDtype).NotTo(BeNil())
+		Expect(*stored.Spec.VLLMConfig.KVCacheDtype).To(Equal("auto"))
+		Expect(k8sClient.Delete(ctx, isvc)).To(Succeed())
+	})
+
+	for _, dt := range []string{"fp8_ds_mla", "fp8_inc", "nvfp4", "turboquant_3bit_nc", "not-a-dtype"} {
+		It("still rejects kvCacheDtype="+dt, func() {
+			err := k8sClient.Create(ctx, newDtypeISvc("kv-dtype-bad-"+kubeName(dt), dt))
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("kvCacheDtype"))
+		})
+	}
+
+	// kvCacheCustomDtype stays a free string so a value the enum now carries
+	// still works there, and an upstream value outside the enum still does.
+	for _, custom := range []string{"fp8", "turboquant_3bit_nc"} {
+		It("admits kvCacheCustomDtype="+custom+" unvalidated", func() {
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: "kv-custom-" + kubeName(custom), Namespace: "default"},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef: "kv-dtype-crd-model",
+					Runtime:  "vllm",
+					VLLMConfig: &inferencev1alpha1.VLLMConfig{
+						KVCacheCustomDtype: custom,
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+
+			stored := &inferencev1alpha1.InferenceService{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvc.Name, Namespace: "default"}, stored)).To(Succeed())
+			Expect(stored.Spec.VLLMConfig.KVCacheCustomDtype).To(Equal(custom))
+			Expect(k8sClient.Delete(ctx, isvc)).To(Succeed())
+		})
+	}
+
+	newSGLangDtypeISvc := func(name, dtype string) *inferencev1alpha1.InferenceService {
+		return &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef:     "kv-dtype-crd-model",
+				Runtime:      "sglang",
+				SGLangConfig: &inferencev1alpha1.SGLangConfig{KVCacheDtype: &dtype},
+			},
+		}
+	}
+
+	for _, dt := range []string{"fp8", "float16"} {
+		It("still rejects sglangConfig.kvCacheDtype="+dt, func() {
+			err := k8sClient.Create(ctx, newSGLangDtypeISvc("sglang-kv-dtype-bad-"+kubeName(dt), dt))
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("kvCacheDtype"))
+		})
+	}
+
+	It("still admits sglangConfig.kvCacheDtype=fp8_e4m3", func() {
+		isvc := newSGLangDtypeISvc("sglang-kv-dtype-e4m3", "fp8_e4m3")
+		Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, isvc)).To(Succeed())
 	})
 })
