@@ -520,16 +520,24 @@ API server, then its other private addresses. The list is
 recomputed at every renewal, so a network change reaches the cluster
 within 15 seconds and triggers a new dial-back.
 
-### Creating the objects
+### The objects for each Mac
 
-`llmkube metal token create` will create all of this for you. Until
-then, apply it yourself in the namespace the agent watches:
+`llmkube metal token create <mac>` creates the MetalNode, its Lease,
+the Mac's ServiceAccount (`llmkube-metal-<mac>`), the per-Mac Role and
+RoleBinding (`llmkube-metal-<mac>`), the binding to the shared agent
+Role (`llmkube-metal-<mac>-shared`) and a single-use join Secret
+(`llmkube-metal-<mac>-join`). Every one carries the label
+`inference.llmkube.dev/metal-node: <mac>`, and the command refuses to
+take over an existing object of the same name without it. The
+MetalNode and Lease it creates for `mac-studio` are equivalent to:
 
 ```yaml
 apiVersion: inference.llmkube.dev/v1alpha1
 kind: MetalNode
 metadata:
   name: mac-studio
+  labels:
+    inference.llmkube.dev/metal-node: mac-studio
 spec:
   serviceAccountName: llmkube-metal-mac-studio
   leaseName: mac-studio
@@ -547,10 +555,9 @@ spec:
   leaseDurationSeconds: 45
 ```
 
-The agent's ServiceAccount needs the shared agent Role (see
-[`deployment/macos/README.md`](https://github.com/defilantech/LLMKube/blob/main/deployment/macos/README.md))
-plus a small per-Mac Role that grants `get` and `update` on its own
-Lease only, by `resourceNames`. The README shows that Role.
+The per-Mac Role grants `get` and `update` on the Mac's own Lease
+only, by `resourceNames`; the full set of objects is in
+[`deployment/macos/README.md`](https://github.com/defilantech/LLMKube/blob/main/deployment/macos/README.md).
 
 ### The dial-back
 

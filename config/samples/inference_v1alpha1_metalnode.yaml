@@ -8,6 +8,8 @@ kind: MetalNode
 metadata:
   name: mac-studio
   namespace: default
+  labels:
+    inference.llmkube.dev/metal-node: mac-studio
 spec:
   serviceAccountName: llmkube-metal-mac-studio
   leaseName: mac-studio

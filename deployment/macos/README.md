@@ -469,15 +469,21 @@ The shared Role in `metal-agent-rbac.yaml` does not grant Leases, and must
 not: RBAC cannot scope a shared rule to "the caller's own Lease", so it would
 let every Mac renew every other Mac's heartbeat. Each Mac instead gets its own
 ServiceAccount, bound to the shared Role, plus a small per-Mac Role scoped by
-`resourceNames` to that Mac's objects. `llmkube metal token create` will
-create all of it; until then, apply it yourself (here for a Mac named
-`mac-studio`):
+`resourceNames` to that Mac's objects.
+
+`llmkube metal token create <mac>` creates these objects, every one labeled
+`inference.llmkube.dev/metal-node: <mac>`, and refuses to take over an
+existing object of the same name that lacks that label. It also creates a
+single-use join Secret, `llmkube-metal-<mac>-join`. For a Mac named
+`mac-studio`, the command creates the equivalent of:
 
 ```yaml
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: llmkube-metal-mac-studio
+  labels:
+    inference.llmkube.dev/metal-node: mac-studio
 automountServiceAccountToken: false
 ---
 apiVersion: coordination.k8s.io/v1
@@ -485,7 +491,7 @@ kind: Lease
 metadata:
   name: mac-studio
   labels:
-    inference.llmkube.dev/metal-node: mac-studio   # lets the controller watch it
+    inference.llmkube.dev/metal-node: mac-studio   # also what lets the controller watch it
 spec:
   holderIdentity: mac-studio
   leaseDurationSeconds: 45
@@ -494,6 +500,8 @@ apiVersion: inference.llmkube.dev/v1alpha1
 kind: MetalNode
 metadata:
   name: mac-studio
+  labels:
+    inference.llmkube.dev/metal-node: mac-studio
 spec:
   serviceAccountName: llmkube-metal-mac-studio
   leaseName: mac-studio
@@ -502,6 +510,8 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: llmkube-metal-mac-studio
+  labels:
+    inference.llmkube.dev/metal-node: mac-studio
 rules:
   # The agent's heartbeat and report. get and update only: the Lease is
   # pre-created, and RBAC cannot restrict create by name.
@@ -514,6 +524,8 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: llmkube-metal-mac-studio
+  labels:
+    inference.llmkube.dev/metal-node: mac-studio
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -525,7 +537,9 @@ subjects:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: llmkube-metal-agent-mac-studio
+  name: llmkube-metal-mac-studio-shared
+  labels:
+    inference.llmkube.dev/metal-node: mac-studio
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -534,6 +548,9 @@ subjects:
   - kind: ServiceAccount
     name: llmkube-metal-mac-studio
 ```
+
+The Role above shows the Lease rule the agent's MetalNode reporting needs;
+the command's per-Mac Role also carries the self-scoped rules joining needs.
 
 `cmd/metal-agent/rbac_test.go` keeps the two apart: the shared Role must grant
 exactly the agent's shared calls and no Lease rule. Deleting the Mac's
