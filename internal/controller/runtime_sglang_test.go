@@ -849,6 +849,95 @@ func TestValidateSGLangConfig(t *testing.T) {
 			wantReason: "AttentionBackendUnsupported",
 		},
 		{
+			// An unregistered tool-call parser keeps the pod from starting,
+			// so it outranks flags that are only skipped (#2219).
+			name: "an invalid attention backend outranks an invalid tool parser",
+			isvc: &inferencev1alpha1.InferenceService{
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					Runtime: "sglang",
+					SGLangConfig: &inferencev1alpha1.SGLangConfig{
+						AttentionBackend: "flash_attn",
+						ToolCallParser:   "qwen3",
+					},
+				},
+			},
+			wantReason: "AttentionBackendUnsupported",
+		},
+		{
+			name: "a removed attention backend outranks an invalid tool parser",
+			isvc: &inferencev1alpha1.InferenceService{
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					Runtime: "sglang",
+					SGLangConfig: &inferencev1alpha1.SGLangConfig{
+						AttentionBackend: "cutlass_mla",
+						ToolCallParser:   "functionary",
+					},
+				},
+			},
+			wantReason: "AttentionBackendRemoved",
+		},
+		{
+			name: "an invalid tool parser outranks a speculative misconfiguration",
+			isvc: &inferencev1alpha1.InferenceService{
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					Runtime: "sglang",
+					SGLangConfig: &inferencev1alpha1.SGLangConfig{
+						ToolCallParser: "qwen3",
+						Speculative: &inferencev1alpha1.SGLangSpeculativeConfig{
+							Enabled: ptrBool(true),
+						},
+					},
+				},
+			},
+			wantReason: "ToolCallParserUnsupported",
+		},
+		{
+			name: "an unregistered tool parser outranks an unused accept threshold",
+			isvc: &inferencev1alpha1.InferenceService{
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					Runtime: "sglang",
+					SGLangConfig: &inferencev1alpha1.SGLangConfig{
+						ToolCallParser: "functionary",
+						Speculative: &inferencev1alpha1.SGLangSpeculativeConfig{
+							Enabled:               ptrBool(false),
+							AcceptThresholdSingle: ptrFloat64(0.9),
+						},
+					},
+				},
+			},
+			wantReason: "ToolCallParserUnsupported",
+		},
+		{
+			name: "qwen3 reports ToolCallParserUnsupported",
+			isvc: &inferencev1alpha1.InferenceService{
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					Runtime:      "sglang",
+					SGLangConfig: &inferencev1alpha1.SGLangConfig{ToolCallParser: "qwen3"},
+				},
+			},
+			wantReason: "ToolCallParserUnsupported",
+		},
+		{
+			name: "functionary reports ToolCallParserUnsupported",
+			isvc: &inferencev1alpha1.InferenceService{
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					Runtime:      "sglang",
+					SGLangConfig: &inferencev1alpha1.SGLangConfig{ToolCallParser: "functionary"},
+				},
+			},
+			wantReason: "ToolCallParserUnsupported",
+		},
+		{
+			name: "a registered tool parser is valid",
+			isvc: &inferencev1alpha1.InferenceService{
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					Runtime:      "sglang",
+					SGLangConfig: &inferencev1alpha1.SGLangConfig{ToolCallParser: "qwen25"},
+				},
+			},
+			wantReason: "",
+		},
+		{
 			name: "speculative disabled is valid",
 			isvc: &inferencev1alpha1.InferenceService{
 				Spec: inferencev1alpha1.InferenceServiceSpec{
@@ -1044,6 +1133,19 @@ func TestReconcileSGLangSpecCondition(t *testing.T) {
 			wantStatus:     metav1.ConditionFalse,
 			wantReason:     "SpeculativeMissingConfig",
 		},
+		{
+			name: "an unregistered tool parser sets False condition",
+			isvc: &inferencev1alpha1.InferenceService{
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					Runtime:      "sglang",
+					SGLangConfig: &inferencev1alpha1.SGLangConfig{ToolCallParser: "qwen3"},
+				},
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Generation: 3},
+			},
+			wantTypeExists: true,
+			wantStatus:     metav1.ConditionFalse,
+			wantReason:     "ToolCallParserUnsupported",
+		},
 	}
 
 	for _, tc := range cases {
@@ -1066,6 +1168,63 @@ func TestReconcileSGLangSpecCondition(t *testing.T) {
 				if cond != nil {
 					t.Errorf("expected condition %q to not exist, got status=%q reason=%q", ConditionSGLangSpecValid, cond.Status, cond.Reason)
 				}
+			}
+		})
+	}
+}
+
+// TestReconcileSGLangSpecConditionClearsAfterParserFix pins the recovery half
+// of #2219: replacing the unregistered parser with one SGLang registers flips
+// the same condition back to True instead of leaving the service reported.
+func TestReconcileSGLangSpecConditionClearsAfterParserFix(t *testing.T) {
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Generation: 1},
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			Runtime:      RuntimeSGLANG,
+			SGLangConfig: &inferencev1alpha1.SGLangConfig{ToolCallParser: "qwen3"},
+		},
+	}
+	r := &InferenceServiceReconciler{}
+	r.reconcileSGLangSpecCondition(isvc)
+
+	cond := findCondition(isvc.Status.Conditions, ConditionSGLangSpecValid)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "ToolCallParserUnsupported" {
+		t.Fatalf("before the fix: want SGLangSpecValid=False/ToolCallParserUnsupported, got %+v", cond)
+	}
+
+	isvc.Generation = 2
+	isvc.Spec.SGLangConfig.ToolCallParser = "qwen25"
+	r.reconcileSGLangSpecCondition(isvc)
+
+	cond = findCondition(isvc.Status.Conditions, ConditionSGLangSpecValid)
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != "ConfigValid" {
+		t.Fatalf("after the fix: want SGLangSpecValid=True/ConfigValid, got %+v", cond)
+	}
+}
+
+// TestSGLangBuildArgsRendersUnregisteredParser pins what #2219 leaves alone:
+// the condition is informational, so the flag is still rendered and the
+// workload is never blocked.
+func TestSGLangBuildArgsRendersUnregisteredParser(t *testing.T) {
+	for _, parser := range []string{"qwen3", "functionary"} {
+		t.Run(parser, func(t *testing.T) {
+			b := &SGLangBackend{}
+			model := &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: "m"},
+				Spec: inferencev1alpha1.ModelSpec{
+					Source:   "hf://Qwen/Qwen3-8B",
+					Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "cuda"},
+				},
+			}
+			isvc := &inferencev1alpha1.InferenceService{
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					Runtime:      RuntimeSGLANG,
+					SGLangConfig: &inferencev1alpha1.SGLangConfig{ToolCallParser: parser},
+				},
+			}
+			args := b.BuildArgs(isvc, model, "/models/m", "", 30000)
+			if !containsArg(args, "--tool-call-parser", parser) {
+				t.Errorf("BuildArgs dropped the unregistered parser %s; the condition must not change the rendered args: %v", parser, args)
 			}
 		})
 	}
