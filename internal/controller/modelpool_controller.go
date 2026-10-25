@@ -82,6 +82,13 @@ type ModelPoolReconciler struct {
 	Recorder   events.EventRecorder
 	HTTPClient *http.Client
 
+	// APIReader reads the ModelPool uncached. status.pendingMember is the only
+	// record of an activation while its member is held at zero replicas, so a
+	// reconcile that read it from a cache lagging the previous status patch
+	// would hand the slot back to the incumbent (#2240). Nil falls back to the
+	// cached client.
+	APIReader client.Reader
+
 	// RolloutIdleBaseURL overrides the member /slots base URL. Used in tests to
 	// point the idle check at an httptest server; empty in production (the URL
 	// is derived from the member Service).
@@ -104,7 +111,7 @@ func (r *ModelPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	log := logf.FromContext(ctx)
 
 	pool := &inferencev1alpha1.ModelPool{}
-	if err := r.Get(ctx, req.NamespacedName, pool); err != nil {
+	if err := r.poolReader().Get(ctx, req.NamespacedName, pool); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -223,6 +230,11 @@ func (r *ModelPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			desired = 1
 		} else {
 			swapping = true
+		}
+		if desired == 0 && replicasOf(members[owner]) >= 1 {
+			if err := r.recordPendingOwner(ctx, pool, owner); err != nil {
+				return ctrl.Result{}, err
+			}
 		}
 		if err := r.ensureReplicas(ctx, members[owner], desired); err != nil {
 			return ctrl.Result{}, err
@@ -459,6 +471,32 @@ func reclaimAfterDuration(pool *inferencev1alpha1.ModelPool) time.Duration {
 // ensureReplicas patches the member InferenceService's spec.replicas when it
 // differs from the desired value. The reconciler is the sole owner of a pooled
 // member's replica count; the proxy's scale-up is only the activation trigger.
+// poolReader returns the uncached reader when one is wired, so resolveSlotOwner
+// always sees the newest status.pendingMember.
+func (r *ModelPoolReconciler) poolReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
+}
+
+// recordPendingOwner persists owner as status.pendingMember before the caller
+// holds it at zero replicas. Until then the owner's replica count is the only
+// record of the activation, so erasing it first would lose the activation if
+// this write failed (#2240). It patches a copy: pool carries status changes
+// (the reclaim idle clock) that updateStatus diffs against its own baseline.
+func (r *ModelPoolReconciler) recordPendingOwner(ctx context.Context, pool *inferencev1alpha1.ModelPool, owner string) error {
+	if pool.Status.PendingMember == owner {
+		return nil
+	}
+	recorded := pool.DeepCopy()
+	recorded.Status.PendingMember = owner
+	if err := r.Status().Patch(ctx, recorded, client.MergeFrom(pool)); err != nil {
+		return fmt.Errorf("record pending owner %q: %w", owner, err)
+	}
+	return nil
+}
+
 func (r *ModelPoolReconciler) ensureReplicas(ctx context.Context, isvc *inferencev1alpha1.InferenceService, desired int32) error {
 	if replicasOf(isvc) == desired {
 		return nil
