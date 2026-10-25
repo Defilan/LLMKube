@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -150,7 +151,8 @@ func (r *MetalNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// A dial-back error (a Forbidden pod create, a failed list) must not
 	// cost the MetalNode its observed status: store what is known first,
 	// then return the error so the request is retried.
-	requeue, toDelete, dialErr := r.reconcileDialBack(ctx, mn, report, connected, now)
+	requeue, toDelete, dialErr := r.reconcileDialBack(ctx, mn, report, connected, now,
+		orig.Status.IngressSPKI, orig.Status.IngressPort)
 	requeue = min(metalNodeResyncInterval, requeue)
 	if meta.FindStatusCondition(mn.Status.Conditions, inferencev1alpha1.MetalNodeConditionReachable) == nil {
 		r.setCondition(mn, inferencev1alpha1.MetalNodeConditionReachable, metav1.ConditionUnknown,
@@ -334,7 +336,7 @@ func copyReportFacts(st *inferencev1alpha1.MetalNodeStatus, report metalnode.Rep
 // is gone (terminating ones included), and starts are at least
 // metalNodeMinStartSpacing apart whatever changed.
 func (r *MetalNodeReconciler) reconcileDialBack(ctx context.Context, mn *inferencev1alpha1.MetalNode, report *metalnode.Report,
-	connected bool, now time.Time) (time.Duration, []corev1.Pod, error) {
+	connected bool, now time.Time, prevPin string, prevPort int32) (time.Duration, []corev1.Pod, error) {
 	st := &mn.Status
 	hostIP, hostIPValid := specHostIP(mn)
 	var hash string
@@ -343,6 +345,10 @@ func (r *MetalNodeReconciler) reconcileDialBack(ctx context.Context, mn *inferen
 		hash = metalNodeInputHash(report.IngressSPKI, report.IngressPort, dialableAddresses(desired), mn.Spec.Verifier)
 		keep := st.Verification != nil && st.Verification.InputHash == hash
 		st.Candidates = mergeCandidates(st.Candidates, desired, keep)
+		if !keep && verifiedResultStale(st, report, prevPin, prevPort) {
+			r.setReachable(mn, metav1.ConditionUnknown, inferencev1alpha1.MetalNodeReasonVerificationPending,
+				"the agent's pin, port or addresses changed since the last check; a new check is due")
+		}
 	}
 
 	pods, err := r.ownedVerifiers(ctx, mn)
@@ -395,6 +401,22 @@ func (r *MetalNodeReconciler) reconcileDialBack(ctx context.Context, mn *inferen
 	v.PodUID = string(pod.UID)
 	log.FromContext(ctx).V(1).Info("started MetalNode dial-back", "pod", pod.Name, "candidates", len(addrs))
 	return metalNodeVerifierPollInterval, toDelete, nil
+}
+
+// verifiedResultStale reports whether a True Reachable no longer describes
+// the current inputs: the pin or port changed since the status was last
+// written (the result proved the old key or port), or status.hostIP is no
+// longer among the addresses being dialed. A result for inputs that only
+// grew (a new address beside the verified one) stands until the next check
+// lands.
+func verifiedResultStale(st *inferencev1alpha1.MetalNodeStatus, report *metalnode.Report, prevPin string, prevPort int32) bool {
+	if st.HostIP == "" {
+		return false
+	}
+	if report.IngressSPKI != prevPin || report.IngressPort != prevPort {
+		return true
+	}
+	return !slices.Contains(dialableAddresses(st.Candidates), st.HostIP)
 }
 
 // specHostIP returns spec.hostIP in canonical form and whether it is usable

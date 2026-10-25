@@ -46,6 +46,9 @@ const (
 	MetalNodeReasonVerifierFailed    = "VerifierFailed"
 	MetalNodeReasonAgentNotConnected = "AgentNotConnected"
 	MetalNodeReasonInvalidSpec       = "InvalidSpec"
+	// MetalNodeReasonVerificationPending: the pin, port or verified address
+	// changed, so the last result no longer applies; a new check is due.
+	MetalNodeReasonVerificationPending = "VerificationPending"
 )
 
 // LabelMetalNode names the MetalNode an object belongs to. The controller

@@ -128,6 +128,12 @@ func TestMetalNodeVerifierFloodBounded(t *testing.T) {
 	if len(pods) != 1 || pods[0].DeletionTimestamp == nil {
 		t.Fatalf("%d verifier pods after new inputs with the old one held, want only the old one, Terminating", len(pods))
 	}
+	// The next reconcile sees the old pod already Terminating: it still
+	// counts as busy, so nothing new starts.
+	f.reconcile("mac-flood")
+	if pods := f.verifierPods("mac-flood"); len(pods) != 1 || pods[0].DeletionTimestamp == nil {
+		t.Fatalf("%d verifier pods on the reconcile after, with the old one Terminating, want only the old one", len(pods))
+	}
 	f.releaseVerifiers("mac-flood")
 	f.reconcile("mac-flood")
 	record()
@@ -470,5 +476,67 @@ func TestMetalNodeIgnoresForgedVerifierPod(t *testing.T) {
 		if p.Name == forged.Name {
 			t.Error("the look-alike verifier pod was left in place")
 		}
+	}
+}
+
+// TestMetalNodeReachableNotStaleAfterInputChange is the re-review's R2
+// repro: once the pin or port changes, or the verified address is no longer
+// dialed, the old Reachable=True and hostIP must not stand until a new result
+// lands. join reads both to report success.
+func TestMetalNodeReachableNotStaleAfterInputChange(t *testing.T) {
+	f := newMetalNodeFixture(t)
+	verified := func(name string, c ...metalnode.Candidate) {
+		f.createMetalNode(name, nil)
+		f.putLease(name, f.now, encodeReport(t, testReport(c...)))
+		f.reconcile(name)
+		f.finishVerifier(f.onlyVerifierPod(name), "100.64.0.2 0\n")
+		f.reconcile(name)
+		wantCondition(t, f.get(name), inferencev1alpha1.MetalNodeConditionReachable, metav1.ConditionTrue,
+			inferencev1alpha1.MetalNodeReasonDialBackSucceeded)
+	}
+	tailnet := metalnode.Candidate{Address: "100.64.0.2", Source: metalnode.SourceTailnet}
+
+	// A new dialable address every 31 s, the verified one gone.
+	verified("mac-churn", tailnet)
+	start := f.now
+	for i := 1; i <= 3; i++ {
+		f.now = start.Add(time.Duration(31*i) * time.Second)
+		f.putLease("mac-churn", f.now, encodeReport(t, testReport(
+			metalnode.Candidate{Address: fmt.Sprintf("10.6.6.%d", i), Source: metalnode.SourceLAN})))
+		f.reconcile("mac-churn")
+		mn := f.get("mac-churn")
+		wantCondition(t, mn, inferencev1alpha1.MetalNodeConditionReachable, metav1.ConditionUnknown,
+			inferencev1alpha1.MetalNodeReasonVerificationPending)
+		if mn.Status.HostIP != "" {
+			t.Fatalf("change %d: hostIP = %q, an address no longer dialed", i, mn.Status.HostIP)
+		}
+	}
+
+	// Same addresses, new pin: the old result proved the old key.
+	verified("mac-rekey", tailnet)
+	rekeyed := testReport(tailnet)
+	rekeyed.IngressSPKI = "AAAAEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80="
+	f.now = f.now.Add(time.Minute)
+	f.putLease("mac-rekey", f.now, encodeReport(t, rekeyed))
+	f.reconcile("mac-rekey")
+	mn := f.get("mac-rekey")
+	wantCondition(t, mn, inferencev1alpha1.MetalNodeConditionReachable, metav1.ConditionUnknown,
+		inferencev1alpha1.MetalNodeReasonVerificationPending)
+	if mn.Status.HostIP != "" {
+		t.Errorf("hostIP = %q after the pin changed, want empty until re-verified", mn.Status.HostIP)
+	}
+
+	// A new address added beside the verified one leaves the result
+	// standing until the new check lands.
+	verified("mac-grow", tailnet)
+	f.now = f.now.Add(time.Minute)
+	f.putLease("mac-grow", f.now, encodeReport(t, testReport(tailnet,
+		metalnode.Candidate{Address: "192.168.1.47", Source: metalnode.SourceLAN})))
+	f.reconcile("mac-grow")
+	mn = f.get("mac-grow")
+	wantCondition(t, mn, inferencev1alpha1.MetalNodeConditionReachable, metav1.ConditionTrue,
+		inferencev1alpha1.MetalNodeReasonDialBackSucceeded)
+	if mn.Status.HostIP != "100.64.0.2" {
+		t.Errorf("hostIP = %q after adding a candidate, want the verified 100.64.0.2 kept", mn.Status.HostIP)
 	}
 }

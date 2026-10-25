@@ -25,6 +25,8 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -185,6 +187,15 @@ func TestBuildMetalNodeVerifierPod(t *testing.T) {
 		t.Errorf("image = %s, want the configured init container image", c.Image)
 	}
 	checkVerifierContainerSecurity(t, c.SecurityContext)
+	// Requests equal to limits for CPU and memory, so a namespace whose
+	// ResourceQuota requires limits admits the verifier.
+	wantResources := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m"), corev1.ResourceMemory: resource.MustParse("32Mi")},
+		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m"), corev1.ResourceMemory: resource.MustParse("32Mi")},
+	}
+	if !apiequality.Semantic.DeepEqual(c.Resources, wantResources) {
+		t.Errorf("resources = %+v, want cpu 100m and memory 32Mi as both request and limit", c.Resources)
+	}
 	if c.TerminationMessagePath != "/dev/termination-log" || c.TerminationMessagePolicy != corev1.TerminationMessageReadFile {
 		t.Errorf("termination message %s/%s, want /dev/termination-log read from file",
 			c.TerminationMessagePath, c.TerminationMessagePolicy)
