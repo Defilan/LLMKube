@@ -8,6 +8,10 @@ before:
     # Ensure dependencies are tidy
     - go mod tidy
     # Note: Tests run in separate CI workflow (test.yml) before release is triggered
+    # Built once for the host so each darwin post hook below can embed its
+    # Info.plist without compiling the tool per binary. Not in dist/: the
+    # dist directory must still be empty when the before hooks finish.
+    - go build -o ./bin/machoplist ./cmd/machoplist
 
 builds:
   - id: llmkube-cli
@@ -38,6 +42,17 @@ builds:
 
     env:
       - CGO_ENABLED=0
+
+    # darwin binaries: embed the Info.plist (if any), then sign with
+    # rcodesign: Developer ID and notarization when the MACOS_* secrets are
+    # set, ad-hoc otherwise. Non-darwin targets are a no-op. See
+    # hack/macos-sign.sh and docs/contributing/macos-signing.md (#2084).
+    hooks:
+      post:
+        - cmd: ./hack/macos-sign.sh {{ .Os }} {{ .Path }} {{ .Version }} dev.llmkube.cli
+          env:
+            - MACHOPLIST=./bin/machoplist
+          output: true
 
   - id: llmkube-controller
     main: ./cmd/main.go
@@ -75,6 +90,14 @@ builds:
 
     env:
       - CGO_ENABLED=0
+
+    # Embed the Info.plist and sign (see the llmkube-cli hook above).
+    hooks:
+      post:
+        - cmd: ./hack/macos-sign.sh {{ .Os }} {{ .Path }} {{ .Version }} dev.llmkube.metal-agent deployment/macos/metal-agent.Info.plist.tmpl
+          env:
+            - MACHOPLIST=./bin/machoplist
+          output: true
 
   - id: llmkube-foreman-operator
     main: ./cmd/foreman-operator
@@ -116,6 +139,14 @@ builds:
 
     env:
       - CGO_ENABLED=0
+
+    # Embed the Info.plist and sign (see the llmkube-cli hook above).
+    hooks:
+      post:
+        - cmd: ./hack/macos-sign.sh {{ .Os }} {{ .Path }} {{ .Version }} dev.llmkube.foreman-agent deployment/macos/foreman-agent.Info.plist.tmpl
+          env:
+            - MACHOPLIST=./bin/machoplist
+          output: true
 
   - id: llmkube-router-proxy
     main: ./cmd/router-proxy

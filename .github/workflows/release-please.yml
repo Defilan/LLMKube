@@ -79,6 +79,26 @@ jobs:
         env:
           VERSION: ${{ needs.release-please.outputs.version || github.sha }}
 
+      - name: Install rcodesign
+        # hack/macos-sign.sh, the GoReleaser post-build hook for the darwin
+        # binaries, signs (and with the notary key, notarizes) them with
+        # rcodesign, which runs on Linux (#2084). Pinned by version and
+        # checksum; the tarball holds <name>/rcodesign.
+        if: ${{ github.event_name == 'push' }}
+        env:
+          RCODESIGN_VERSION: 0.29.0
+          RCODESIGN_SHA256: dbe85cedd8ee4217b64e9a0e4c2aef92ab8bcaaa41f20bde99781ff02e600002
+        run: |
+          set -euo pipefail
+          name="apple-codesign-${RCODESIGN_VERSION}-x86_64-unknown-linux-musl"
+          url="https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F${RCODESIGN_VERSION}/${name}.tar.gz"
+          tmp="$(mktemp -d)"
+          curl -fsSL --retry 3 -o "$tmp/rcodesign.tar.gz" "$url"
+          echo "${RCODESIGN_SHA256}  $tmp/rcodesign.tar.gz" | sha256sum -c -
+          tar -xzf "$tmp/rcodesign.tar.gz" -C "$tmp"
+          sudo install -m 0755 "$tmp/${name}/rcodesign" /usr/local/bin/rcodesign
+          rcodesign --version
+
       - name: Run GoReleaser
         if: ${{ github.event_name == 'push' }}
         uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
@@ -89,6 +109,14 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          # Read by hack/macos-sign.sh (docs/contributing/macos-signing.md).
+          # Unset: the darwin binaries are ad-hoc signed and not notarized.
+          # A partial set fails the release.
+          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
 
       - name: Publish Homebrew formula
         # GoReleaser no longer manages the tap (its cask replacement is
