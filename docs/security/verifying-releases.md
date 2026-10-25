@@ -32,3 +32,21 @@ above to match.
 The same applies to llmkube-foreman-operator, llmkube-foreman-agent, and
 llmkube-router-proxy. Release binary archives also carry provenance; verify with
 `gh attestation verify <archive> --owner defilantech`.
+
+## Verify the macOS binaries
+
+The darwin builds of `llmkube`, `llmkube-metal-agent` and `foreman-agent` are
+code-signed with the bundle identifiers `dev.llmkube.cli`,
+`dev.llmkube.metal-agent` and `dev.llmkube.foreman-agent`; the two agents embed
+an Info.plist. A release built with the project's signing secrets is signed
+with a Developer ID certificate and notarized by Apple:
+
+    codesign -dv --verbose=4 llmkube-metal-agent
+    spctl --assess --type install -vv llmkube-metal-agent
+
+The first shows `Identifier=dev.llmkube.metal-agent`, `Info.plist entries=9`,
+the `runtime` flag and the Developer ID authority; the second reports
+`source=Notarized Developer ID`. A bare executable cannot have its notarization
+ticket stapled, so Gatekeeper checks it online on first launch. A release built
+without the secrets is ad-hoc signed (`Signature=adhoc`). Maintainers: see
+[Signing and notarizing the macOS binaries](../contributing/macos-signing.md).
