@@ -166,6 +166,11 @@ func metalScheme() (*runtime.Scheme, error) {
 // errNotMetalManaged refuses to take over an object with a derived name that
 // was not created for this Mac.
 func errNotMetalManaged(kind string, obj client.Object, mac string) error {
+	if other := obj.GetLabels()[inferencev1alpha1.LabelMetalNode]; other != "" {
+		return fmt.Errorf("%s %s/%s already exists and belongs to Mac %q (labeled %s=%s), not %q; "+
+			"llmkube will not take it over", kind, obj.GetNamespace(), obj.GetName(), other,
+			inferencev1alpha1.LabelMetalNode, other, mac)
+	}
 	return fmt.Errorf("%s %s/%s already exists and is not labeled %s=%s, so llmkube will not take it over; "+
 		"delete it, or label it if it really is this Mac's (kubectl label -n %s %s %s %s=%s)",
 		kind, obj.GetNamespace(), obj.GetName(), inferencev1alpha1.LabelMetalNode, mac,

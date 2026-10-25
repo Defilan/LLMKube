@@ -21,6 +21,8 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -69,9 +71,12 @@ func metalEnvtest(t *testing.T) (*rest.Config, client.Client, string) {
 	}
 	ns := "metal-" + strings.ToLower(strings.ReplaceAll(t.Name(), "/", "-"))
 	if len(ns) > 63 {
-		ns = ns[:63]
+		// Subtests share a long prefix: keep them apart with a hash.
+		h := fnv.New32a()
+		_, _ = h.Write([]byte(ns))
+		ns = fmt.Sprintf("%s-%08x", strings.TrimRight(ns[:50], "-"), h.Sum32())
 	}
-	ns = strings.TrimRight(ns, "-")
+	ns = strings.TrimRight(strings.ReplaceAll(ns, "_", "-"), "-")
 	if err := c.Create(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}); err != nil {
 		t.Fatalf("create namespace: %v", err)
 	}

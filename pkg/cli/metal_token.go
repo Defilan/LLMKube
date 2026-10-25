@@ -283,6 +283,9 @@ func metalTokenCreate(ctx context.Context, c client.Client, kube kubernetes.Inte
 		return nil, fmt.Errorf("look up the MetalNode resource: %w", err)
 	}
 	n := newMetalNames(mac)
+	if err := preflightMetalOwnership(ctx, c, namespace, n); err != nil {
+		return nil, err
+	}
 	if err := ensureSharedMetalRole(ctx, c, namespace, log); err != nil {
 		return nil, err
 	}
@@ -304,6 +307,48 @@ func metalTokenCreate(ctx context.Context, c client.Client, kube kubernetes.Inte
 		return nil, err
 	}
 	return mintJoinToken(ctx, kube, namespace, n, secret, ttl)
+}
+
+// metalDerivedObjects are the Mac's objects whose ownership label decides
+// whether llmkube may write them. The MetalNode is left out: it is this Mac
+// by kind and name, so a hand-applied one is adopted.
+func metalDerivedObjects(namespace string, n metalNames) []struct {
+	kind string
+	obj  client.Object
+} {
+	om := func(name string) metav1.ObjectMeta { return metav1.ObjectMeta{Namespace: namespace, Name: name} }
+	return []struct {
+		kind string
+		obj  client.Object
+	}{
+		{"ServiceAccount", &corev1.ServiceAccount{ObjectMeta: om(n.ServiceAccount)}},
+		{"Role", &rbacv1.Role{ObjectMeta: om(n.Role)}},
+		{"RoleBinding", &rbacv1.RoleBinding{ObjectMeta: om(n.RoleBinding)}},
+		{"RoleBinding", &rbacv1.RoleBinding{ObjectMeta: om(n.SharedBinding)}},
+		{"Lease", &coordinationv1.Lease{ObjectMeta: om(n.Lease)}},
+		{"Secret", &corev1.Secret{ObjectMeta: om(n.JoinSecret)}},
+	}
+}
+
+// preflightMetalOwnership refuses, before anything is written, when an
+// object with one of the Mac's names exists and is not labeled for this Mac.
+// A refusal must leave the cluster as it was: a half-made identity (a
+// ServiceAccount bound to a Role on someone else's Lease) is worse than none.
+// The steps check again when they write, for objects created in between.
+func preflightMetalOwnership(ctx context.Context, c client.Client, namespace string, n metalNames) error {
+	for _, d := range metalDerivedObjects(namespace, n) {
+		err := c.Get(ctx, client.ObjectKeyFromObject(d.obj), d.obj)
+		switch {
+		case apierrors.IsNotFound(err):
+			continue
+		case err != nil:
+			return fmt.Errorf("get %s %s/%s: %w", d.kind, namespace, d.obj.GetName(), err)
+		}
+		if d.obj.GetLabels()[inferencev1alpha1.LabelMetalNode] != n.Mac {
+			return errNotMetalManaged(d.kind, d.obj, n.Mac)
+		}
+	}
+	return nil
 }
 
 // metalApply is what each step of token create works with.
