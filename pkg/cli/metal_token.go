@@ -83,18 +83,24 @@ func newMetalTokenCreateCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "create <mac-name>",
 		Short: "Create a Mac's identity and print a single-use join string",
-		Long: `Create everything a Mac needs to join the cluster and print a join string
-for 'llmkube metal join' on that Mac.
+		Long: `Create everything a Mac needs to join the cluster and print the join command
+to run on that Mac.
 
 In the namespace it creates (or updates) the Mac's ServiceAccount, a per-Mac
 Role scoped to the Mac's own objects, RoleBindings to that Role and to the
 shared llmkube-metal-agent Role (created from deployment/macos/metal-agent-rbac.yaml
 if missing), the Mac's Lease and MetalNode, and a join Secret. The join token
-is bound to that Secret: 'llmkube metal join' deletes it, so the string works
-once, and only until it expires (--ttl, 30 minutes by default).
+is bound to that Secret, which the Mac deletes when it joins, so the string
+works once, and only until it expires (--ttl, 30 minutes by default). It
+refuses, before writing anything, when an object with one of the Mac's names
+exists and is not labeled for this Mac.
 
-Running it again for the same Mac issues a new string and kills the previous
-one. The Mac never sees your credentials.`,
+Until it is used or expires, the string is a credential for the Mac's
+identity: whoever redeems it can mint the Mac's own tokens. Running this
+again for the same Mac kills an unused previous string (within ~10 seconds
+if it was just used), but not a string that was already redeemed. If a
+string may have leaked, run 'llmkube metal remove <mac>' and then create a
+new one. The Mac never sees your credentials.`,
 		Example: `  llmkube metal token create mac-studio
   llmkube metal token create mac-studio -n inference --server https://100.64.0.1:6443`,
 		Args: cobra.ExactArgs(1),
@@ -590,7 +596,8 @@ func recreateJoinSecret(ctx context.Context, a metalApply) (*corev1.Secret, erro
 		if err := waitGone(ctx, c, old); err != nil {
 			return nil, err
 		}
-		_, _ = fmt.Fprintf(log, "Secret %s/%s deleted (the previous join string no longer works)\n", namespace, n.JoinSecret)
+		_, _ = fmt.Fprintf(log, "Secret %s/%s deleted: an unused previous join string no longer works "+
+			"(one redeemed already is revoked only by llmkube metal remove)\n", namespace, n.JoinSecret)
 	case !apierrors.IsNotFound(err):
 		return nil, fmt.Errorf("get join Secret %s/%s: %w", namespace, n.JoinSecret, err)
 	}

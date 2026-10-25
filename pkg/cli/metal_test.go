@@ -23,11 +23,13 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/spf13/cobra"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
@@ -287,3 +289,25 @@ func TestJWTLifetime(t *testing.T) {
 		t.Error("jwtLifetime accepted a non-JWT")
 	}
 }
+
+// TestMetalHelpNamesOnlyExistingCommands: help text must not send users to
+// an `llmkube metal` subcommand this build does not have.
+func TestMetalHelpNamesOnlyExistingCommands(t *testing.T) {
+	root := NewMetalCommand()
+	var walk func(cmd *cobra.Command)
+	walk = func(cmd *cobra.Command) {
+		for _, text := range []string{cmd.Short, cmd.Long, cmd.Example} {
+			for _, m := range metalCommandRef.FindAllStringSubmatch(text, -1) {
+				if found, _, err := root.Find(strings.Fields(m[1])); err != nil || found == root {
+					t.Errorf("help of %q names %q, which is not a command", cmd.CommandPath(), "llmkube metal "+m[1])
+				}
+			}
+		}
+		for _, sub := range cmd.Commands() {
+			walk(sub)
+		}
+	}
+	walk(root)
+}
+
+var metalCommandRef = regexp.MustCompile(`llmkube metal ([a-z]+(?: [a-z]+)?)`)
