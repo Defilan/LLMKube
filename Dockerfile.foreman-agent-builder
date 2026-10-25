@@ -15,9 +15,9 @@
 # Two stages:
 #   1. builder -- compile the static foreman-agent binary, identical to
 #      Dockerfile.foreman-agent's build stage.
-#   2. runtime -- FROM golang:1.26, the SAME base the gate Job uses
-#      (gate_job_template.yaml default image). It already ships go, make,
-#      and git, so the coder's bash gate checks run unmodified.
+#   2. runtime -- FROM golang at go.mod's version (make check-go-version
+#      keeps the tag equal to it). It already ships go, make, and git, so
+#      the coder's bash gate checks run unmodified.
 #
 # The binary lands at /usr/local/bin/foreman-agent (on PATH) so the
 # template's `command: ["foreman-agent"]` resolves by bare name. We do
@@ -25,7 +25,7 @@
 # container's command and break that bare-name invocation.
 
 # Build stage: full Go toolchain on a small base.
-FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine AS builder
 
 ARG TARGETOS
 ARG TARGETARCH
@@ -45,15 +45,15 @@ COPY pkg/ pkg/
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags="-s -w" -o foreman-agent ./cmd/foreman-agent
 
-# Runtime stage: golang:1.26 -- the same image the gate Job runs on, so it
-# already has go, make, and git for the coder's `make fmt vet lint test`.
-FROM golang:1.27
+# Runtime stage: golang at go.mod's version, so it already has go, make, and
+# git for the coder's `make fmt vet lint test`.
+FROM golang:1.27.3
 
 # TARGETARCH is supplied by buildx; declare it so the helm fetch below can
 # pick the right release asset for the runtime platform.
 ARG TARGETARCH
 
-# make is the only gate-check dependency golang:1.26 does not already
+# make is the only gate-check dependency the golang image does not already
 # ship (go and git are present in the official image). curl + ca-certs are
 # needed to fetch helm.
 RUN apt-get update \
@@ -61,7 +61,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # helm: coder tasks that edit Helm charts verify locally with
-# `helm template` / `helm lint`. golang:1.26 does not ship helm, so without
+# `helm template` / `helm lint`. The golang image does not ship helm, so without
 # this a chart-editing coder cannot run the verification its task asks for
 # (the run_gate_job gate also lints charts). Pinned for reproducibility.
 ARG HELM_VERSION=v3.16.4
