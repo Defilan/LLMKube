@@ -22,9 +22,6 @@ import (
 	"io"
 
 	"github.com/spf13/cobra"
-	coordinationv1 "k8s.io/api/coordination/v1"
-	corev1 "k8s.io/api/core/v1"
-	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -35,6 +32,7 @@ import (
 
 func newMetalRemoveCommand() *cobra.Command {
 	var namespace string
+	var includeUnlabeled bool
 	cmd := &cobra.Command{
 		Use:   "remove <mac-name>",
 		Short: "Revoke a Mac and delete its objects",
@@ -49,18 +47,28 @@ Role, both RoleBindings, the Lease, the join Secret and the MetalNode are
 deleted. The shared llmkube-metal-agent Role stays. Objects that are already
 gone are skipped, so running it twice is fine.
 
-This does not stop the agent on the Mac; run 'llmkube metal leave' there.`,
+Only objects labeled inference.llmkube.dev/metal-node=<mac-name> are deleted.
+Anything else with one of the Mac's names (another app's Lease, objects
+labeled for another Mac, objects applied by hand) is left in place and
+listed. --include-unlabeled also deletes unlabeled objects with the Mac's
+names, for a Mac set up by hand; objects labeled for another Mac are never
+deleted. If the ServiceAccount is left in place, nothing was revoked and the
+command fails.
+
+This does not stop the agent on the Mac.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runMetalRemove(cmd, args[0], namespace)
+			return runMetalRemove(cmd, args[0], namespace, includeUnlabeled)
 		},
 	}
 	cmd.Flags().StringVarP(&namespace, "namespace", "n", "",
 		"Namespace of the Mac's objects (default: the kubeconfig context's namespace, else default)")
+	cmd.Flags().BoolVar(&includeUnlabeled, "include-unlabeled", false,
+		"Also delete unlabeled objects with the Mac's names (a Mac whose objects were applied by hand)")
 	return cmd
 }
 
-func runMetalRemove(cmd *cobra.Command, mac, namespaceFlag string) error {
+func runMetalRemove(cmd *cobra.Command, mac, namespaceFlag string, includeUnlabeled bool) error {
 	if err := validateMacName(mac); err != nil {
 		return err
 	}
@@ -80,61 +88,101 @@ func runMetalRemove(cmd *cobra.Command, mac, namespaceFlag string) error {
 	if err != nil {
 		return fmt.Errorf("create client: %w", err)
 	}
-	return metalRemove(ctx, c, namespace, mac, cmd.OutOrStdout())
+	return metalRemove(ctx, c, namespace, mac, includeUnlabeled, cmd.OutOrStdout(), cmd.ErrOrStderr())
 }
 
-// metalRemove deletes the Mac's objects, ServiceAccount first. It never
-// deletes the shared Role.
-func metalRemove(ctx context.Context, c client.Client, namespace, mac string, out io.Writer) error {
+// metalRemove deletes the Mac's objects, ServiceAccount first, but only
+// those labeled for this Mac (and, with includeUnlabeled, unlabeled ones with
+// its names). It never deletes the shared Role. Removed and skipped objects
+// go to out, warnings to log. It fails when the ServiceAccount was left in
+// place, because then nothing was revoked.
+func metalRemove(ctx context.Context, c client.Client, namespace, mac string, includeUnlabeled bool,
+	out, log io.Writer) error {
 	n := newMetalNames(mac)
-	objMeta := func(name string) metav1.ObjectMeta { return metav1.ObjectMeta{Namespace: namespace, Name: name} }
-
-	removed := 0
-	sa := &corev1.ServiceAccount{ObjectMeta: objMeta(n.ServiceAccount)}
-	gone, err := deleteMetalObject(ctx, c, "ServiceAccount", sa)
-	if err != nil {
-		return err
-	}
-	if gone {
-		if err := waitGone(ctx, c, sa); err != nil {
-			return err
-		}
-		removed++
-		_, _ = fmt.Fprintf(out, "removed ServiceAccount %s/%s: the Mac's tokens are revoked "+
-			"(one used in the last ~10 s may work ~10 s longer)\n", namespace, n.ServiceAccount)
-	}
-
-	rest := []struct {
+	targets := append(metalDerivedObjects(namespace, n), struct {
 		kind string
 		obj  client.Object
-	}{
-		{"Role", &rbacv1.Role{ObjectMeta: objMeta(n.Role)}},
-		{"RoleBinding", &rbacv1.RoleBinding{ObjectMeta: objMeta(n.RoleBinding)}},
-		{"RoleBinding", &rbacv1.RoleBinding{ObjectMeta: objMeta(n.SharedBinding)}},
-		{"Lease", &coordinationv1.Lease{ObjectMeta: objMeta(n.Lease)}},
-		{"Secret", &corev1.Secret{ObjectMeta: objMeta(n.JoinSecret)}},
-		{"MetalNode", &inferencev1alpha1.MetalNode{ObjectMeta: objMeta(n.MetalNode)}},
-	}
-	for _, r := range rest {
-		gone, err := deleteMetalObject(ctx, c, r.kind, r.obj)
+	}{"MetalNode", &inferencev1alpha1.MetalNode{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: n.MetalNode},
+	}})
+
+	removed, skippedSA, skippedUnlabeled := 0, false, false
+	for _, t := range targets {
+		found, err := getMetalObject(ctx, c, t.kind, t.obj)
 		if err != nil {
 			return err
 		}
-		if gone {
-			removed++
-			_, _ = fmt.Fprintf(out, "removed %s %s/%s\n", r.kind, namespace, r.obj.GetName())
+		if !found {
+			continue
 		}
+		owner := t.obj.GetLabels()[inferencev1alpha1.LabelMetalNode]
+		switch {
+		case owner == mac:
+		case owner == "" && includeUnlabeled:
+			_, _ = fmt.Fprintf(log, "warning: deleting unlabeled %s %s/%s by its name (--include-unlabeled)\n",
+				t.kind, namespace, t.obj.GetName())
+		default:
+			why := "not labeled " + inferencev1alpha1.LabelMetalNode + "=" + mac
+			if owner != "" {
+				why = "it belongs to Mac " + owner
+			} else {
+				skippedUnlabeled = true
+			}
+			_, _ = fmt.Fprintf(out, "skipped %s %s/%s: %s\n", t.kind, namespace, t.obj.GetName(), why)
+			skippedSA = skippedSA || t.kind == "ServiceAccount"
+			continue
+		}
+		gone, err := deleteMetalObject(ctx, c, t.kind, t.obj)
+		if err != nil {
+			return err
+		}
+		if !gone {
+			continue
+		}
+		removed++
+		if t.kind != "ServiceAccount" {
+			_, _ = fmt.Fprintf(out, "removed %s %s/%s\n", t.kind, namespace, t.obj.GetName())
+			continue
+		}
+		if err := waitGone(ctx, c, t.obj); err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintf(out, "removed ServiceAccount %s/%s: the Mac's tokens are revoked "+
+			"(one used in the last ~10 s may work ~10 s longer)\n", namespace, n.ServiceAccount)
 	}
-	if removed == 0 {
+	if removed == 0 && !skippedSA && !skippedUnlabeled {
 		_, _ = fmt.Fprintf(out, "nothing to remove for Mac %s in namespace %s\n", mac, namespace)
+	}
+	if skippedUnlabeled {
+		_, _ = fmt.Fprintf(log, "unlabeled objects were left in place; if they are this Mac's (applied by hand), "+
+			"rerun with --include-unlabeled\n")
+	}
+	if skippedSA {
+		return fmt.Errorf("ServiceAccount %s/%s is not this Mac's, so it was left in place and the Mac's tokens "+
+			"are NOT revoked", namespace, n.ServiceAccount)
 	}
 	return nil
 }
 
-// deleteMetalObject deletes obj and reports whether it existed. A missing
-// object, or a missing MetalNode resource, is not an error.
+// getMetalObject reads obj by name and reports whether it exists. A missing
+// MetalNode resource counts as not found.
+func getMetalObject(ctx context.Context, c client.Client, kind string, obj client.Object) (bool, error) {
+	err := c.Get(ctx, client.ObjectKeyFromObject(obj), obj)
+	switch {
+	case err == nil:
+		return true, nil
+	case apierrors.IsNotFound(err), meta.IsNoMatchError(err):
+		return false, nil
+	}
+	return false, fmt.Errorf("get %s %s/%s: %w", kind, obj.GetNamespace(), obj.GetName(), err)
+}
+
+// deleteMetalObject deletes the object that was read (the UID precondition
+// keeps a replacement created since from being deleted in its place) and
+// reports whether it was there to delete.
 func deleteMetalObject(ctx context.Context, c client.Client, kind string, obj client.Object) (bool, error) {
-	err := c.Delete(ctx, obj)
+	uid := obj.GetUID()
+	err := c.Delete(ctx, obj, client.Preconditions{UID: &uid})
 	switch {
 	case err == nil:
 		return true, nil

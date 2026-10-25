@@ -539,7 +539,7 @@ func TestMetalRemoveDeletesTheServiceAccountFirst(t *testing.T) {
 		},
 	})
 	var out bytes.Buffer
-	if err := metalRemove(ctx, recording, ns, "mac-a", &out); err != nil {
+	if err := metalRemove(ctx, recording, ns, "mac-a", false, &out, &bytes.Buffer{}); err != nil {
 		t.Fatalf("metalRemove: %v", err)
 	}
 	if len(order) == 0 || order[0] != "ServiceAccount/llmkube-metal-mac-a" {
