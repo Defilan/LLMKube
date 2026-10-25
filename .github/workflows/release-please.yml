@@ -84,7 +84,12 @@ jobs:
         # binaries, signs (and with the notary key, notarizes) them with
         # rcodesign, which runs on Linux (#2084). Pinned by version and
         # checksum; the tarball holds <name>/rcodesign.
+        # A failed download must not block a release on its own: without
+        # rcodesign the hook dies whenever MACOS_SIGN_P12 is set or
+        # MACOS_SIGNING_REQUIRED is true, and otherwise leaves the binaries
+        # as built, with a warning.
         if: ${{ github.event_name == 'push' }}
+        continue-on-error: true
         env:
           RCODESIGN_VERSION: 0.29.0
           RCODESIGN_SHA256: dbe85cedd8ee4217b64e9a0e4c2aef92ab8bcaaa41f20bde99781ff02e600002
@@ -105,7 +110,9 @@ jobs:
         with:
           distribution: goreleaser
           version: 'v2.19.0'
-          args: release --clean
+          # Six darwin binaries may each wait up to 20 minutes for Apple's
+          # notary service; the 1h default is too tight.
+          args: release --clean --timeout 2h
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
