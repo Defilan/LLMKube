@@ -45,6 +45,11 @@ func TestHostCapacityFromSysctl(t *testing.T) {
 		t.Errorf("capacity with sysctl failing = %+v, want empty rather than a guess", got)
 	}
 
+	values["machdep.cpu.brand_string"] = "Apple \u202eM5\u200b Max\u0085"
+	if got := hostCapacityFromSysctl(sysctl).Chip; got != "Apple M5 Max" {
+		t.Errorf("chip = %q, want bidi, zero-width and C1 characters stripped (the controller rejects them)", got)
+	}
+
 	values["hw.memsize"] = "lots"
 	values["machdep.cpu.brand_string"] = strings.Repeat("M", 300) + "\x01"
 	got = hostCapacityFromSysctl(sysctl)

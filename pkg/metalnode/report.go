@@ -27,6 +27,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/netip"
+	"unicode"
+	"unicode/utf8"
 )
 
 // ReportAnnotation is the Lease annotation that carries the agent's Report.
@@ -47,6 +49,11 @@ const (
 	// MaxCandidates bounds the addresses one report may carry, which also
 	// bounds the verifier pod's run time (one short probe per address).
 	MaxCandidates = 16
+
+	// MinIngressPort is the lowest ingress port a report may carry. The
+	// controller dials the reported port from inside the cluster, so a
+	// privileged port (22, 443, ...) is refused outright.
+	MinIngressPort = 1024
 
 	maxShortString = 128
 	maxSource      = 32
@@ -102,8 +109,8 @@ func Decode(raw string) (Report, error) {
 }
 
 func (r *Report) validate() error {
-	if r.IngressPort < 0 || r.IngressPort > 65535 {
-		return fmt.Errorf("ingressPort %d is not a TCP port", r.IngressPort)
+	if r.IngressPort != 0 && (r.IngressPort < MinIngressPort || r.IngressPort > 65535) {
+		return fmt.Errorf("ingressPort %d must be 0 (no ingress) or %d-65535", r.IngressPort, MinIngressPort)
 	}
 	if r.MemoryBytes < 0 {
 		return fmt.Errorf("memoryBytes %d is negative", r.MemoryBytes)
@@ -140,18 +147,29 @@ func (r *Report) validate() error {
 	return nil
 }
 
-// checkPrintable bounds a free-text claim before it reaches MetalNode status.
+// checkPrintable bounds a free-text claim before it reaches MetalNode status
+// and the kubectl printer columns. Only printable characters are allowed
+// (unicode.IsPrint): control characters, C1 controls, and format characters
+// such as bidi overrides and zero-width spaces are rejected, since they could
+// make `kubectl get mn` show something other than what is stored.
 func checkPrintable(name, value string, limit int) error {
 	if len(value) > limit {
 		return fmt.Errorf("%s is %d bytes, over the %d allowed", name, len(value), limit)
 	}
+	if !utf8.ValidString(value) {
+		return fmt.Errorf("%s is not valid UTF-8", name)
+	}
 	for _, r := range value {
-		if r < 0x20 || r == 0x7f {
-			return fmt.Errorf("%s contains a control character", name)
+		if !unicode.IsPrint(r) {
+			return fmt.Errorf("%s contains a non-printable character", name)
 		}
 	}
 	return nil
 }
+
+// Printable reports whether r may appear in a report's free-text fields; the
+// agent strips anything else before it reports.
+func Printable(r rune) bool { return unicode.IsPrint(r) }
 
 func validSource(s string) bool {
 	if s == "" || len(s) > maxSource {

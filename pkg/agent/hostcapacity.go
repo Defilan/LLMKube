@@ -19,6 +19,8 @@ package agent
 import (
 	"strconv"
 	"strings"
+
+	"github.com/defilantech/llmkube/pkg/metalnode"
 )
 
 // maxChipBytes matches the bound the MetalNode controller enforces on
@@ -49,12 +51,13 @@ func hostCapacityFromSysctl(sysctl func(name string) (string, error)) HostCapaci
 	return c
 }
 
-// printablePrefix drops control characters and truncates to limit bytes
-// on a rune boundary.
+// printablePrefix drops every character the controller would reject
+// (metalnode.Printable: controls, bidi and other format characters) and
+// truncates to limit bytes on a rune boundary.
 func printablePrefix(s string, limit int) string {
 	var b strings.Builder
 	for _, r := range s {
-		if r < 0x20 || r == 0x7f {
+		if !metalnode.Printable(r) {
 			continue
 		}
 		if b.Len()+len(string(r)) > limit {
