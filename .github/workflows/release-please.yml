@@ -83,26 +83,13 @@ jobs:
         # hack/macos-sign.sh, the GoReleaser post-build hook for the darwin
         # binaries, signs (and with the notary key, notarizes) them with
         # rcodesign, which runs on Linux (#2084). Pinned by version and
-        # checksum; the tarball holds <name>/rcodesign.
-        # A failed download must not block a release on its own: without
-        # rcodesign the hook dies whenever MACOS_SIGN_P12 is set or
-        # MACOS_SIGNING_REQUIRED is true, and otherwise leaves the binaries
-        # as built, with a warning.
+        # SHA-256 in hack/install-rcodesign.sh: a mismatch fails the release,
+        # while a failed download only warns (the hook then fails if signing
+        # is configured).
         if: ${{ github.event_name == 'push' }}
-        continue-on-error: true
-        env:
-          RCODESIGN_VERSION: 0.29.0
-          RCODESIGN_SHA256: dbe85cedd8ee4217b64e9a0e4c2aef92ab8bcaaa41f20bde99781ff02e600002
         run: |
-          set -euo pipefail
-          name="apple-codesign-${RCODESIGN_VERSION}-x86_64-unknown-linux-musl"
-          url="https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F${RCODESIGN_VERSION}/${name}.tar.gz"
-          tmp="$(mktemp -d)"
-          curl -fsSL --retry 3 -o "$tmp/rcodesign.tar.gz" "$url"
-          echo "${RCODESIGN_SHA256}  $tmp/rcodesign.tar.gz" | sha256sum -c -
-          tar -xzf "$tmp/rcodesign.tar.gz" -C "$tmp"
-          sudo install -m 0755 "$tmp/${name}/rcodesign" /usr/local/bin/rcodesign
-          rcodesign --version
+          ./hack/install-rcodesign.sh "$RUNNER_TEMP/rcodesign"
+          echo "$RUNNER_TEMP/rcodesign" >> "$GITHUB_PATH"
 
       - name: Run GoReleaser
         if: ${{ github.event_name == 'push' }}

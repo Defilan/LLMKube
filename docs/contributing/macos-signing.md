@@ -23,8 +23,10 @@ on the Linux release runner, before anything is archived:
    the finished Mach-O instead (`internal/machoplist`).
 2. [rcodesign](https://github.com/indygreg/apple-platform-rs) signs the
    binary with the identifier above and binds the embedded plist. The release
-   job installs rcodesign 0.29.0, pinned by version and SHA-256, in
-   `.github/workflows/release-please.yml`.
+   job installs rcodesign 0.29.0 with `hack/install-rcodesign.sh`, pinned by
+   version and SHA-256: a download that does not match fails the release, a
+   download that fails only warns (and the hook then fails if signing is
+   configured).
 3. With the notary key set, the binary is zipped, submitted to Apple's notary
    service, and the hook waits up to 20 minutes for the verdict. A rejection
    fails the release, so a signed but rejected binary never ships.
@@ -202,7 +204,9 @@ codesign -dv --verbose=4 llmkube-metal-agent            # Identifier=dev.llmkube
   as built.
 - `make test-scripts` runs `scripts/macos-sign_test.sh`, which checks the hook's
   secret handling with a stubbed rcodesign and, on macOS with rcodesign
-  installed, signs a real binary.
+  installed, signs a real binary, and `scripts/install-rcodesign_test.sh`,
+  which checks that a checksum mismatch fails and a failed download only
+  warns.
 
 ## Changing things
 
@@ -216,6 +220,6 @@ codesign -dv --verbose=4 llmkube-metal-agent            # Identifier=dev.llmkube
   1400 bytes and keeps the templates out of the release archives, which list
   `deployment/macos/` by pattern: a new file there needs a matching pattern.
 - To update rcodesign, change the version and the SHA-256 of the
-  `x86_64-unknown-linux-musl` tarball in the "Install rcodesign" step.
+  `x86_64-unknown-linux-musl` tarball in `hack/install-rcodesign.sh`.
 - A Developer ID certificate is valid for five years. After renewing it,
   export and store the new `.p12` the same way.
