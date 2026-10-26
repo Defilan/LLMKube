@@ -18,6 +18,9 @@ package controller
 
 import (
 	"net/netip"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -260,5 +263,77 @@ func checkVerifierContainerSecurity(t *testing.T, sc *corev1.SecurityContext) {
 	if !reflect.DeepEqual(sc, want) {
 		t.Errorf("container securityContext %+v, want non-root uid %d, read-only root, no escalation, drop ALL and nothing else",
 			sc, initContainerUID)
+	}
+}
+
+// runVerifierScript runs metalNodeVerifierScript with sh, the termination log
+// redirected to a temp file and curl replaced by curlStub, and returns what
+// the log holds when the script ends, however it ends.
+func runVerifierScript(t *testing.T, curlStub string, addrs ...string) string {
+	t.Helper()
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "termination-log")
+	if err := os.WriteFile(filepath.Join(dir, "curl"), []byte("#!/bin/sh\n"+curlStub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := strings.ReplaceAll(metalNodeVerifierScript, "/dev/termination-log", logPath)
+	cmd := exec.Command("sh", append([]string{"-c", script, "metalnode-verify", testIngressPin, "9443"}, addrs...)...)
+	cmd.Env = append(os.Environ(), "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	_ = cmd.Run()
+	raw, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read termination log: %v", err)
+	}
+	return string(raw)
+}
+
+// TestMetalNodeVerifierScriptReportsEachProbe runs the real script: every
+// probe's exit code lands in the termination log, and the controller's parser
+// reads it back.
+func TestMetalNodeVerifierScriptReportsEachProbe(t *testing.T) {
+	sent := []string{"100.64.0.2", "192.168.1.47", "fd7a::2"}
+	// The URL is the last argument: answer by host.
+	msg := runVerifierScript(t, `case "$*" in
+  *100.64.0.2*) exit 0 ;;
+  *192.168.1.47*) exit 7 ;;
+  *) exit 90 ;;
+esac
+`, sent...)
+	got, err := parseVerifierMessage(msg, sent)
+	if err != nil {
+		t.Fatalf("parse the script's log %q: %v", msg, err)
+	}
+	want := map[string]inferencev1alpha1.MetalNodeCandidateResult{
+		"100.64.0.2":   inferencev1alpha1.CandidateReachable,
+		"192.168.1.47": inferencev1alpha1.CandidateRefused,
+		"fd7a::2":      inferencev1alpha1.CandidatePinMismatch,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("results from the script's log %q:\n got %v\nwant %v", msg, got, want)
+	}
+}
+
+// TestMetalNodeVerifierScriptReportsProbesBeforeItIsKilled: a verifier killed
+// part-way (activeDeadlineSeconds, after a slow image pull) still reports the
+// addresses it probed, so a reachable address found before the kill counts.
+// The stub kills the script during the second probe, as the deadline would.
+func TestMetalNodeVerifierScriptReportsProbesBeforeItIsKilled(t *testing.T) {
+	sent := []string{"100.64.0.2", "192.168.1.47", "10.0.0.9"}
+	msg := runVerifierScript(t, `case "$*" in
+  *100.64.0.2*) exit 0 ;;
+  *) kill -KILL "$PPID"; exit 28 ;;
+esac
+`, sent...)
+	got, err := parseVerifierMessage(msg, sent)
+	if err != nil {
+		t.Fatalf("a killed verifier left %q, want the probes it finished: %v", msg, err)
+	}
+	if got["100.64.0.2"] != inferencev1alpha1.CandidateReachable {
+		t.Errorf("100.64.0.2 = %s, want Reachable from the probe that finished before the kill", got["100.64.0.2"])
+	}
+	for _, a := range sent[1:] {
+		if got[a] != inferencev1alpha1.CandidateError {
+			t.Errorf("%s = %s, want Error for an address the killed verifier never finished", a, got[a])
+		}
 	}
 }

@@ -52,7 +52,10 @@ const (
 )
 
 // metalNodeVerifierScript probes each candidate once with the pinned key and
-// writes "<address> <curl exit code>" per line to the termination message.
+// appends "<address> <curl exit code>" to the termination message after each
+// probe, so a verifier the activeDeadlineSeconds kill cuts short (a slow image
+// pull eats into it) still reports every address it checked; the kubelet
+// reads the file however the container ended.
 // -q (first) ignores any .curlrc in the image and --noproxy '*' keeps a
 // cluster-wide proxy setting from testing the proxy path instead of the
 // direct one.
@@ -63,15 +66,13 @@ const (
 // 28 a timeout. Response bodies go to /dev/null and curl's stderr stays in
 // the pod log; neither reaches the MetalNode.
 const metalNodeVerifierScript = `pin="$1"; port="$2"; shift 2
-out=""
+: > /dev/termination-log
 for a in "$@"; do
   case "$a" in *:*) h="[$a]" ;; *) h="$a" ;; esac
   curl -q -sS --noproxy '*' -o /dev/null --max-time 3 --connect-timeout 3 -k --pinnedpubkey "sha256//$pin" "https://$h:$port/health"
   rc=$?
-  out="$out$a $rc
-"
+  printf '%s %s\n' "$a" "$rc" >> /dev/termination-log
 done
-printf '%s' "$out" > /dev/termination-log
 `
 
 // ParseMetalNodeAllowedCIDRs parses --metal-node-allowed-cidrs. Empty entries
