@@ -8,9 +8,9 @@
 #   hack/macos-sign.sh <os> <binary> <version> <identifier> [<plist template>]
 #
 # <os> is GoReleaser's {{ .Os }}; anything but darwin is a no-op. The template
-# is rendered with __VERSION__ replaced by <version> (a leading v stripped)
-# and embedded with cmd/machoplist; the CLI passes no template and only gets
-# the identifier.
+# is rendered with __VERSION__ replaced by the bundle version (<version> with
+# a leading v and any pre-release or build suffix stripped) and embedded with
+# cmd/machoplist; the CLI passes no template and only gets the identifier.
 #
 # Environment (all optional; empty counts as unset):
 #   MACOS_SIGN_P12          base64 Developer ID Application .p12. Unset: the
@@ -50,9 +50,13 @@ os="$1" bin="$2" version="${3#v}" identifier="$4" template="${5:-}"
 
 [[ -f "$bin" ]] || die "binary $bin not found"
 [[ "$identifier" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || die "identifier '$identifier' is not a reverse-DNS bundle identifier"
-# The version lands in the plist XML and in a sed replacement.
-[[ "$version" =~ ^[A-Za-z0-9][A-Za-z0-9.+-]*$ ]] || die "version '$version' has characters outside [A-Za-z0-9.+-]"
 [[ -z "$template" || -f "$template" ]] || die "Info.plist template $template not found"
+# CFBundleVersion and CFBundleShortVersionString take at most three
+# dot-separated integers, so a pre-release or snapshot version (0.11.0-rc.1,
+# 0.10.11-SNAPSHOT-6b120c8) is embedded as its release part. The check also
+# keeps the plist XML and the sed replacement below safe.
+bundle_version="${version%%[-+]*}"
+[[ "$bundle_version" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]] || die "version '$version' does not start with up to three dot-separated integers, which the Info.plist bundle version needs"
 
 # Check the signing configuration before touching the binary: a partial
 # configuration is a mistake to fix, not a reason to ship a weaker binary.
@@ -115,7 +119,7 @@ decode_secret() {
 }
 
 if [[ -n "$template" ]]; then
-  sed "s/__VERSION__/${version}/g" "$template" >"$work/Info.plist"
+  sed "s/__VERSION__/${bundle_version}/g" "$template" >"$work/Info.plist"
   if [[ -n "${MACHOPLIST:-}" ]]; then
     [[ -x "$MACHOPLIST" ]] || die "MACHOPLIST=$MACHOPLIST is not an executable file"
     "$MACHOPLIST" -plist "$work/Info.plist" "$bin"
@@ -125,7 +129,7 @@ if [[ -n "$template" ]]; then
     # A build hook inherits the target's environment; build the tool for the host.
     env -u GOOS -u GOARCH go -C "$repo_root" run ./cmd/machoplist -plist "$work/Info.plist" "$bin_abs"
   fi
-  log "embedded Info.plist ($identifier $version) in $bin"
+  log "embedded Info.plist ($identifier $bundle_version) in $bin"
 fi
 
 if [[ -z "$p12" ]]; then

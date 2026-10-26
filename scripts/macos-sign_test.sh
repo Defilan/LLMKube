@@ -154,6 +154,19 @@ else
   fail "template rendered with the version, leading v stripped" "machoplist '$(calls machoplist)'"
 fi
 
+# --- pre-release and snapshot versions: the release part is the bundle version
+for v in v0.11.0-rc.1:0.11.0 0.10.11-SNAPSHOT-6b120c8:0.10.11 1.2.3+build.7:1.2.3; do
+  bin="$(new_bin)"
+  hook -- darwin "$bin" "${v%%:*}" dev.llmkube.metal-agent "$TEMPLATE"
+  short="$(grep -A1 CFBundleShortVersionString "$CAP/Info.plist" 2>/dev/null | tail -1)"
+  long="$(grep -A1 '<key>CFBundleVersion</key>' "$CAP/Info.plist" 2>/dev/null | tail -1)"
+  if [[ $CODE == 0 && "$short" == *"<string>${v#*:}</string>"* && "$long" == *"<string>${v#*:}</string>"* ]]; then
+    pass "version ${v%%:*}: bundle versions are ${v#*:}"
+  else
+    fail "version ${v%%:*}: bundle versions are ${v#*:}" "exit $CODE, short '$short', long '$long'"
+  fi
+done
+
 # --- no template (the CLI): identifier only -----------------------------------
 bin="$(new_bin)"
 hook -- darwin "$bin" 1.2.3 dev.llmkube.cli
@@ -208,6 +221,15 @@ if [[ $CODE != 0 && "$OUT" == *version* && "$(content "$bin")" == original-binar
 else
   fail "a version that would break the plist XML fails" "exit $CODE"
 fi
+for v in 1.2.3.4 dev 1.2.x; do
+  bin="$(new_bin)"
+  hook -- darwin "$bin" "$v" dev.llmkube.metal-agent "$TEMPLATE"
+  if [[ $CODE != 0 && "$OUT" == *"three dot-separated integers"* && "$(content "$bin")" == original-binary ]]; then
+    pass "version $v, not a valid bundle version, fails"
+  else
+    fail "version $v, not a valid bundle version, fails" "exit $CODE"
+  fi
+done
 bin="$(new_bin)"
 hook -- darwin "$bin" 1.2.3 dev.llmkube.metal-agent "$WORK/missing.tmpl"
 if [[ $CODE != 0 && "$OUT" == *missing.tmpl* && "$(content "$bin")" == original-binary ]]; then
