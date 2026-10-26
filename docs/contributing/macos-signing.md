@@ -27,9 +27,20 @@ on the Linux release runner, before anything is archived:
    version and SHA-256: a download that does not match fails the release, a
    download that fails only warns (and the hook then fails if signing is
    configured).
-3. With the notary key set, the binary is zipped, submitted to Apple's notary
-   service, and the hook waits up to 20 minutes for the verdict. A rejection
-   fails the release, so a signed but rejected binary never ships.
+
+With the notary key set, the `notarize-macos` job runs after the release is
+published: `hack/macos-notarize.sh` reads GoReleaser's `dist/artifacts.json`,
+zips every darwin binary (six today), submits them to Apple's notary service in
+one submission and waits up to an hour for the verdict. Notarization does not
+change the binaries; Apple records a ticket for their signatures, so the
+published assets become notarized when it is accepted. Running it after the
+release keeps a slow notary queue from failing GoReleaser after release-please
+has tagged the release. Until the job succeeds, a downloaded copy fails
+Gatekeeper's check. If it fails or times out, use "Re-run failed jobs" on the
+workflow run: only `notarize-macos` runs again, and it resubmits the same
+binaries. A notary misconfiguration still fails before anything is published:
+the `goreleaser` job checks the settings (`hack/macos-notarize.sh --preflight`)
+before GoReleaser runs.
 
 GoReleaser's own `notarize.macos` step is deliberately not used: it signs with
 the file name as the identifier and does not bind the plist.
@@ -42,7 +53,7 @@ What the secrets select:
 | `MACOS_SIGN_P12`, `MACOS_SIGN_PASSWORD` | Developer ID signature, hardened runtime, secure timestamp       |
 | all five                             | Developer ID signature, notarized                                   |
 | any other combination                | the release fails with the missing variable named                   |
-| anything short of all five, with `MACOS_SIGNING_REQUIRED=true` | the release fails before signing |
+| anything short of all five, with `MACOS_SIGNING_REQUIRED=true` | the release fails before anything is published |
 
 The ad-hoc fallback keeps forks and secret-less runs working: embedding the
 plist breaks the Go linker's own ad-hoc signature, and macOS kills an arm64
@@ -52,11 +63,12 @@ binary whose signature does not verify, so the binary is re-signed either way.
 
 Store them as repository secrets on `defilantech/LLMKube` (Settings, Secrets
 and variables, Actions, Repository secrets). Do not put them in an environment:
-the `goreleaser` job has no `environment:` key, so environment secrets would
-read as empty and the release would quietly fall back to ad-hoc signing. Moving
-them into a protected environment later means adding `environment: <name>` to
-that job in the same change. All five are read from the GoReleaser step's
-environment.
+the `goreleaser` and `notarize-macos` jobs have no `environment:` key, so
+environment secrets would read as empty and the release would quietly fall back
+to ad-hoc signing. Moving them into a protected environment later means adding
+`environment: <name>` to both jobs in the same change. The `.p12` and its
+password reach only the GoReleaser step; the three notary values reach only the
+settings check before it and the `notarize-macos` job.
 
 Once all five are stored (after the local dry run below), set the repository
 variable `MACOS_SIGNING_REQUIRED` to `true` (Settings, Secrets and
@@ -96,9 +108,9 @@ without the variable keep the ad-hoc fallback.
 
 GoReleaser runs only after release-please has tagged a release, so a bad secret
 found there leaves a tagged release without assets. Run the release's own hook
-on a Mac first. It signs, notarizes (a real submission to Apple, a few minutes)
-and checks a freshly built metal-agent, with the values held only by a
-subshell. You need rcodesign 0.29.0: the
+on a Mac first. It signs a freshly built metal-agent with the release's hook,
+notarizes it with the release's notarize step (a real submission to Apple, a
+few minutes) and checks it, with the values held only by a subshell. You need rcodesign 0.29.0: the
 `apple-codesign-0.29.0-aarch64-apple-darwin.tar.gz` release asset (SHA-256
 `d1a532150adaf90048260d76359261aa716abafc45c53c5dc18845029184334a`) or
 `brew install rcodesign`.
@@ -116,15 +128,20 @@ CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags '-s -w' \
   export MACOS_NOTARY_KEY="$(base64 -i AuthKey_<KEYID>.p8)"
   export MACOS_NOTARY_KEY_ID=<KEYID>
   export MACOS_NOTARY_ISSUER_ID=<issuer-id>
+  export MACOS_SIGN_P12_SET=true
   ./hack/macos-sign.sh darwin "$bin" 0.0.0 dev.llmkube.metal-agent \
     deployment/macos/metal-agent.Info.plist.tmpl
+  printf '[{"type":"Binary","goos":"darwin","path":"%s"}]' "$bin" >/tmp/llmkube-sign-test/artifacts.json
+  ./hack/macos-notarize.sh /tmp/llmkube-sign-test/artifacts.json
 )
 codesign -dv --verbose=4 "$bin"
 spctl --assess --type install -vv "$bin"
 "$bin" --version
 ```
 
-The hook should end with `macos-sign: notarized ...`. `codesign` should show
+The hook should print `macos-sign: signed ... with the Developer ID certificate`
+and the notarize step should end with `macos-notarize: notarized 1 darwin
+binary`. `codesign` should show
 `Identifier=dev.llmkube.metal-agent`, `Authority=Developer ID Application: ...`,
 your `TeamIdentifier`, a `Timestamp`, the `runtime` flag and
 `Info.plist entries=9`. `spctl` should print `accepted` and
@@ -178,8 +195,11 @@ rm developer-id.p12 developer-id-legacy.p12 AuthKey_<KEYID>.p8
 Use the `.p12` file that passed the dry run (the `-legacy` one if you
 re-encoded it).
 
-The hook decodes the secrets into a private temporary directory, passes them to
-rcodesign as files, never prints them, and removes the directory when it exits.
+The hook and the notarize step decode the secrets into a private temporary
+directory, pass them to rcodesign as files, never print them, and remove the
+directory when they exit. A process killed with SIGKILL (a job cancelled past
+its grace period) cannot run that cleanup; the release jobs run on ephemeral
+GitHub-hosted runners, which are discarded afterwards.
 
 ## Stapling and Gatekeeper
 
@@ -204,9 +224,10 @@ codesign -dv --verbose=4 llmkube-metal-agent            # Identifier=dev.llmkube
   as built.
 - `make test-scripts` runs `scripts/macos-sign_test.sh`, which checks the hook's
   secret handling with a stubbed rcodesign and, on macOS with rcodesign
-  installed, signs a real binary, and `scripts/install-rcodesign_test.sh`,
-  which checks that a checksum mismatch fails and a failed download only
-  warns.
+  installed, signs a real binary; `scripts/macos-notarize_test.sh`, which
+  checks the single submission and the notary settings; and
+  `scripts/install-rcodesign_test.sh`, which checks that a checksum mismatch
+  fails and a failed download only warns.
 
 ## Changing things
 

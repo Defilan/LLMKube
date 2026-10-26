@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 #
-# Installs the pinned rcodesign into <dir> for the release job (#2084):
-# hack/macos-sign.sh signs and notarizes the darwin binaries with it.
+# Installs the pinned rcodesign into <dir> for the release jobs (#2084):
+# hack/macos-sign.sh signs the darwin binaries with it and
+# hack/macos-notarize.sh submits them to Apple's notary service.
 #
 #   hack/install-rcodesign.sh <dir>
 #
 # A failed download is not fatal on its own: without rcodesign the sign hook
-# fails whenever MACOS_SIGN_P12 is set or MACOS_SIGNING_REQUIRED is true, and
-# otherwise the darwin binaries are left as built, with a warning. A download that does not match
+# fails whenever MACOS_SIGN_P12 is set or MACOS_SIGNING_REQUIRED is true, the
+# notarize step fails whenever the notary key is set, and otherwise the darwin
+# binaries are left as built, with a warning. A download that does not match
 # the pinned SHA-256 always fails: it is not rcodesign 0.29.0, and must not run
 # with the signing secrets.
 #

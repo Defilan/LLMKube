@@ -47,6 +47,8 @@ with a Developer ID certificate and notarized by Apple:
 The first shows `Identifier=dev.llmkube.metal-agent`, `Info.plist entries=9`,
 the `runtime` flag and the Developer ID authority; the second reports
 `source=Notarized Developer ID`. A bare executable cannot have its notarization
-ticket stapled, so Gatekeeper checks it online on first launch. A release built
+ticket stapled, so Gatekeeper checks it online on first launch. Notarization is
+submitted after the release is published and usually completes within minutes;
+until then `spctl` rejects the binary. A release built
 without the secrets is ad-hoc signed (`Signature=adhoc`). Maintainers: see
 [Signing and notarizing the macOS binaries](../contributing/macos-signing.md).

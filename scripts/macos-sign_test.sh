@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # Regression test for hack/macos-sign.sh, the GoReleaser post-build hook that
-# embeds an Info.plist into the darwin binaries and signs (and notarizes) them.
+# embeds an Info.plist into the darwin binaries and signs them. Notarization is
+# hack/macos-notarize.sh, tested by scripts/macos-notarize_test.sh.
 #
 # The stubbed cases run anywhere: `rcodesign`, `go` and the machoplist tool are
 # replaced by scripts that record their arguments, so the test pins which
@@ -49,13 +50,6 @@ case "$sub" in
         *) printf 'SIGNED' >>"$1"; shift ;;
       esac
     done ;;
-  encode-app-store-connect-api-key)
-    [[ "$1" == "-o" ]] || exit 3
-    out="$2"; cp "$5" "$CAP/p8"; perm_of "$5" >"$CAP/p8.perm"
-    echo '{"stub":true}' >"$out" ;;
-  notary-submit)
-    zipf="${*: -1}"
-    unzip -Z1 "$zipf" >"$CAP/zip.list" ;;
 esac
 SH
 
@@ -83,6 +77,8 @@ P12_B64="$(printf '%s' "$P12_RAW" | base64)"
 PASSWORD='s3cret-pass-value'
 P8_RAW='-----BEGIN PRIVATE KEY-----fake-----END PRIVATE KEY-----'
 P8_B64="$(printf '%s' "$P8_RAW" | base64 | tr -d '\n')"
+SIGN=(MACOS_SIGN_P12="$P12_B64" MACOS_SIGN_PASSWORD="$PASSWORD")
+NOTARY=(MACOS_NOTARY_KEY="$P8_B64" MACOS_NOTARY_KEY_ID=KEYID123 MACOS_NOTARY_ISSUER_ID=issuer-uuid)
 
 fails=0
 pass() { echo "ok   - $1"; }
@@ -208,12 +204,8 @@ misconfig() {
 }
 misconfig "P12 without a password fails" "MACOS_SIGN_PASSWORD" MACOS_SIGN_P12="$P12_B64"
 misconfig "password without a P12 fails" "MACOS_SIGN_P12" MACOS_SIGN_PASSWORD="$PASSWORD"
-misconfig "partial notary configuration fails" "MACOS_NOTARY_ISSUER_ID" \
-  MACOS_SIGN_P12="$P12_B64" MACOS_SIGN_PASSWORD="$PASSWORD" MACOS_NOTARY_KEY="$P8_B64" MACOS_NOTARY_KEY_ID=KEYID123
-misconfig "notary key without a signing certificate fails" "MACOS_SIGN_P12" \
-  MACOS_NOTARY_KEY="$P8_B64" MACOS_NOTARY_KEY_ID=KEYID123 MACOS_NOTARY_ISSUER_ID=issuer-uuid
 misconfig "P12 with rcodesign missing fails" "rcodesign" \
-  RCODESIGN=rcodesign-not-installed MACOS_SIGN_P12="$P12_B64" MACOS_SIGN_PASSWORD="$PASSWORD"
+  RCODESIGN=rcodesign-not-installed "${SIGN[@]}"
 bin="$(new_bin)"
 hook -- darwin "$bin" '1.2.3</string><key>x' dev.llmkube.metal-agent "$TEMPLATE"
 if [[ $CODE != 0 && "$OUT" == *version* && "$(content "$bin")" == original-binary ]]; then
@@ -238,9 +230,9 @@ else
   fail "a missing template fails" "exit $CODE"
 fi
 
-# --- Developer ID signing, no notary key ----------------------------------------
+# --- Developer ID signing ------------------------------------------------------
 bin="$(new_bin)"
-hook MACOS_SIGN_P12="$P12_B64" MACOS_SIGN_PASSWORD="$PASSWORD" -- darwin "$bin" 1.2.3 dev.llmkube.metal-agent "$TEMPLATE"
+hook "${SIGN[@]}" -- darwin "$bin" 1.2.3 dev.llmkube.metal-agent "$TEMPLATE"
 p12path="$(cat "$CAP/p12.path" 2>/dev/null || true)"
 want_re="^sign --p12-file [^ ]+ --p12-password-file [^ ]+ --binary-identifier dev\.llmkube\.metal-agent --code-signature-flags runtime --for-notarization $bin\$"
 if [[ $CODE == 0 && "$(calls rcodesign)" =~ $want_re ]]; then
@@ -264,52 +256,31 @@ if no_secrets_in_output && [[ "$(calls rcodesign)" != *"$PASSWORD"* ]]; then
 else
   fail "P12: no secret value printed or passed on the command line" "secret leaked"
 fi
-if [[ "$(calls rcodesign)" != *notary-submit* && "$OUT" == *"not notarized"* ]]; then
-  pass "P12 without notary key: signed, not submitted, and says so"
-else
-  fail "P12 without notary key: signed, not submitted, and says so" "rcodesign '$(calls rcodesign)'"
-fi
 
-# --- Developer ID signing + notarization -----------------------------------------
-NOTARY=(MACOS_SIGN_P12="$P12_B64" MACOS_SIGN_PASSWORD="$PASSWORD" MACOS_NOTARY_KEY="$P8_B64"
-  MACOS_NOTARY_KEY_ID=KEYID123 MACOS_NOTARY_ISSUER_ID=issuer-uuid)
+# --- the hook never notarizes: one submission after the release does ------------
 bin="$(new_bin)"
-hook "${NOTARY[@]}" -- darwin "$bin" 1.2.3 dev.llmkube.metal-agent "$TEMPLATE"
-encode_re="^encode-app-store-connect-api-key -o ([^ ]+) issuer-uuid KEYID123 [^ ]+\$"
-submit_re="^notary-submit --api-key-file ([^ ]+) --wait --max-wait-seconds 1200 [^ ]+\.zip\$"
+hook MACOS_SIGNING_REQUIRED=true "${SIGN[@]}" "${NOTARY[@]}" -- darwin "$bin" 1.2.3 dev.llmkube.metal-agent "$TEMPLATE"
 rc_lines=()
 while IFS= read -r line; do rc_lines+=("$line"); done < <(calls rcodesign)
-if [[ $CODE == 0 && ${#rc_lines[@]} == 3 && "${rc_lines[0]}" == sign* && "${rc_lines[1]}" =~ $encode_re ]]; then
-  keyjson="${BASH_REMATCH[1]}"
-  if [[ "${rc_lines[2]}" =~ $submit_re && "${BASH_REMATCH[1]}" == "$keyjson" ]]; then
-    pass "notary: key encoded, then the signed binary submitted with --wait"
-  else
-    fail "notary: key encoded, then the signed binary submitted with --wait" "'${rc_lines[2]}'"
-  fi
+if [[ $CODE == 0 && ${#rc_lines[@]} == 1 && "${rc_lines[0]}" == "sign --p12-file "* && "$OUT" == *macos-notarize.sh* ]] && no_secrets_in_output; then
+  pass "notary key set: the hook signs only and leaves notarization to macos-notarize.sh"
 else
-  fail "notary: key encoded, then the signed binary submitted with --wait" "exit $CODE, rcodesign '$(calls rcodesign)'"
-fi
-if [[ "$(cat "$CAP/p8" 2>/dev/null)" == "$P8_RAW" && "$(cat "$CAP/p8.perm")" == 600 \
-  && "$(cat "$CAP/zip.list" 2>/dev/null)" == llmkube-metal-agent ]] && no_secrets_in_output; then
-  pass "notary: .p8 decoded owner-only, zip holds just the binary, no secret printed"
-else
-  fail "notary: .p8 decoded owner-only, zip holds just the binary, no secret printed" "zip '$(cat "$CAP/zip.list" 2>/dev/null)'"
+  fail "notary key set: the hook signs only and leaves notarization to macos-notarize.sh" "exit $CODE, rcodesign '$(calls rcodesign)'"
 fi
 
 # --- MACOS_SIGNING_REQUIRED=true: no silent downgrade -----------------------------
 misconfig "required, no secrets: fails" "MACOS_SIGN_P12" MACOS_SIGNING_REQUIRED=true
-misconfig "required, P12 without the notary key: fails" "MACOS_NOTARY_KEY" \
-  MACOS_SIGNING_REQUIRED=true MACOS_SIGN_P12="$P12_B64" MACOS_SIGN_PASSWORD="$PASSWORD"
-misconfig "required, everything set but rcodesign missing: fails" "rcodesign" \
-  MACOS_SIGNING_REQUIRED=true RCODESIGN=rcodesign-not-installed "${NOTARY[@]}"
+misconfig "required, notary key but no P12: fails" "MACOS_SIGN_P12" MACOS_SIGNING_REQUIRED=true "${NOTARY[@]}"
+misconfig "required, P12 set but rcodesign missing: fails" "rcodesign" \
+  MACOS_SIGNING_REQUIRED=true RCODESIGN=rcodesign-not-installed "${SIGN[@]}"
 misconfig "required set to an unrecognized value: fails" "MACOS_SIGNING_REQUIRED" \
-  MACOS_SIGNING_REQUIRED=yes "${NOTARY[@]}"
+  MACOS_SIGNING_REQUIRED=yes "${SIGN[@]}"
 bin="$(new_bin)"
-hook MACOS_SIGNING_REQUIRED=true "${NOTARY[@]}" -- darwin "$bin" 1.2.3 dev.llmkube.metal-agent "$TEMPLATE"
-if [[ $CODE == 0 && "$(calls rcodesign)" == *notary-submit* ]]; then
-  pass "required, everything set: signs and notarizes"
+hook MACOS_SIGNING_REQUIRED=true "${SIGN[@]}" -- darwin "$bin" 1.2.3 dev.llmkube.metal-agent "$TEMPLATE"
+if [[ $CODE == 0 && "$(calls rcodesign)" == "sign --p12-file "* ]]; then
+  pass "required, P12 set: signs with the Developer ID"
 else
-  fail "required, everything set: signs and notarizes" "exit $CODE, rcodesign '$(calls rcodesign)'"
+  fail "required, P12 set: signs with the Developer ID" "exit $CODE, rcodesign '$(calls rcodesign)'"
 fi
 bin="$(new_bin)"
 hook MACOS_SIGNING_REQUIRED=true -- linux "$bin" 1.2.3 dev.llmkube.cli
@@ -328,14 +299,7 @@ fi
 
 # --- failures propagate -----------------------------------------------------------
 bin="$(new_bin)"
-hook RC_FAIL=notary-submit "${NOTARY[@]}" -- darwin "$bin" 1.2.3 dev.llmkube.metal-agent "$TEMPLATE"
-if [[ $CODE != 0 && "$OUT" == *notariz* ]]; then
-  pass "a rejected notarization fails the hook"
-else
-  fail "a rejected notarization fails the hook" "exit $CODE"
-fi
-bin="$(new_bin)"
-hook RC_FAIL=sign MACOS_SIGN_P12="$P12_B64" MACOS_SIGN_PASSWORD="$PASSWORD" -- darwin "$bin" 1.2.3 dev.llmkube.metal-agent "$TEMPLATE"
+hook RC_FAIL=sign "${SIGN[@]}" -- darwin "$bin" 1.2.3 dev.llmkube.metal-agent "$TEMPLATE"
 if [[ $CODE != 0 && "$OUT" == *"stub rcodesign: sign failed"* ]] && no_secrets_in_output; then
   pass "a signing failure fails the hook and shows rcodesign's error"
 else

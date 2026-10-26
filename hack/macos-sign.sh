@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 #
 # GoReleaser post-build hook for the darwin binaries (#2084): embeds an
-# Info.plist as a __TEXT,__info_plist section, signs the binary with
-# rcodesign, and notarizes it when an App Store Connect key is configured.
-# It runs on the Linux release runner, so it uses rcodesign, not Xcode.
+# Info.plist as a __TEXT,__info_plist section and signs the binary with
+# rcodesign. It runs on the Linux release runner, so it uses rcodesign, not
+# Xcode. Notarization is a separate job after the release is published
+# (hack/macos-notarize.sh): every darwin binary goes to Apple in one
+# submission, and a slow notary queue cannot fail the build.
 #
 #   hack/macos-sign.sh <os> <binary> <version> <identifier> [<plist template>]
 #
@@ -17,21 +19,21 @@
 #                           binary is ad-hoc signed (it runs, but Gatekeeper
 #                           treats it as unidentified).
 #   MACOS_SIGN_PASSWORD     password for the .p12; required with it.
-#   MACOS_NOTARY_KEY        base64 App Store Connect API key (.p8)
-#   MACOS_NOTARY_KEY_ID     its key ID
-#   MACOS_NOTARY_ISSUER_ID  its issuer ID. All three or none; they need the .p12.
 #   MACHOPLIST              prebuilt machoplist binary (the release builds it
 #                           once in a before hook); unset: go run ./cmd/machoplist.
 #   RCODESIGN               rcodesign to use (default: rcodesign on PATH).
-#   MACOS_SIGNING_REQUIRED  true: fail unless the .p12, its password and the
-#                           notary key are all set (no ad-hoc fallback).
+#   MACOS_SIGNING_REQUIRED  true: fail unless the .p12 and its password are set
+#                           (no ad-hoc fallback). hack/macos-notarize.sh checks
+#                           the notary key against the same switch.
 #
 # Without rcodesign and without MACOS_SIGN_P12 the binary is left exactly as
 # built, with a warning: embedding the plist breaks the Go linker's ad-hoc
 # signature, and macOS kills an arm64 binary whose signature does not verify.
 #
-# Secrets are decoded into a private temp directory that is removed on exit,
-# passed to rcodesign as files, and never printed. Do not run this with -x.
+# Secrets are decoded into a private temp directory, passed to rcodesign as
+# files, and never printed; the directory is removed when the hook exits (not
+# when it is killed with SIGKILL, which no trap can catch; the release runs on
+# ephemeral runners). Do not run this with -x.
 set -euo pipefail
 
 log() { echo "macos-sign: $*" >&2; }
@@ -62,28 +64,14 @@ bundle_version="${version%%[-+]*}"
 # configuration is a mistake to fix, not a reason to ship a weaker binary.
 p12="${MACOS_SIGN_P12:-}"
 password="${MACOS_SIGN_PASSWORD:-}"
-notary_missing=()
-for v in MACOS_NOTARY_KEY MACOS_NOTARY_KEY_ID MACOS_NOTARY_ISSUER_ID; do
-  [[ -n "${!v:-}" ]] || notary_missing+=("$v")
-done
-notarize=false
-case ${#notary_missing[@]} in
-  0) notarize=true ;;
-  3) ;;
-  *) die "notarization needs MACOS_NOTARY_KEY, MACOS_NOTARY_KEY_ID and MACOS_NOTARY_ISSUER_ID together; missing: ${notary_missing[*]}" ;;
-esac
 [[ -n "$p12" || -z "$password" ]] || die "MACOS_SIGN_PASSWORD is set but MACOS_SIGN_P12 is empty"
 [[ -z "$p12" || -n "$password" ]] || die "MACOS_SIGN_P12 is set but MACOS_SIGN_PASSWORD is empty"
-[[ -n "$p12" || $notarize == false ]] || die "the notary key is set but MACOS_SIGN_P12 is empty: notarization needs a Developer ID signature"
 
 # Once the secrets exist the release must not quietly fall back to an ad-hoc
-# or un-notarized binary (a secret renamed, deleted or out of the job's scope
-# reads as empty), so the maintainer sets MACOS_SIGNING_REQUIRED=true.
+# binary (a secret renamed, deleted or out of the job's scope reads as empty),
+# so the maintainer sets MACOS_SIGNING_REQUIRED=true.
 case "${MACOS_SIGNING_REQUIRED:-}" in
-  true)
-    [[ -n "$p12" ]] || die "MACOS_SIGNING_REQUIRED=true but MACOS_SIGN_P12 is empty"
-    [[ $notarize == true ]] || die "MACOS_SIGNING_REQUIRED=true but the notary key is not set: missing ${notary_missing[*]}"
-    ;;
+  true) [[ -n "$p12" ]] || die "MACOS_SIGNING_REQUIRED=true but MACOS_SIGN_P12 is empty" ;;
   false | "") ;;
   *) die "MACOS_SIGNING_REQUIRED must be true, false or empty, not '${MACOS_SIGNING_REQUIRED}'" ;;
 esac
@@ -145,24 +133,4 @@ re-encode it with openssl pkcs12 -legacy, see \"rcodesign rejects the .p12\" in 
 rc sign --p12-file "$work/cert.p12" --p12-password-file "$work/p12.password" \
   --binary-identifier "$identifier" --code-signature-flags runtime --for-notarization "$bin"
 rm -f "$work/cert.p12" "$work/p12.password"
-log "signed $bin as $identifier with the Developer ID certificate"
-
-if [[ $notarize == false ]]; then
-  log "notary key not set: $bin is signed but not notarized"
-  exit 0
-fi
-
-command -v zip >/dev/null 2>&1 || die "zip not found; it is required to submit $bin for notarization"
-decode_secret MACOS_NOTARY_KEY "$work/key.p8"
-if ! "$rcodesign" encode-app-store-connect-api-key -o "$work/key.json" \
-  "$MACOS_NOTARY_ISSUER_ID" "$MACOS_NOTARY_KEY_ID" "$work/key.p8" >/dev/null 2>&1; then
-  die "rcodesign could not encode the App Store Connect API key (check MACOS_NOTARY_KEY, MACOS_NOTARY_KEY_ID, MACOS_NOTARY_ISSUER_ID)"
-fi
-rm -f "$work/key.p8"
-zip -q -j "$work/submit.zip" "$bin"
-log "submitting $bin for notarization (waiting up to 20 minutes)"
-if ! "$rcodesign" notary-submit --api-key-file "$work/key.json" \
-  --wait --max-wait-seconds 1200 "$work/submit.zip" >&2; then
-  die "notarization of $bin failed or was rejected; see the notary log above"
-fi
-log "notarized $bin (bare executables cannot be stapled; Gatekeeper checks the ticket online)"
+log "signed $bin as $identifier with the Developer ID certificate (hack/macos-notarize.sh notarizes it after the release)"
