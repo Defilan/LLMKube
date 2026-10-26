@@ -390,6 +390,7 @@ func (r *MetalNodeReconciler) reconcileDialBack(ctx context.Context, mn *inferen
 		return wait, toDelete, nil
 	}
 
+	prev := st.Verification.DeepCopy()
 	v := verification(mn)
 	started := metav1.NewTime(now)
 	v.LastStartTime = &started
@@ -398,13 +399,38 @@ func (r *MetalNodeReconciler) reconcileDialBack(ctx context.Context, mn *inferen
 	if err := controllerutil.SetControllerReference(mn, pod, r.Scheme); err != nil {
 		return 0, toDelete, fmt.Errorf("own verifier pod: %w", err)
 	}
-	if err := r.Create(ctx, pod); err != nil {
+	if err := r.Create(ctx, pod); apierrors.IsAlreadyExists(err) {
+		return r.verifierExists(ctx, mn, prev, pod.Name, hash, now, toDelete)
+	} else if err != nil {
 		r.recordVerifierFailure(mn, hash, now,
 			"the controller could not create the verifier pod; see the controller log")
 		return metalNodeVerifierPollInterval, toDelete, fmt.Errorf("create verifier pod %s: %w", pod.Name, err)
 	}
 	v.PodUID = string(pod.UID)
 	log.FromContext(ctx).V(1).Info("started MetalNode dial-back", "pod", pod.Name, "candidates", len(addrs))
+	return metalNodeVerifierPollInterval, toDelete, nil
+}
+
+// verifierExists handles a verifier create that found the pod's name taken.
+// The name follows the inputs, so a verifier this MetalNode owns is already
+// checking them and the pod list has not caught up: that is a running check,
+// and status.verification stays as it was (it may track that very pod). A pod
+// of that name this MetalNode does not own blocks every check for these
+// inputs, which Reachable says.
+func (r *MetalNodeReconciler) verifierExists(ctx context.Context, mn *inferencev1alpha1.MetalNode,
+	prev *inferencev1alpha1.MetalNodeVerification, name, hash string, now time.Time,
+	toDelete []corev1.Pod) (time.Duration, []corev1.Pod, error) {
+	existing := &corev1.Pod{}
+	if err := r.APIReader.Get(ctx, types.NamespacedName{Namespace: mn.Namespace, Name: name}, existing); err != nil {
+		mn.Status.Verification = prev
+		return metalNodeVerifierPollInterval, toDelete, fmt.Errorf("get existing verifier pod %s: %w", name, err)
+	}
+	if owner := metav1.GetControllerOf(existing); owner == nil || owner.UID != mn.UID {
+		r.recordVerifierFailure(mn, hash, now, fmt.Sprintf(
+			"pod %s, the verifier's name for these inputs, exists and is not owned by this MetalNode; delete it", name))
+		return metalNodeVerifierPollInterval, toDelete, nil
+	}
+	mn.Status.Verification = prev
 	return metalNodeVerifierPollInterval, toDelete, nil
 }
 

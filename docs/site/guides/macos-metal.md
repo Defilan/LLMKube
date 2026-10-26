@@ -654,7 +654,7 @@ on schedule does not wake the controller; its 60 s resync does.
 | `Reachable` | `NoneReachable` | No candidate answered with the pinned key; see `status.candidates`. |
 | `Reachable` | `NoCandidates` | No reported address is inside the allowed CIDRs. |
 | `Reachable` | `PinMissing` | The agent reports no ingress pin (legacy mode). |
-| `Reachable` | `VerifierFailed` | The verifier pod could not be created, failed, or never finished (check the controller log, `spec.verifier` placement and the image pull). |
+| `Reachable` | `VerifierFailed` | The verifier pod could not be created, failed, or never finished (check the controller log, `spec.verifier` placement and the image pull), or a pod this MetalNode does not own holds the verifier's name. |
 | `Reachable` | `VerificationPending` | `Unknown`: the pin or port changed, or the verified address is no longer offered, so the last result no longer applies; `hostIP` is empty until the new check lands. |
 | `Reachable` | `AgentNotConnected` | `Unknown`: the agent is not connected, so nothing is dialed and `hostIP` is empty. |
 | `Reachable` | `InvalidSpec` | `spec.hostIP` is not an IP address; nothing is dialed until it is fixed. |
