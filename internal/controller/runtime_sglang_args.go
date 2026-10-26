@@ -114,11 +114,14 @@ func sglangAppendAttentionBackend(args []string, backend string) []string {
 	return args
 }
 
-// sglangAppendEnablePrefixCaching: only emit when user explicitly opted in (true).
-// SGLang's own default handles nil/false.
-func sglangAppendEnablePrefixCaching(args []string, enabled *bool) []string {
-	if enabled != nil && *enabled {
-		return append(args, "--enable-prefix-caching")
+// sglangAppendEnablePrefixCaching maps enablePrefixCaching onto SGLang's
+// RadixAttention switch. SGLang has no --enable-prefix-caching (that is vLLM's
+// flag) and exits on it (#2218): the cache is on by default and turned off with
+// --disable-radix-cache. So only false emits a flag, and not when extraArgs
+// already does.
+func sglangAppendEnablePrefixCaching(args []string, enabled *bool, extraArgs []string) []string {
+	if enabled != nil && !*enabled && !hasMatchingExtraArg(extraArgs, "disable-radix-cache") {
+		return append(args, "--disable-radix-cache")
 	}
 	return args
 }

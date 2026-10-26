@@ -2125,9 +2125,10 @@ type SGLangConfig struct {
 	// +optional
 	AttentionBackend string `json:"attentionBackend,omitempty"`
 
-	// EnablePrefixCaching turns on RadixAttention automatic prefix caching.
-	// Headline feature for agentic workloads with shared system-prompt +
-	// tool-definition + repo-context prefixes. Maps to SGLang --enable-prefix-caching.
+	// EnablePrefixCaching controls RadixAttention automatic prefix caching,
+	// the headline feature for agentic workloads with shared system-prompt +
+	// tool-definition + repo-context prefixes. SGLang enables it by default, so
+	// true and unset render no flag; false maps to SGLang --disable-radix-cache.
 	// +optional
 	EnablePrefixCaching *bool `json:"enablePrefixCaching,omitempty"`
 

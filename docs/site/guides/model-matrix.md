@@ -269,7 +269,7 @@ GPU-only. Choose when:
 
 - Your workload re-sends a large shared prefix every turn (foreman tool loops,
   multi-turn chat with a stable system prompt + tool definitions). SGLang's
-  RadixAttention (`--enable-prefix-caching`) serves the shared prefix from a
+  RadixAttention (on by default) serves the shared prefix from a
   tree-structured cache rather than reprocessing it.
 - You want speculative decoding (EAGLE / EAGLE3) or tool-call / reasoning
   parsers that vLLM doesn't ship with first-class CRD fields.
