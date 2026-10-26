@@ -186,8 +186,9 @@ func NewMetalCommand() *cobra.Command {
 		Long: `Manage the Macs that run the LLMKube Metal agent.
 
 An admin creates a short-lived, single-use join string for a Mac with
-'llmkube metal token create <mac>'; the Mac uses it to set up the agent.
-'llmkube metal remove <mac>' revokes the Mac.`,
+'llmkube metal token create <mac>'; on the Mac, 'llmkube metal join <string>'
+uses it to set up the agent. 'llmkube metal leave' undoes that on the Mac,
+and 'llmkube metal remove <mac>' revokes the Mac in the cluster.`,
 	}
 	token := &cobra.Command{
 		Use:   "token",
@@ -196,5 +197,7 @@ An admin creates a short-lived, single-use join string for a Mac with
 	token.AddCommand(newMetalTokenCreateCommand())
 	cmd.AddCommand(token)
 	cmd.AddCommand(newMetalRemoveCommand())
+	cmd.AddCommand(newMetalJoinCommand())
+	cmd.AddCommand(newMetalLeaveCommand())
 	return cmd
 }

@@ -1,0 +1,498 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package cli
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"encoding/pem"
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	authenticationv1 "k8s.io/api/authentication/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
+	"github.com/defilantech/llmkube/pkg/metaljoin"
+)
+
+// fakeMac stands in for the Mac join and leave run on: a temporary home, a
+// llmkube-metal-agent on PATH, and a launchctl that records its calls.
+type fakeMac struct {
+	home     string
+	agentBin string
+	calls    []string
+	failOn   string
+}
+
+func newFakeMac(t *testing.T) *fakeMac {
+	t.Helper()
+	m := &fakeMac{home: t.TempDir()}
+	m.agentBin = filepath.Join(t.TempDir(), "bin", metalAgentBinary)
+	if err := os.MkdirAll(filepath.Dir(m.agentBin), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(m.agentBin, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	prev := newMetalHost
+	newMetalHost = func() (metalHost, error) {
+		return metalHost{
+			goos: "darwin",
+			home: m.home,
+			uid:  501,
+			launchctl: func(_ context.Context, args ...string) error {
+				call := strings.Join(args, " ")
+				m.calls = append(m.calls, call)
+				if m.failOn != "" && strings.HasPrefix(call, m.failOn) {
+					return errors.New("launchctl failed")
+				}
+				return nil
+			},
+			lookPath: func(name string) (string, error) {
+				if name == metalAgentBinary {
+					return m.agentBin, nil
+				}
+				return "", exec.ErrNotFound
+			},
+			executable: func() (string, error) { return filepath.Join(m.home, "llmkube"), nil },
+		}, nil
+	}
+	t.Cleanup(func() { newMetalHost = prev })
+	return m
+}
+
+func (m *fakeMac) paths() metalAgentPaths { return newMetalAgentPaths(m.home) }
+
+// issueJoinString runs token create for mac-a and returns the join string
+// and its payload.
+func issueJoinString(t *testing.T, ns string) (string, metaljoin.Payload) {
+	t.Helper()
+	stdout, stderr, err := runMetal(t, "token", "create", "mac-a", "-n", ns)
+	if err != nil {
+		t.Fatalf("token create: %v\n%s", err, stderr)
+	}
+	first, _, _ := strings.Cut(stdout, "\n")
+	return strings.TrimPrefix(first, "llmkube metal join "), decodeJoinLine(t, stdout)
+}
+
+// markReachable stands in for the MetalNode controller's verdict.
+func markReachable(t *testing.T, c client.Client, ns string) {
+	t.Helper()
+	mn := &inferencev1alpha1.MetalNode{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "mac-a"}, mn); err != nil {
+		t.Fatal(err)
+	}
+	mn.Status.HostIP, mn.Status.IngressPort = "100.64.0.2", 9443
+	meta.SetStatusCondition(&mn.Status.Conditions, metav1.Condition{
+		Type:   inferencev1alpha1.MetalNodeConditionAgentConnected,
+		Status: metav1.ConditionTrue, Reason: inferencev1alpha1.MetalNodeReasonHeartbeatFresh, Message: "fresh"})
+	meta.SetStatusCondition(&mn.Status.Conditions, metav1.Condition{
+		Type:   inferencev1alpha1.MetalNodeConditionReachable,
+		Status: metav1.ConditionTrue, Reason: inferencev1alpha1.MetalNodeReasonDialBackSucceeded, Message: "reached"})
+	if err := c.Status().Update(context.Background(), mn); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func authenticatedAs(t *testing.T, cfg *rest.Config) (string, error) {
+	t.Helper()
+	scheme, err := metalScheme()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := client.New(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatal(err)
+	}
+	review := &authenticationv1.SelfSubjectReview{}
+	if err := c.Create(context.Background(), review); err != nil {
+		return "", err
+	}
+	return review.Status.UserInfo.Username, nil
+}
+
+func fileMode(t *testing.T, path string) os.FileMode {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	return info.Mode().Perm()
+}
+
+// TestMetalJoinSetsUpTheAgent runs token create and join end to end against
+// a real API server: the agent's kubeconfig reads a token of the Mac's own
+// ServiceAccount from a 0600 file and trusts only the cluster CA, the join
+// Secret is gone so the string stops working, and the LaunchAgent starts the
+// agent with renewal on.
+func TestMetalJoinSetsUpTheAgent(t *testing.T) {
+	_, c, ns := metalEnvtest(t)
+	mac := newFakeMac(t)
+	joinString, p := issueJoinString(t, ns)
+	markReachable(t, c, ns)
+
+	stdout, stderr, err := runMetal(t, "join", joinString, "--wait", "30s")
+	if err != nil {
+		t.Fatalf("join: %v\nstderr: %s", err, stderr)
+	}
+	paths := mac.paths()
+	if !strings.Contains(stderr, "CA pin: "+p.Pin) {
+		t.Errorf("join does not print the CA pin to compare: %q", stderr)
+	}
+	if !strings.Contains(stdout, "100.64.0.2:9443") {
+		t.Errorf("join does not say where the cluster reaches the Mac: %q", stdout)
+	}
+	agentToken, err := os.ReadFile(paths.Token)
+	if err != nil {
+		t.Fatalf("read the agent's token: %v", err)
+	}
+	for _, secret := range []string{p.Token, string(agentToken)} {
+		if strings.Contains(stdout+stderr, secret) {
+			t.Error("join printed a token")
+		}
+	}
+	for path, want := range map[string]os.FileMode{paths.Dir: 0o700, paths.Token: 0o600, paths.Kubeconfig: 0o600} {
+		if got := fileMode(t, path); got != want {
+			t.Errorf("%s mode %o, want %o", path, got, want)
+		}
+	}
+
+	assertAgentKubeconfig(t, paths, p, ns)
+	if life, ok := jwtLifetime(string(agentToken)); !ok || life < metalAgentTokenLifetimeDefault-time.Minute {
+		t.Errorf("agent token lifetime %s (ok %t), want the %s default", life, ok, metalAgentTokenLifetimeDefault)
+	}
+
+	joinSecret := types.NamespacedName{Namespace: ns, Name: "llmkube-metal-mac-a-join"}
+	err = c.Get(context.Background(), joinSecret, &corev1.Secret{})
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("join Secret after join: %v, want NotFound", err)
+	}
+	assertMetalAgentPlist(t, mac, paths, ns)
+}
+
+// assertAgentKubeconfig checks the kubeconfig as the agent loads it: through
+// clientcmd, which is also what the agent's config.GetConfig uses.
+func assertAgentKubeconfig(t *testing.T, paths metalAgentPaths, p metaljoin.Payload, ns string) {
+	t.Helper()
+	kc, err := clientcmd.LoadFromFile(paths.Kubeconfig)
+	if err != nil {
+		t.Fatalf("load the agent's kubeconfig: %v", err)
+	}
+	ctxCfg := kc.Contexts[kc.CurrentContext]
+	if ctxCfg == nil || ctxCfg.Namespace != ns {
+		t.Fatalf("current context %+v, want namespace %s", ctxCfg, ns)
+	}
+	user, cluster := kc.AuthInfos[ctxCfg.AuthInfo], kc.Clusters[ctxCfg.Cluster]
+	if user.Token != "" || user.TokenFile != paths.Token || user.ClientCertificateData != nil || user.Exec != nil {
+		t.Errorf("kubeconfig user %+v, want only tokenFile %s", user, paths.Token)
+	}
+	wantCA := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: p.CA})
+	if cluster.Server != p.Server || !bytes.Equal(cluster.CertificateAuthorityData, wantCA) ||
+		cluster.InsecureSkipTLSVerify {
+		t.Errorf("kubeconfig cluster %s (insecure %t), want %s with the join string's CA", cluster.Server,
+			cluster.InsecureSkipTLSVerify, p.Server)
+	}
+
+	// The agent's --renew-service-account-token renews exactly this file.
+	cfg, err := clientcmd.BuildConfigFromFlags("", paths.Kubeconfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.BearerTokenFile != paths.Token {
+		t.Errorf("the agent's rest config reads its token from %q, want %s", cfg.BearerTokenFile, paths.Token)
+	}
+	user2, err := authenticatedAs(t, cfg)
+	if want := "system:serviceaccount:" + ns + ":llmkube-metal-mac-a"; err != nil || user2 != want {
+		t.Errorf("the agent's kubeconfig authenticates as %q (%v), want %q", user2, err, want)
+	}
+}
+
+func assertMetalAgentPlist(t *testing.T, mac *fakeMac, paths metalAgentPaths, ns string) {
+	t.Helper()
+	raw, err := os.ReadFile(paths.Plist)
+	if err != nil {
+		t.Fatalf("read the LaunchAgent: %v", err)
+	}
+	var args []string
+	inArgs := false
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case line == "<key>ProgramArguments</key>":
+			inArgs = true
+		case inArgs && line == "</array>":
+			inArgs = false
+		case inArgs && strings.HasPrefix(line, "<string>"):
+			args = append(args, strings.TrimSuffix(strings.TrimPrefix(line, "<string>"), "</string>"))
+		}
+	}
+	want := []string{mac.agentBin, "--kubeconfig", paths.Kubeconfig, "--namespace", ns, "--metal-node", "mac-a",
+		"--renew-service-account-token", "--log-level", "info"}
+	if strings.Join(args, "\x00") != strings.Join(want, "\x00") {
+		t.Errorf("agent arguments %q, want %q", args, want)
+	}
+	if plutil, err := exec.LookPath("plutil"); err == nil {
+		if out, err := exec.Command(plutil, "-lint", paths.Plist).CombinedOutput(); err != nil {
+			t.Errorf("plutil -lint: %v: %s", err, out)
+		}
+	}
+	wantCalls := []string{"bootout gui/501/" + metalAgentLabel, "bootstrap gui/501 " + paths.Plist}
+	if strings.Join(mac.calls, "; ") != strings.Join(wantCalls, "; ") {
+		t.Errorf("launchctl calls %q, want %q", mac.calls, wantCalls)
+	}
+}
+
+// TestMetalJoinStringIsSingleUse: once join has deleted the join Secret, the
+// join token stops authenticating (after the API server's ~10 s cache of a
+// successful authentication), and a second join says the string is used up.
+func TestMetalJoinStringIsSingleUse(t *testing.T) {
+	cfg, c, ns := metalEnvtest(t)
+	newFakeMac(t)
+	joinString, p := issueJoinString(t, ns)
+	markReachable(t, c, ns)
+	if _, stderr, err := runMetal(t, "join", joinString, "--wait", "0"); err != nil {
+		t.Fatalf("join: %v\n%s", err, stderr)
+	}
+
+	joinCfg := rest.AnonymousClientConfig(cfg)
+	joinCfg.BearerToken = p.Token
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		_, err := authenticatedAs(t, joinCfg)
+		if apierrors.IsUnauthorized(err) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the join token still authenticates 30s after join deleted its Secret (err %v)", err)
+		}
+		time.Sleep(time.Second)
+	}
+	_, _, err := runMetal(t, "join", joinString, "--wait", "0")
+	if err == nil || !strings.Contains(err.Error(), "expired or was already used") {
+		t.Errorf("second join: err = %v, want the string reported as used", err)
+	}
+}
+
+// TestMetalJoinRefusesBeforeAnyChange: a tampered string, a missing agent
+// binary, or another OS stop join before it writes a file, calls launchctl
+// or redeems the token.
+func TestMetalJoinRefusesBeforeAnyChange(t *testing.T) {
+	_, c, ns := metalEnvtest(t)
+	joinString, p := issueJoinString(t, ns)
+	tamperedString := tamperedJoinString(t, p)
+
+	for _, tc := range []struct {
+		name  string
+		setup func(*fakeMac)
+		args  []string
+		want  string
+	}{
+		{"CA that does not match its pin", nil, []string{"join", tamperedString}, "pin"},
+		{"no agent binary", func(m *fakeMac) { _ = os.Remove(m.agentBin) }, []string{"join", joinString}, metalAgentBinary},
+		{"agent binary flag not executable", func(m *fakeMac) {
+			_ = os.Chmod(m.agentBin, 0o644) //nolint:gosec // G302: not executable on purpose
+		},
+			[]string{"join", joinString, "--agent-binary", "AGENT"}, "not an executable"},
+		{"short token lifetime", nil, []string{"join", joinString, "--token-lifetime", "5m"}, "10m"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mac := newFakeMac(t)
+			if tc.setup != nil {
+				tc.setup(mac)
+			}
+			for i, a := range tc.args {
+				tc.args[i] = strings.ReplaceAll(a, "AGENT", mac.agentBin)
+			}
+			_, _, err := runMetal(t, tc.args...)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("join: err = %v, want a refusal mentioning %q", err, tc.want)
+			}
+			if entries, _ := os.ReadDir(mac.home); len(entries) != 0 || len(mac.calls) != 0 {
+				t.Errorf("a refused join wrote %v and ran launchctl %q", entries, mac.calls)
+			}
+		})
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "llmkube-metal-mac-a-join"},
+		&corev1.Secret{}); err != nil {
+		t.Errorf("a refused join used up the join string: get join Secret: %v", err)
+	}
+
+	prev := newMetalHost
+	newMetalHost = func() (metalHost, error) { return metalHost{goos: "linux", home: t.TempDir()}, nil }
+	defer func() { newMetalHost = prev }()
+	if _, _, err := runMetal(t, "join", joinString); err == nil || !strings.Contains(err.Error(), "runs on the Mac") {
+		t.Errorf("join on linux: err = %v, want a refusal", err)
+	}
+}
+
+// tamperedJoinString is p with its pin replaced, the way a string altered
+// on the way would arrive: everything else intact, the CA no longer matching.
+func tamperedJoinString(t *testing.T, p metaljoin.Payload) string {
+	t.Helper()
+	raw, err := json.Marshal(map[string]any{"v": metaljoin.Version, "server": p.Server, "ca": p.CA,
+		"pin": "sha256:" + strings.Repeat("0", 64), "tlsServerName": p.TLSServerName,
+		"namespace": p.Namespace, "mac": p.Mac, "token": p.Token})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return metaljoin.Prefix + base64.RawURLEncoding.EncodeToString(raw)
+}
+
+// TestMetalJoinWaitTimesOutAndSaysWhy: when the cluster never verifies the
+// Mac, join fails after --wait with the conditions it last saw, and leaves
+// the agent installed to keep trying.
+func TestMetalJoinWaitTimesOutAndSaysWhy(t *testing.T) {
+	_, _, ns := metalEnvtest(t)
+	mac := newFakeMac(t)
+	joinString, _ := issueJoinString(t, ns)
+	_, _, err := runMetal(t, "join", joinString, "--wait", "3s")
+	if err == nil || !strings.Contains(err.Error(), "not Reachable within 3s") ||
+		!strings.Contains(err.Error(), "keeps trying") {
+		t.Fatalf("join: err = %v, want a timeout that says the agent keeps trying", err)
+	}
+	if _, err := os.Stat(mac.paths().Plist); err != nil {
+		t.Errorf("the LaunchAgent is gone after a timed-out wait: %v", err)
+	}
+}
+
+// TestMetalLeaveUndoesJoin: leave stops the LaunchAgent, removes the plist
+// and the agent's credentials, keeps the rest of the state directory, and
+// says how to revoke the Mac in the cluster.
+func TestMetalLeaveUndoesJoin(t *testing.T) {
+	_, c, ns := metalEnvtest(t)
+	mac := newFakeMac(t)
+	joinString, _ := issueJoinString(t, ns)
+	markReachable(t, c, ns)
+	if _, stderr, err := runMetal(t, "join", joinString, "--wait", "0"); err != nil {
+		t.Fatalf("join: %v\n%s", err, stderr)
+	}
+	paths := mac.paths()
+	identity := filepath.Join(paths.Dir, "ingress", "ingress-key.pem")
+	if err := os.MkdirAll(filepath.Dir(identity), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(identity, []byte("key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mac.calls = nil
+
+	stdout, _, err := runMetal(t, "leave")
+	if err != nil {
+		t.Fatalf("leave: %v", err)
+	}
+	for _, f := range []string{paths.Plist, paths.Kubeconfig, paths.Token} {
+		if _, err := os.Stat(f); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s after leave: %v, want removed", f, err)
+		}
+	}
+	if _, err := os.Stat(identity); err != nil {
+		t.Errorf("leave removed the agent's ingress identity: %v", err)
+	}
+	if len(mac.calls) != 1 || mac.calls[0] != "bootout gui/501/"+metalAgentLabel {
+		t.Errorf("launchctl calls %q, want the agent booted out", mac.calls)
+	}
+	if !strings.Contains(stdout, "llmkube metal remove mac-a -n "+ns) {
+		t.Errorf("leave does not say how to revoke the Mac: %q", stdout)
+	}
+
+	stdout, _, err = runMetal(t, "leave")
+	if err != nil || !strings.Contains(stdout, "has not joined") {
+		t.Errorf("second leave: %q, %v; want nothing to remove", stdout, err)
+	}
+}
+
+func TestRenderMetalAgentPlistEscapes(t *testing.T) {
+	home := t.TempDir()
+	odd := filepath.Join(home, "R&D <models>", metalAgentBinary)
+	raw, err := renderMetalAgentPlist([]string{odd, "--namespace", "macs"}, home, filepath.Join(home, "a&b.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "R&amp;D &lt;models&gt;") || strings.Contains(string(raw), "R&D <models>") {
+		t.Errorf("a path with & and < is not escaped:\n%s", raw)
+	}
+	if plutil, err := exec.LookPath("plutil"); err == nil {
+		path := filepath.Join(home, "agent.plist")
+		if err := os.WriteFile(path, raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if out, err := exec.Command(plutil, "-lint", path).CombinedOutput(); err != nil {
+			t.Errorf("plutil -lint: %v: %s", err, out)
+		}
+	}
+}
+
+func TestFindMetalAgentBinary(t *testing.T) {
+	// Resolved, as findMetalAgentBinary resolves the llmkube symlink (macOS's
+	// temp directory is under the /var symlink).
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	exe := func(name string) string {
+		p := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	onPath := exe("path/" + metalAgentBinary)
+	beside := exe("cellar/bin/" + metalAgentBinary)
+	llmkube := exe("cellar/bin/llmkube")
+	link := filepath.Join(dir, "brew-bin-llmkube")
+	if err := os.Symlink(llmkube, link); err != nil {
+		t.Fatal(err)
+	}
+	host := func(path string) metalHost {
+		return metalHost{
+			lookPath: func(string) (string, error) {
+				if path == "" {
+					return "", exec.ErrNotFound
+				}
+				return path, nil
+			},
+			executable: func() (string, error) { return link, nil },
+		}
+	}
+	if got, err := findMetalAgentBinary(host(onPath), ""); err != nil || got != onPath {
+		t.Errorf("on PATH: %q, %v; want %s", got, err, onPath)
+	}
+	if got, err := findMetalAgentBinary(host(""), ""); err != nil || got != beside {
+		t.Errorf("next to the symlinked llmkube: %q, %v; want %s", got, err, beside)
+	}
+	if _, err := findMetalAgentBinary(host(""), filepath.Join(dir, "missing")); err == nil {
+		t.Error("a missing --agent-binary was accepted")
+	}
+}
