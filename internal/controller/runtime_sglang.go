@@ -194,7 +194,7 @@ func (b *SGLangBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, mode
 		args = sglangAppendQuantization(args, cfg.Quantization)
 		args = sglangAppendKVCacheDtype(args, cfg.KVCacheDtype, cfg.KVCacheCustomDtype)
 		args = sglangAppendAttentionBackend(args, cfg.AttentionBackend)
-		args = sglangAppendEnablePrefixCaching(args, cfg.EnablePrefixCaching)
+		args = sglangAppendEnablePrefixCaching(args, cfg.EnablePrefixCaching, isvc.Spec.ExtraArgs)
 		args = sglangAppendToolCallParser(args, cfg.ToolCallParser)
 		args = sglangAppendReasoningParser(args, cfg.ReasoningParser)
 		args = sglangAppendChatTemplate(args, cfg.ChatTemplate)

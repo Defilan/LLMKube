@@ -34,7 +34,7 @@ var sglangFlagsNeverInBase = []string{
 	"--tp", "--ep", "--dp", "--context-length", "--mem-fraction-static",
 	"--chunked-prefill-size", "--max-running-requests", "--quantization",
 	"--kv-cache-dtype", "--attention-backend", "--enable-prefix-caching",
-	"--tool-call-parser", "--reasoning-parser", "--chat-template",
+	"--disable-radix-cache", "--tool-call-parser", "--reasoning-parser", "--chat-template",
 	"--speculative-algorithm", "--speculative-accept-threshold-single",
 	"--speculative-accept-threshold-acc",
 	// SGLang v0.5.15 calls the flag `--lora-paths`, NOT vLLM's
@@ -383,20 +383,23 @@ func TestSGLangBuildArgs(t *testing.T) {
 		},
 		{
 			model: &inferencev1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: "m"}},
-			name:  "enablePrefixCaching=true emits flag",
+			// SGLang has no --enable-prefix-caching and exits on it (#2218);
+			// RadixAttention is already on.
+			name: "enablePrefixCaching=true emits no flag",
 			spec: &inferencev1alpha1.InferenceServiceSpec{
 				Runtime:      "sglang",
 				SGLangConfig: &inferencev1alpha1.SGLangConfig{EnablePrefixCaching: ptrBool(true)},
 			},
-			contains: []FlagCheck{{"--enable-prefix-caching", ""}},
+			notContains: []string{"--enable-prefix-caching", "--disable-radix-cache"},
 		},
 		{
 			model: &inferencev1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: "m"}},
-			name:  "enablePrefixCaching=false does not emit flag",
+			name:  "enablePrefixCaching=false emits --disable-radix-cache",
 			spec: &inferencev1alpha1.InferenceServiceSpec{
 				Runtime:      "sglang",
 				SGLangConfig: &inferencev1alpha1.SGLangConfig{EnablePrefixCaching: ptrBool(false)},
 			},
+			contains:    []FlagCheck{{"--disable-radix-cache", ""}},
 			notContains: []string{"--enable-prefix-caching"},
 		},
 		{
@@ -640,11 +643,10 @@ func TestSGLangBuildArgs(t *testing.T) {
 				{"--quantization", "fp8"},
 				{"--kv-cache-dtype", "fp8_e5m2"},
 				{"--attention-backend", "flashinfer"},
-				{"--enable-prefix-caching", ""},
 				{"--tool-call-parser", "qwen3"},
 				{"--reasoning-parser", "qwen3"},
 			},
-			notContains: []string{"--model"},
+			notContains: []string{"--model", "--enable-prefix-caching", "--disable-radix-cache"},
 		},
 	}
 
@@ -674,6 +676,25 @@ func TestSGLangBuildArgs(t *testing.T) {
 
 // TestSGLangBuildArgsDeterministic verifies BuildArgs emits flags in the
 // same order across calls so Deployment .spec diffs stay quiet.
+// A user's own --disable-radix-cache is not repeated by enablePrefixCaching:
+// false.
+func TestSGLangBuildArgs_DisableRadixCacheInExtraArgs(t *testing.T) {
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			Runtime:      "sglang",
+			ModelRef:     "m",
+			SGLangConfig: &inferencev1alpha1.SGLangConfig{EnablePrefixCaching: ptrBool(false)},
+			ExtraArgs:    []string{"--disable-radix-cache"},
+		},
+	}
+	model := &inferencev1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: "m"}}
+	args := (&SGLangBackend{}).BuildArgs(isvc, model, "/models/m", "", 30000)
+	if n := countFlagAnyForm(args, "--disable-radix-cache"); n != 1 {
+		t.Errorf("--disable-radix-cache appears %d times, want 1: %v", n, args)
+	}
+}
+
 func TestSGLangBuildArgsDeterministic(t *testing.T) {
 	backend := &SGLangBackend{}
 	model := &inferencev1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: "m"}}
