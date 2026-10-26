@@ -540,3 +540,54 @@ func TestMetalNodeReachableNotStaleAfterInputChange(t *testing.T) {
 		t.Errorf("hostIP = %q after adding a candidate, want the verified 100.64.0.2 kept", mn.Status.HostIP)
 	}
 }
+
+// TestMetalNodeReportFactsClearedWithoutAValidReport: the agent's version,
+// capacity, ingress pin and port stay in status only while a valid report
+// backs them. An invalid report or a deleted Lease clears them (a deleted
+// Lease is what llmkube metal remove leaves); a stale but valid report keeps
+// them as the last known facts.
+func TestMetalNodeReportFactsClearedWithoutAValidReport(t *testing.T) {
+	f := newMetalNodeFixture(t)
+	f.createMetalNode("mac-facts", nil)
+	report := encodeReport(t, testReport(metalnode.Candidate{Address: "100.64.0.2", Source: metalnode.SourceTailnet}))
+	f.putLease("mac-facts", f.now, report)
+	f.reconcile("mac-facts")
+	wantFacts := func(step string, present bool) {
+		t.Helper()
+		st := f.get("mac-facts").Status
+		has := st.AgentVersion != "" || st.Capacity != nil || st.IngressSPKI != "" || st.IngressPort != 0
+		full := st.AgentVersion == "0.11.0" && st.Capacity != nil && st.IngressSPKI == testIngressPin && st.IngressPort == 9443
+		if present && !full {
+			t.Errorf("%s: version %q capacity %+v pin %q port %d, want the report's facts", step, st.AgentVersion, st.Capacity, st.IngressSPKI, st.IngressPort)
+		}
+		if !present && has {
+			t.Errorf("%s: version %q capacity %+v pin %q port %d, want all cleared", step, st.AgentVersion, st.Capacity, st.IngressSPKI, st.IngressPort)
+		}
+	}
+	wantFacts("valid report", true)
+
+	f.putLease("mac-facts", f.now, "not-a-report")
+	f.reconcile("mac-facts")
+	wantCondition(t, f.get("mac-facts"), inferencev1alpha1.MetalNodeConditionAgentConnected, metav1.ConditionFalse,
+		inferencev1alpha1.MetalNodeReasonReportInvalid)
+	wantFacts("invalid report", false)
+
+	f.putLease("mac-facts", f.now, report)
+	f.reconcile("mac-facts")
+	wantFacts("valid report again", true)
+
+	f.now = f.now.Add(time.Hour)
+	f.reconcile("mac-facts")
+	wantCondition(t, f.get("mac-facts"), inferencev1alpha1.MetalNodeConditionAgentConnected, metav1.ConditionFalse,
+		inferencev1alpha1.MetalNodeReasonHeartbeatStale)
+	wantFacts("stale heartbeat", true)
+
+	lease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: "mac-facts", Namespace: testNS}}
+	if err := f.c.Delete(context.Background(), lease); err != nil {
+		t.Fatal(err)
+	}
+	f.reconcile("mac-facts")
+	wantCondition(t, f.get("mac-facts"), inferencev1alpha1.MetalNodeConditionAgentConnected, metav1.ConditionFalse,
+		inferencev1alpha1.MetalNodeReasonLeaseNotFound)
+	wantFacts("Lease deleted", false)
+}

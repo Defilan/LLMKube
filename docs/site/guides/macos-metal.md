@@ -601,7 +601,10 @@ will use.
 
 While `AgentConnected` is not True, nothing is dialed: `Reachable`
 is `Unknown` (reason `AgentNotConnected`), `status.hostIP` is
-cleared, and any verifier pod is deleted. `status.lastHeartbeatTime`
+cleared, and any verifier pod is deleted. When the Lease is missing or
+its report is invalid, the agent's reported facts (`agentVersion`,
+`capacity`, `ingressPort`, `ingressSPKI`) are cleared too; a stale but
+valid report keeps them as the last known facts. `status.lastHeartbeatTime`
 is accurate to about a minute: it advances when `AgentConnected`
 changes or when it is more than 60 seconds behind the Lease, which
 holds the exact time. A Lease update that only advances `renewTime`

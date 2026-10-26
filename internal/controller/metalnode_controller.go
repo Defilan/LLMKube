@@ -201,14 +201,19 @@ func (r *MetalNodeReconciler) setCondition(mn *inferencev1alpha1.MetalNode, cond
 
 // observeLease reads the agent's Lease, sets AgentConnected, advances
 // lastHeartbeatTime (throttled) and copies a valid report's facts into
-// status. It returns the report when it is valid (stale or not) and whether
-// the heartbeat is fresh. Messages never quote the agent's values.
+// status. Without a valid report (no Lease, or a report that does not
+// decode) the facts are cleared: nothing current backs them, and they carry
+// no time of their own. A stale but valid report keeps them as the last
+// known facts, dated by lastHeartbeatTime. It returns the report when it is
+// valid (stale or not) and whether the heartbeat is fresh. Messages never
+// quote the agent's values.
 func (r *MetalNodeReconciler) observeLease(ctx context.Context, mn *inferencev1alpha1.MetalNode, now time.Time) (*metalnode.Report, bool, error) {
 	wasConnected := meta.IsStatusConditionTrue(mn.Status.Conditions, inferencev1alpha1.MetalNodeConditionAgentConnected)
 	lease := &coordinationv1.Lease{}
 	key := types.NamespacedName{Namespace: mn.Namespace, Name: mn.Spec.LeaseName}
 	if err := r.APIReader.Get(ctx, key, lease); err != nil {
 		if apierrors.IsNotFound(err) {
+			copyReportFacts(&mn.Status, metalnode.Report{})
 			r.setCondition(mn, inferencev1alpha1.MetalNodeConditionAgentConnected, metav1.ConditionFalse,
 				inferencev1alpha1.MetalNodeReasonLeaseNotFound,
 				fmt.Sprintf("Lease %s not found; create it with llmkube metal token create", key))
@@ -220,6 +225,8 @@ func (r *MetalNodeReconciler) observeLease(ctx context.Context, mn *inferencev1a
 	obs := evaluateLease(lease, key, now)
 	if obs.report != nil {
 		copyReportFacts(&mn.Status, *obs.report)
+	} else {
+		copyReportFacts(&mn.Status, metalnode.Report{})
 	}
 	r.setCondition(mn, inferencev1alpha1.MetalNodeConditionAgentConnected, obs.status, obs.reason, obs.message)
 	connected := obs.status == metav1.ConditionTrue
