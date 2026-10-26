@@ -70,6 +70,13 @@ For OpenShift clusters, add `-f values-openshift.yaml`
 
 ## Step 3: Install and start the Metal Agent
 
+With `llmkube` on your admin machine and `llmkube` and
+`llmkube-metal-agent` on the Mac, two commands do this step and the
+RBAC part of step 4: `llmkube metal token create <mac>` where you have
+cluster access, then the `llmkube metal join` line it prints, on the
+Mac. See [Join a Mac](#join-a-mac). The rest of this step sets the
+agent up by hand.
+
 Clone the operator repo on your Mac and check out the release that
 matches the operator Helm installed:
 
@@ -687,11 +694,20 @@ sees your cluster credentials:
    `-o json` prints `joinCommand`, `expiresAt`, `caPin`, `namespace`
    and `mac` for scripts.
 
-2. **On the Mac**, `llmkube metal join <join-string>` sets up the
-   agent with that identity. `join` is the Mac side of
-   [#2232](https://github.com/defilantech/LLMKube/issues/2232) and
-   ships separately; this section covers what the admin side creates
-   and how to revoke it.
+2. **On the Mac**, with `llmkube` and `llmkube-metal-agent`
+   installed, paste that line:
+
+   ```bash
+   llmkube metal join llmkube://eyJ2IjoxLCJzZXJ2ZXIiOi...
+   # joining Mac mac-studio in namespace default at https://100.64.0.1:6443
+   # CA pin: sha256:a5fee586b3b05aaff494d200d4c072e2e37126eaef344e2f295ad87479272655 (compare it with ...)
+   # ...
+   # Mac mac-studio joined: the cluster reaches it at 100.64.0.5:9443 (log: ~/Library/Logs/llmkube/metal-agent.log)
+   ```
+
+   It sets up and starts the agent with the Mac's own identity and
+   returns once the cluster has verified it can reach the Mac. See
+   [On the Mac: join and leave](#on-the-mac-join-and-leave).
 
 The join string carries the API server URL, the cluster's CA
 certificate, the CA's pin, the namespace, the Mac's name and a join
@@ -785,7 +801,8 @@ or delete them first.
   `llmkube metal remove <mac>` (that revokes every token for the Mac
 within ~10 seconds)
   and then `token create` again.
-- **Checked before anything is created.** The command reads the API
+- **Checked before anything is created.** The command checks every
+  field of the join string, then reads the API
   server's certificate and verifies it against your kubeconfig's CA.
   It refuses a kubeconfig with `insecure-skip-tls-verify` or no CA,
   since the Mac would have nothing to trust. When the server address
@@ -802,6 +819,60 @@ within ~10 seconds)
 | `--tls-server-name` | automatic | Name the Mac verifies the certificate against. It must be in the certificate. |
 | `-o`, `--output` | `text` | `text` or `json`. |
 
+### On the Mac: join and leave
+
+`llmkube metal join <join-string>` runs on the Mac (it refuses to run
+elsewhere). In order:
+
+1. Decodes the string and checks the CA against its pin, then prints
+   the pin. Compare it with the one `token create` printed.
+2. Finds `llmkube-metal-agent`: `--agent-binary`, else on `PATH`,
+   else next to `llmkube` (a release archive, a Homebrew prefix).
+3. With the join token, which trusts only the string's CA, mints the
+   agent's own token for the Mac's ServiceAccount (`--token-lifetime`,
+   7 days by default).
+4. Writes that token and a kubeconfig that reads it through
+   `tokenFile`, both `0600`, in
+   `~/Library/Application Support/llmkube/metal-agent/` (`0700`; the
+   agent's state directory, which also holds its ingress identity).
+5. Checks the new credentials can read the Mac's MetalNode, then
+   deletes the join Secret: the join string stops working (within
+   ~10 seconds, as above). A failure before this step leaves the
+   string usable, so you can fix the cause and run `join` again.
+6. Writes `~/Library/LaunchAgents/com.llmkube.metal-agent.plist`
+   (an existing one is kept as `.plist.bak`) and starts it with
+   `launchctl bootstrap`. The agent runs with `--kubeconfig`,
+   `--namespace`, `--metal-node` and `--renew-service-account-token`,
+   and logs to `~/Library/Logs/llmkube/metal-agent.log`.
+7. Waits up to `--wait` (3 minutes; `0` does not wait) for the
+   MetalNode to report `Reachable`, printing each change of
+   `AgentConnected` and `Reachable`. If the wait runs out, `join`
+   fails with the last conditions it saw and leaves the agent
+   installed and retrying.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--agent-binary` | on `PATH`, else next to `llmkube` | Path to `llmkube-metal-agent`. |
+| `--llama-server` | the agent finds it | Path to `llama-server`, passed to the agent. |
+| `--token-lifetime` | `168h` (7 days) | Lifetime of the agent's token (at least `10m`). |
+| `--wait` | `3m` | How long to wait for `Reachable`; `0` returns once the agent is started. |
+
+**The agent renews its own token.** With
+`--renew-service-account-token`, the agent requests a new token for
+its own ServiceAccount at half the current one's lifetime and
+replaces the token file; client-go re-reads the file, so nothing
+restarts. The API server may issue a shorter token than asked for
+(`--service-account-max-token-expiration`); `join` warns, and renewal
+follows the token's real lifetime. A Mac that is off for longer than
+the token's lifetime cannot renew it: run `token create` and `join`
+again. Running `join` again on a Mac replaces its setup.
+
+`llmkube metal leave` undoes `join` on the Mac: it stops the
+LaunchAgent and removes its plist, the kubeconfig and the token. The
+ingress identity and the model store stay. It does not revoke
+anything; the token stays valid until it expires, so also run
+`llmkube metal remove` where you have cluster access.
+
 ### Revoking a Mac
 
 ```bash
@@ -817,7 +888,7 @@ deletes the per-Mac Role, both RoleBindings, the Lease, the join
 Secret and the MetalNode, and prints each one it removed. It never
 deletes the shared `llmkube-metal-agent` Role, and objects that are
 already gone are skipped, so running it twice is fine. It does not
-touch the Mac itself; stop the agent there.
+touch the Mac itself; run `llmkube metal leave` there.
 
 `remove` deletes only objects labeled
 `inference.llmkube.dev/metal-node=<mac>`. Anything else with one of
