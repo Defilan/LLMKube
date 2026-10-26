@@ -37,6 +37,30 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
+// fakeStatScript is a stat that answers -f as the named filesystem would and
+// defers everything else to the real stat ($REAL_STAT). "unavailable" is an
+// init image whose stat has no -f.
+func fakeStatScript(fs string) string {
+	stub := "#!/bin/sh\nif [ \"$1\" = -f ]; then "
+	if fs == "unavailable" {
+		stub += "exit 1"
+	} else {
+		// BusyBox does not name FUSE, but both implementations
+		// report the Linux filesystem magic through %t.
+		magic, name := "65735546", "fuseblk"
+		switch fs {
+		case "fuse":
+			name = "fuse"
+		case "busybox-fuse":
+			name = "UNKNOWN"
+		case "ext4":
+			magic, name = "ef53", "ext2/ext3"
+		}
+		stub += "if [ \"$3\" = %t ]; then echo " + magic + "; else echo " + name + "; fi"
+	}
+	return stub + "; else exec \"$REAL_STAT\" \"$@\"; fi\n"
+}
+
 func TestMultiFileFUSEStaging(t *testing.T) {
 	requireInitShellEnvironment(t)
 	realStat, err := exec.LookPath("stat")
@@ -80,25 +104,7 @@ func TestMultiFileFUSEStaging(t *testing.T) {
 				}
 				dir := t.TempDir()
 				bin := t.TempDir()
-				stub := "#!/bin/sh\nif [ \"$1\" = -f ]; then "
-				if fs == "unavailable" {
-					stub += "exit 1"
-				} else {
-					// BusyBox does not name FUSE, but both implementations
-					// report the Linux filesystem magic through %t.
-					magic, name := "65735546", "fuseblk"
-					switch fs {
-					case "fuse":
-						name = "fuse"
-					case "busybox-fuse":
-						name = "UNKNOWN"
-					case "ext4":
-						magic, name = "ef53", "ext2/ext3"
-					}
-					stub += "if [ \"$3\" = %t ]; then echo " + magic + "; else echo " + name + "; fi"
-				}
-				stub += "; else exec \"$REAL_STAT\" \"$@\"; fi\n"
-				if err := os.WriteFile(filepath.Join(bin, "stat"), []byte(stub), 0o755); err != nil {
+				if err := os.WriteFile(filepath.Join(bin, "stat"), []byte(fakeStatScript(fs)), 0o755); err != nil {
 					t.Fatal(err)
 				}
 				sentinel := filepath.Join(dir, "orphan.tmp")
@@ -114,7 +120,9 @@ func TestMultiFileFUSEStaging(t *testing.T) {
 				}
 				cmd.Env = append(cmd.Env, "CACHE_DIR="+dir, "PATH="+bin+":"+os.Getenv("PATH"), "REAL_STAT="+realStat)
 				out, err := cmd.CombinedOutput()
-				if (!prefetch && fs != "ext4") || fs == "unavailable" {
+				// A stat without -f stages under the lock, as before FUSE
+				// detection, rather than failing on every filesystem (#2253).
+				if !prefetch && fs != "ext4" && fs != "unavailable" {
 					if err == nil {
 						t.Fatalf("unsafe staging succeeded: %s", out)
 					}
@@ -136,6 +144,15 @@ func TestMultiFileFUSEStaging(t *testing.T) {
 					}
 					if got := readOrFail(t, filepath.Join(dir, "model.safetensors")); got != string(origin.content()) {
 						t.Error("prefetch published incorrect bytes")
+					}
+					if fs == "unavailable" {
+						if !strings.Contains(string(out), "WARNING: cannot determine the cache filesystem") ||
+							strings.Contains(string(out), "ModelCacheLockUnsupported") {
+							t.Errorf("stat without -f: want the warning and no ModelCacheLockUnsupported diagnosis: %s", out)
+						}
+						if _, err := os.Stat(filepath.Join(dir, ".llmkube-download.lock")); err != nil {
+							t.Errorf("stat without -f must stage under the directory lock: %v", err)
+						}
 					}
 				}
 			})

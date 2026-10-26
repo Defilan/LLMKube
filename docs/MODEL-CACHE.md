@@ -125,6 +125,9 @@ multi-file artifacts on FUSE mounts. Warm caches remain usable, including
 when the origin is offline; the serving downloader does not sweep temporary
 files or create a lock file on these mounts. Detection uses the Linux FUSE
 magic value, which also covers virtiofs (including Kata Containers volumes).
+It reads the magic with `stat -f`; a custom init image whose `stat` lacks
+`-f` cannot detect FUSE, so it stages under the directory lock as before and
+logs a warning, which leaves a FUSE cache unprotected across nodes.
 The filesystem type alone cannot establish cross-node locking support.
 A refusal sets `ModelTransferHealthy=False` with reason
 `ModelCacheLockUnsupported` and a remedy in the condition message.
