@@ -112,20 +112,26 @@ type metalAgentPaths struct {
 	Kubeconfig string
 	Token      string
 	Plist      string
-	LogDir     string
-	Log        string
+	// PlistBackup keeps the plist join replaced. It is not next to the
+	// plist: launchd reads LaunchAgents at login, and a copy there with the
+	// same Label could start the agent with the old arguments, even after
+	// llmkube metal leave.
+	PlistBackup string
+	LogDir      string
+	Log         string
 }
 
 func newMetalAgentPaths(home string) metalAgentPaths {
 	dir := filepath.Join(home, "Library", "Application Support", "llmkube", "metal-agent")
 	logDir := filepath.Join(home, "Library", "Logs", "llmkube")
 	return metalAgentPaths{
-		Dir:        dir,
-		Kubeconfig: filepath.Join(dir, "kubeconfig"),
-		Token:      filepath.Join(dir, "token"),
-		Plist:      filepath.Join(home, "Library", "LaunchAgents", metalAgentLabel+".plist"),
-		LogDir:     logDir,
-		Log:        filepath.Join(logDir, "metal-agent.log"),
+		Dir:         dir,
+		Kubeconfig:  filepath.Join(dir, "kubeconfig"),
+		Token:       filepath.Join(dir, "token"),
+		Plist:       filepath.Join(home, "Library", "LaunchAgents", metalAgentLabel+".plist"),
+		PlistBackup: filepath.Join(dir, metalAgentLabel+".plist.bak"),
+		LogDir:      logDir,
+		Log:         filepath.Join(logDir, "metal-agent.log"),
 	}
 }
 
@@ -444,7 +450,7 @@ func metalAgentArgs(agentBin string, paths metalAgentPaths, p metaljoin.Payload,
 
 // installMetalAgent writes the LaunchAgent plist and (re)starts it. An
 // existing plist, from an earlier join or make install-metal-agent, is kept
-// as <plist>.bak.
+// as paths.PlistBackup.
 func installMetalAgent(ctx context.Context, host metalHost, paths metalAgentPaths, args []string, log io.Writer) error {
 	if err := os.MkdirAll(paths.LogDir, 0o700); err != nil {
 		return fmt.Errorf("create %s: %w", paths.LogDir, err)
@@ -453,10 +459,13 @@ func installMetalAgent(ctx context.Context, host metalHost, paths metalAgentPath
 		return fmt.Errorf("create %s: %w", filepath.Dir(paths.Plist), err)
 	}
 	if old, err := os.ReadFile(paths.Plist); err == nil {
-		if err := writeFileAtomic(paths.Plist+".bak", old, 0o600); err != nil {
-			return fmt.Errorf("keep the previous LaunchAgent as %s.bak: %w", paths.Plist, err)
+		if err := os.MkdirAll(filepath.Dir(paths.PlistBackup), 0o700); err != nil {
+			return fmt.Errorf("create %s: %w", filepath.Dir(paths.PlistBackup), err)
 		}
-		_, _ = fmt.Fprintf(log, "kept the previous LaunchAgent as %s.bak\n", paths.Plist)
+		if err := writeFileAtomic(paths.PlistBackup, old, 0o600); err != nil {
+			return fmt.Errorf("keep the previous LaunchAgent as %s: %w", paths.PlistBackup, err)
+		}
+		_, _ = fmt.Fprintf(log, "kept the previous LaunchAgent as %s\n", paths.PlistBackup)
 	}
 	plist, err := renderMetalAgentPlist(args, host.home, paths.Log)
 	if err != nil {

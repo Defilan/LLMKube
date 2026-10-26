@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -555,5 +556,41 @@ func TestFindLlamaServer(t *testing.T) {
 	}
 	if _, err := findLlamaServer(host([]string{brew}, ""), missing); err == nil {
 		t.Error("a missing --llama-server was accepted")
+	}
+}
+
+// TestInstallMetalAgentKeepsThePreviousPlistOutsideLaunchAgents: rejoining
+// keeps the plist it replaces, and not in LaunchAgents, where launchd could
+// load the old copy at login, even after leave.
+func TestInstallMetalAgentKeepsThePreviousPlistOutsideLaunchAgents(t *testing.T) {
+	mac := newFakeMac(t)
+	host, err := newMetalHost()
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := mac.paths()
+	launchAgents := filepath.Dir(paths.Plist)
+	if err := os.MkdirAll(launchAgents, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.Plist, []byte("previous"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := installMetalAgent(context.Background(), host, paths, []string{mac.agentBin}, io.Discard); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if kept, err := os.ReadFile(paths.PlistBackup); err != nil || string(kept) != "previous" {
+		t.Errorf("backup %s = %q, %v; want the previous plist", paths.PlistBackup, kept, err)
+	}
+	entries, err := os.ReadDir(launchAgents)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(paths.Plist) {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("LaunchAgents holds %q, want only %s", names, filepath.Base(paths.Plist))
 	}
 }

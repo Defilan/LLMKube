@@ -844,8 +844,9 @@ elsewhere). In order:
    ~10 seconds, as above). A failure before this step leaves the
    string usable, so you can fix the cause and run `join` again.
 6. Writes `~/Library/LaunchAgents/com.llmkube.metal-agent.plist`
-   (an existing one is kept as `.plist.bak`) and starts it with
-   `launchctl bootstrap`. The agent runs with `--kubeconfig`,
+   and starts it with `launchctl bootstrap`. An existing plist is kept
+   as `com.llmkube.metal-agent.plist.bak` in the state directory, not
+   in `LaunchAgents`, where launchd could load it at login. The agent runs with `--kubeconfig`,
    `--namespace`, `--metal-node` and `--renew-service-account-token`,
    and logs to `~/Library/Logs/llmkube/metal-agent.log`.
 7. Waits up to `--wait` (3 minutes; `0` does not wait) for the
