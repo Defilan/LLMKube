@@ -851,8 +851,13 @@ elsewhere). In order:
    and logs to `~/Library/Logs/llmkube/metal-agent.log`.
 7. Waits up to `--wait` (3 minutes; `0` does not wait) for the
    MetalNode to report `Reachable`, printing each change of
-   `AgentConnected` and `Reachable`. If the wait runs out, `join`
-   fails with the last conditions it saw and leaves the agent
+   `AgentConnected` and `Reachable`. Only status for the agent this
+   `join` started counts: its Lease renewed after the old agent was
+   stopped, the controller caught up with the MetalNode's generation,
+   and `Reachable` verified for the ingress key and an address the new
+   agent reports. On a re-join, the replaced agent's `Reachable=True`
+   stays for minutes and does not end the wait. If the wait runs out,
+   `join` fails with the last conditions it saw and leaves the agent
    installed and retrying.
 
 | Flag | Default | Meaning |

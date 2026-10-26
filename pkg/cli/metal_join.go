@@ -34,6 +34,7 @@ import (
 
 	"github.com/spf13/cobra"
 	authenticationv1 "k8s.io/api/authentication/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -45,6 +46,7 @@ import (
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 	"github.com/defilantech/llmkube/pkg/metaljoin"
+	"github.com/defilantech/llmkube/pkg/metalnode"
 )
 
 const (
@@ -218,7 +220,8 @@ func runMetalJoin(cmd *cobra.Command, joinString string, opts *metalJoinOptions)
 	if err := metalJoinSetup(ctx, p, opts.tokenLifetime, paths, log); err != nil {
 		return err
 	}
-	if err := installMetalAgent(ctx, host, paths, metalAgentArgs(agentBin, paths, p, llamaServer), log); err != nil {
+	started, err := installMetalAgent(ctx, host, paths, metalAgentArgs(agentBin, paths, p, llamaServer), log)
+	if err != nil {
 		return err
 	}
 	if opts.wait == 0 {
@@ -229,7 +232,8 @@ func runMetalJoin(cmd *cobra.Command, joinString string, opts *metalJoinOptions)
 	if err != nil {
 		return err
 	}
-	mn, err := waitMetalNodeReachable(ctx, agentClient, p.Namespace, p.Mac, opts.wait, metalJoinPollInterval, log)
+	mn, err := waitMetalNodeReachable(ctx, agentClient, p.Namespace, p.Mac, started, opts.wait,
+		metalJoinPollInterval, log)
 	if err != nil {
 		return fmt.Errorf("%w; the agent is installed and keeps trying (log: %s)", err, paths.Log)
 	}
@@ -450,39 +454,44 @@ func metalAgentArgs(agentBin string, paths metalAgentPaths, p metaljoin.Payload,
 
 // installMetalAgent writes the LaunchAgent plist and (re)starts it. An
 // existing plist, from an earlier join or make install-metal-agent, is kept
-// as paths.PlistBackup.
-func installMetalAgent(ctx context.Context, host metalHost, paths metalAgentPaths, args []string, log io.Writer) error {
+// as paths.PlistBackup. It returns when the old agent had been booted out:
+// the new agent's status is newer than that.
+func installMetalAgent(ctx context.Context, host metalHost, paths metalAgentPaths, args []string,
+	log io.Writer) (time.Time, error) {
 	if err := os.MkdirAll(paths.LogDir, 0o700); err != nil {
-		return fmt.Errorf("create %s: %w", paths.LogDir, err)
+		return time.Time{}, fmt.Errorf("create %s: %w", paths.LogDir, err)
 	}
 	if err := os.MkdirAll(filepath.Dir(paths.Plist), 0o755); err != nil {
-		return fmt.Errorf("create %s: %w", filepath.Dir(paths.Plist), err)
+		return time.Time{}, fmt.Errorf("create %s: %w", filepath.Dir(paths.Plist), err)
 	}
 	if old, err := os.ReadFile(paths.Plist); err == nil {
 		if err := os.MkdirAll(filepath.Dir(paths.PlistBackup), 0o700); err != nil {
-			return fmt.Errorf("create %s: %w", filepath.Dir(paths.PlistBackup), err)
+			return time.Time{}, fmt.Errorf("create %s: %w", filepath.Dir(paths.PlistBackup), err)
 		}
 		if err := writeFileAtomic(paths.PlistBackup, old, 0o600); err != nil {
-			return fmt.Errorf("keep the previous LaunchAgent as %s: %w", paths.PlistBackup, err)
+			return time.Time{}, fmt.Errorf("keep the previous LaunchAgent as %s: %w", paths.PlistBackup, err)
 		}
 		_, _ = fmt.Fprintf(log, "kept the previous LaunchAgent as %s\n", paths.PlistBackup)
 	}
 	plist, err := renderMetalAgentPlist(args, host.home, paths.Log)
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
 	if err := writeFileAtomic(paths.Plist, plist, 0o644); err != nil {
-		return fmt.Errorf("write %s: %w", paths.Plist, err)
+		return time.Time{}, fmt.Errorf("write %s: %w", paths.Plist, err)
 	}
 	domain := "gui/" + strconv.Itoa(host.uid)
 	// Not loaded yet is the usual case for bootout; anything else surfaces
 	// when bootstrap fails.
 	_ = host.launchctl(ctx, "bootout", domain+"/"+metalAgentLabel)
+	// Truncated to the Lease's renewTime precision, so a renewal in the
+	// same microsecond still counts as the new agent's.
+	started := time.Now().Truncate(time.Microsecond)
 	if err := host.launchctl(ctx, "bootstrap", domain, paths.Plist); err != nil {
-		return fmt.Errorf("start the agent: %w", err)
+		return time.Time{}, fmt.Errorf("start the agent: %w", err)
 	}
 	_, _ = fmt.Fprintf(log, "started the %s LaunchAgent (%s)\n", metalAgentLabel, paths.Plist)
-	return nil
+	return started, nil
 }
 
 // renderMetalAgentPlist renders the LaunchAgent, matching
@@ -555,9 +564,11 @@ func renderMetalAgentPlist(args []string, home, logFile string) ([]byte, error) 
 	return []byte(b.String()), nil
 }
 
-// waitMetalNodeReachable polls the Mac's MetalNode until Reachable is True,
-// printing each change of the two conditions.
-func waitMetalNodeReachable(ctx context.Context, c client.Client, namespace, name string,
+// waitMetalNodeReachable polls the Mac's MetalNode and its Lease until they
+// show the agent join started connected and verified Reachable, printing
+// each change. Status left from an earlier agent does not count: on a
+// re-join it stays True for minutes after that agent is gone.
+func waitMetalNodeReachable(ctx context.Context, c client.Client, namespace, name string, started time.Time,
 	timeout, interval time.Duration, log io.Writer) (*inferencev1alpha1.MetalNode, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -566,17 +577,24 @@ func waitMetalNodeReachable(ctx context.Context, c client.Client, namespace, nam
 	for {
 		mn := &inferencev1alpha1.MetalNode{}
 		err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, mn)
-		switch {
-		case err == nil:
-			if state := metalNodeState(mn); state != last {
+		if err == nil {
+			lease := &coordinationv1.Lease{}
+			if err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: mn.Spec.LeaseName}, lease); err != nil {
+				lease = nil
+			}
+			done, why := metalJoinVerified(mn, lease, started)
+			state := metalNodeState(mn)
+			if why != "" {
+				state += "; " + why
+			}
+			if state != last {
 				_, _ = fmt.Fprintf(log, "  %s\n", state)
 				last = state
 			}
-			if meta.IsStatusConditionTrue(mn.Status.Conditions, inferencev1alpha1.MetalNodeConditionReachable) &&
-				mn.Status.HostIP != "" {
+			if done {
 				return mn, nil
 			}
-		case ctx.Err() == nil:
+		} else if ctx.Err() == nil {
 			_, _ = fmt.Fprintf(log, "  get MetalNode: %v\n", err)
 		}
 		select {
@@ -588,6 +606,47 @@ func waitMetalNodeReachable(ctx context.Context, c client.Client, namespace, nam
 		case <-time.After(interval):
 		}
 	}
+}
+
+// metalJoinVerified reports whether mn and its Lease show the agent started
+// at started connected and verified Reachable, and if not, what it still
+// waits for (empty while the conditions themselves say it). The agent stamps
+// the Lease's renewTime with this Mac's clock, the clock started comes from;
+// the controller copies the Lease report's ingress key and port into status.
+func metalJoinVerified(mn *inferencev1alpha1.MetalNode, lease *coordinationv1.Lease,
+	started time.Time) (bool, string) {
+	gen := mn.Generation
+	if mn.Status.ObservedGeneration != gen {
+		return false, fmt.Sprintf("waiting for the controller to observe generation %d", gen)
+	}
+	if lease == nil || lease.Spec.RenewTime == nil || lease.Spec.RenewTime.Time.Before(started) {
+		return false, "waiting for the agent this join started to renew its Lease"
+	}
+	current := func(condType string) bool {
+		c := meta.FindStatusCondition(mn.Status.Conditions, condType)
+		return c != nil && c.Status == metav1.ConditionTrue && c.ObservedGeneration == gen
+	}
+	if !current(inferencev1alpha1.MetalNodeConditionAgentConnected) ||
+		!current(inferencev1alpha1.MetalNodeConditionReachable) {
+		return false, ""
+	}
+	report, err := metalnode.Decode(lease.Annotations[metalnode.ReportAnnotation])
+	if err != nil {
+		return false, "the agent's report on its Lease is invalid"
+	}
+	st := mn.Status
+	if st.HostIP == "" || st.IngressSPKI != report.IngressSPKI || st.IngressPort != report.IngressPort {
+		return false, "Reachable is for an earlier report; waiting for the new agent's ingress to be verified"
+	}
+	if st.HostIP == mn.Spec.HostIP {
+		return true, ""
+	}
+	for _, cand := range report.Candidates {
+		if cand.Address == st.HostIP {
+			return true, ""
+		}
+	}
+	return false, "Reachable names an address the agent no longer offers"
 }
 
 func metalNodeState(mn *inferencev1alpha1.MetalNode) string {

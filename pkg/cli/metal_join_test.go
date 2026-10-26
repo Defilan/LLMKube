@@ -32,6 +32,7 @@ import (
 	"time"
 
 	authenticationv1 "k8s.io/api/authentication/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -43,6 +44,7 @@ import (
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 	"github.com/defilantech/llmkube/pkg/metaljoin"
+	"github.com/defilantech/llmkube/pkg/metalnode"
 )
 
 // fakeMac stands in for the Mac join and leave run on: a temporary home, a
@@ -53,6 +55,8 @@ type fakeMac struct {
 	llamaServer string
 	calls       []string
 	failOn      string
+	// onBootstrap runs when launchctl bootstrap succeeds: the agent starts.
+	onBootstrap func()
 }
 
 func newFakeMac(t *testing.T) *fakeMac {
@@ -80,6 +84,9 @@ func newFakeMac(t *testing.T) *fakeMac {
 				m.calls = append(m.calls, call)
 				if m.failOn != "" && strings.HasPrefix(call, m.failOn) {
 					return errors.New("launchctl failed")
+				}
+				if args[0] == "bootstrap" && m.onBootstrap != nil {
+					m.onBootstrap()
 				}
 				return nil
 			},
@@ -111,23 +118,60 @@ func issueJoinString(t *testing.T, ns string) (string, metaljoin.Payload) {
 	return strings.TrimPrefix(first, "llmkube metal join "), decodeJoinLine(t, stdout)
 }
 
-// markReachable stands in for the MetalNode controller's verdict.
-func markReachable(t *testing.T, c client.Client, ns string) {
+// testIngressSPKI is a well-formed ingress pin for the fake agent's report.
+var testIngressSPKI = base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))
+
+// markVerified stands in for an agent and the MetalNode controller: the
+// agent renews mac-a's Lease at renewed with a report, and the controller
+// marks the MetalNode connected and Reachable at 100.64.0.2:9443 for it.
+func markVerified(t *testing.T, c client.Client, ns string, renewed time.Time) {
 	t.Helper()
+	ctx := context.Background()
+	raw, err := metalnode.Encode(metalnode.Report{IngressPort: 9443, IngressSPKI: testIngressSPKI,
+		Candidates: []metalnode.Candidate{{Address: "100.64.0.2", Source: metalnode.SourceTailnet}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease := &coordinationv1.Lease{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: ns, Name: "mac-a"}, lease); err != nil {
+		t.Fatal(err)
+	}
+	rt := metav1.NewMicroTime(renewed)
+	lease.Spec.RenewTime = &rt
+	if lease.Annotations == nil {
+		lease.Annotations = map[string]string{}
+	}
+	lease.Annotations[metalnode.ReportAnnotation] = raw
+	if err := c.Update(ctx, lease); err != nil {
+		t.Fatal(err)
+	}
+
 	mn := &inferencev1alpha1.MetalNode{}
-	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "mac-a"}, mn); err != nil {
+	if err := c.Get(ctx, types.NamespacedName{Namespace: ns, Name: "mac-a"}, mn); err != nil {
 		t.Fatal(err)
 	}
-	mn.Status.HostIP, mn.Status.IngressPort = "100.64.0.2", 9443
-	meta.SetStatusCondition(&mn.Status.Conditions, metav1.Condition{
-		Type:   inferencev1alpha1.MetalNodeConditionAgentConnected,
+	mn.Status = verifiedStatus(mn.Generation)
+	if err := c.Status().Update(ctx, mn); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func verifiedStatus(gen int64) inferencev1alpha1.MetalNodeStatus {
+	st := inferencev1alpha1.MetalNodeStatus{ObservedGeneration: gen, HostIP: "100.64.0.2", IngressPort: 9443,
+		IngressSPKI: testIngressSPKI}
+	meta.SetStatusCondition(&st.Conditions, metav1.Condition{
+		Type: inferencev1alpha1.MetalNodeConditionAgentConnected, ObservedGeneration: gen,
 		Status: metav1.ConditionTrue, Reason: inferencev1alpha1.MetalNodeReasonHeartbeatFresh, Message: "fresh"})
-	meta.SetStatusCondition(&mn.Status.Conditions, metav1.Condition{
-		Type:   inferencev1alpha1.MetalNodeConditionReachable,
+	meta.SetStatusCondition(&st.Conditions, metav1.Condition{
+		Type: inferencev1alpha1.MetalNodeConditionReachable, ObservedGeneration: gen,
 		Status: metav1.ConditionTrue, Reason: inferencev1alpha1.MetalNodeReasonDialBackSucceeded, Message: "reached"})
-	if err := c.Status().Update(context.Background(), mn); err != nil {
-		t.Fatal(err)
-	}
+	return st
+}
+
+// agentStartsOnBootstrap makes the agent join starts renew its Lease and
+// get verified.
+func (m *fakeMac) agentStartsOnBootstrap(t *testing.T, c client.Client, ns string) {
+	m.onBootstrap = func() { markVerified(t, c, ns, time.Now()) }
 }
 
 func authenticatedAs(t *testing.T, cfg *rest.Config) (string, error) {
@@ -165,7 +209,7 @@ func TestMetalJoinSetsUpTheAgent(t *testing.T) {
 	_, c, ns := metalEnvtest(t)
 	mac := newFakeMac(t)
 	joinString, p := issueJoinString(t, ns)
-	markReachable(t, c, ns)
+	mac.agentStartsOnBootstrap(t, c, ns)
 
 	stdout, stderr, err := runMetal(t, "join", joinString, "--wait", "30s")
 	if err != nil {
@@ -282,10 +326,9 @@ func assertMetalAgentPlist(t *testing.T, mac *fakeMac, paths metalAgentPaths, ns
 // join token stops authenticating (after the API server's ~10 s cache of a
 // successful authentication), and a second join says the string is used up.
 func TestMetalJoinStringIsSingleUse(t *testing.T) {
-	cfg, c, ns := metalEnvtest(t)
+	cfg, _, ns := metalEnvtest(t)
 	newFakeMac(t)
 	joinString, p := issueJoinString(t, ns)
-	markReachable(t, c, ns)
 	if _, stderr, err := runMetal(t, "join", joinString, "--wait", "0"); err != nil {
 		t.Fatalf("join: %v\n%s", err, stderr)
 	}
@@ -376,6 +419,83 @@ func tamperedJoinString(t *testing.T, p metaljoin.Payload) string {
 	return metaljoin.Prefix + base64.RawURLEncoding.EncodeToString(raw)
 }
 
+// TestMetalJoinWaitIgnoresAnEarlierAgentsStatus: on a re-join the
+// MetalNode can still say connected and Reachable for the agent join just
+// replaced. join must wait for the agent it started, not report success
+// while that one is not running.
+func TestMetalJoinWaitIgnoresAnEarlierAgentsStatus(t *testing.T) {
+	_, c, ns := metalEnvtest(t)
+	newFakeMac(t)
+	joinString, _ := issueJoinString(t, ns)
+	markVerified(t, c, ns, time.Now().Add(-time.Minute))
+
+	_, stderr, err := runMetal(t, "join", joinString, "--wait", "3s")
+	if err == nil || !strings.Contains(err.Error(), "not Reachable within 3s") {
+		t.Fatalf("join over an earlier agent's status: err = %v, want a timeout\nstderr: %s", err, stderr)
+	}
+	if !strings.Contains(err.Error(), "the agent this join started to renew its Lease") {
+		t.Errorf("join's timeout does not say what it waited for: %v", err)
+	}
+}
+
+func TestMetalJoinVerified(t *testing.T) {
+	started := time.Now()
+	report, err := metalnode.Encode(metalnode.Report{IngressPort: 9443, IngressSPKI: testIngressSPKI,
+		Candidates: []metalnode.Candidate{{Address: "100.64.0.2", Source: metalnode.SourceTailnet}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	renewedAt := func(at time.Time) *coordinationv1.Lease {
+		rt := metav1.NewMicroTime(at)
+		return &coordinationv1.Lease{
+			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{metalnode.ReportAnnotation: report}},
+			Spec:       coordinationv1.LeaseSpec{RenewTime: &rt}}
+	}
+	fresh := renewedAt(started.Add(time.Second))
+	node := func(edit func(*inferencev1alpha1.MetalNode)) *inferencev1alpha1.MetalNode {
+		mn := &inferencev1alpha1.MetalNode{ObjectMeta: metav1.ObjectMeta{Generation: 2}, Status: verifiedStatus(2)}
+		if edit != nil {
+			edit(mn)
+		}
+		return mn
+	}
+	for _, tc := range []struct {
+		name  string
+		mn    *inferencev1alpha1.MetalNode
+		lease *coordinationv1.Lease
+		want  bool
+		why   string
+	}{
+		{"the new agent, verified", node(nil), fresh, true, ""},
+		{"renewed in the microsecond join started", node(nil), renewedAt(started), true, ""},
+		{"Lease last renewed by the earlier agent", node(nil), renewedAt(started.Add(-time.Second)), false,
+			"renew its Lease"},
+		{"Lease not readable", node(nil), nil, false, "renew its Lease"},
+		{"status for an earlier generation", node(func(mn *inferencev1alpha1.MetalNode) { mn.Generation = 3 }),
+			fresh, false, "observe generation 3"},
+		{"Reachable for an earlier generation", node(func(mn *inferencev1alpha1.MetalNode) {
+			meta.FindStatusCondition(mn.Status.Conditions,
+				inferencev1alpha1.MetalNodeConditionReachable).ObservedGeneration = 1
+		}), fresh, false, ""},
+		{"Reachable for an earlier ingress key", node(func(mn *inferencev1alpha1.MetalNode) {
+			mn.Status.IngressSPKI = base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{8}, 32))
+		}), fresh, false, "earlier report"},
+		{"Reachable at an address the agent no longer offers", node(func(mn *inferencev1alpha1.MetalNode) {
+			mn.Status.HostIP = "192.168.1.9"
+		}), fresh, false, "no longer offers"},
+		{"Reachable at the admin's spec.hostIP", node(func(mn *inferencev1alpha1.MetalNode) {
+			mn.Status.HostIP, mn.Spec.HostIP = "192.168.1.9", "192.168.1.9"
+		}), fresh, true, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, why := metalJoinVerified(tc.mn, tc.lease, started)
+			if got != tc.want || (tc.why != "" && !strings.Contains(why, tc.why)) {
+				t.Errorf("metalJoinVerified = %t, %q; want %t, %q", got, why, tc.want, tc.why)
+			}
+		})
+	}
+}
+
 // TestMetalJoinWaitTimesOutAndSaysWhy: when the cluster never verifies the
 // Mac, join fails after --wait with the conditions it last saw, and leaves
 // the agent installed to keep trying.
@@ -397,10 +517,9 @@ func TestMetalJoinWaitTimesOutAndSaysWhy(t *testing.T) {
 // and the agent's credentials, keeps the rest of the state directory, and
 // says how to revoke the Mac in the cluster.
 func TestMetalLeaveUndoesJoin(t *testing.T) {
-	_, c, ns := metalEnvtest(t)
+	_, _, ns := metalEnvtest(t)
 	mac := newFakeMac(t)
 	joinString, _ := issueJoinString(t, ns)
-	markReachable(t, c, ns)
 	if _, stderr, err := runMetal(t, "join", joinString, "--wait", "0"); err != nil {
 		t.Fatalf("join: %v\n%s", err, stderr)
 	}
@@ -576,7 +695,7 @@ func TestInstallMetalAgentKeepsThePreviousPlistOutsideLaunchAgents(t *testing.T)
 	if err := os.WriteFile(paths.Plist, []byte("previous"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := installMetalAgent(context.Background(), host, paths, []string{mac.agentBin}, io.Discard); err != nil {
+	if _, err := installMetalAgent(context.Background(), host, paths, []string{mac.agentBin}, io.Discard); err != nil {
 		t.Fatalf("install: %v", err)
 	}
 	if kept, err := os.ReadFile(paths.PlistBackup); err != nil || string(kept) != "previous" {
