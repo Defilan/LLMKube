@@ -115,9 +115,14 @@ func metalNodeLeaseUpdateMatters(old, updated *coordinationv1.Lease) bool {
 type MetalNodeReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
-	// APIReader reads the agent's Lease. The Lease informer only holds
-	// Leases labeled inference.llmkube.dev/metal-node, so reading through it
-	// would miss an unlabeled Lease; an uncached read always finds it.
+	// APIReader reads the MetalNode and the agent's Lease. The MetalNode is
+	// read uncached because status.verification.podUID is the only record of
+	// which verifier pod the controller started: that pod's own create event
+	// reconciles again, and a cached MetalNode from before the status write
+	// would treat the pod as a stranger and delete it. The Lease informer only
+	// holds Leases labeled inference.llmkube.dev/metal-node, so reading
+	// through it would miss an unlabeled Lease; an uncached read always finds
+	// it.
 	APIReader client.Reader
 	// InitContainerImage is the operator's curl image (--init-container-image),
 	// which the verifier pod runs.
@@ -137,7 +142,7 @@ type MetalNodeReconciler struct {
 
 func (r *MetalNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	mn := &inferencev1alpha1.MetalNode{}
-	if err := r.Get(ctx, req.NamespacedName, mn); err != nil {
+	if err := r.APIReader.Get(ctx, req.NamespacedName, mn); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	now := r.now()
