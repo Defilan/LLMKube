@@ -142,6 +142,7 @@ type metalJoinOptions struct {
 	llamaServer   string
 	tokenLifetime time.Duration
 	wait          time.Duration
+	force         bool
 }
 
 func newMetalJoinCommand() *cobra.Command {
@@ -162,7 +163,12 @@ reports the Mac's MetalNode Reachable.
 
 The agent renews its token at half its lifetime (--token-lifetime, 7 days by
 default). A Mac that is off for longer needs a new join string. Running join
-again replaces the earlier setup; 'llmkube metal leave' removes it.`,
+again replaces the earlier setup; 'llmkube metal leave' removes it.
+
+join refuses to replace a com.llmkube.metal-agent LaunchAgent it did not
+write (make install-metal-agent, a playbook), since that one carries the
+Mac's own arguments; --force replaces it and keeps a copy for leave to
+point back to.`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// A join string a terminal wrapped can arrive as several
@@ -178,6 +184,8 @@ again replaces the earlier setup; 'llmkube metal leave' removes it.`,
 		"Lifetime of the agent's token; the agent renews it at half (at least 10m)")
 	cmd.Flags().DurationVar(&opts.wait, "wait", metalJoinWaitDefault,
 		"How long to wait for the MetalNode to report Reachable; 0 does not wait")
+	cmd.Flags().BoolVar(&opts.force, "force", false,
+		"Replace a com.llmkube.metal-agent LaunchAgent that join did not write (it is kept in the state directory)")
 	return cmd
 }
 
@@ -217,6 +225,9 @@ func runMetalJoin(cmd *cobra.Command, joinString string, opts *metalJoinOptions)
 		return err
 	}
 	paths := newMetalAgentPaths(host.home)
+	if err := checkMetalAgentPlist(paths, opts.force); err != nil {
+		return err
+	}
 	if err := metalJoinSetup(ctx, p, opts.tokenLifetime, paths, log); err != nil {
 		return err
 	}
@@ -452,10 +463,43 @@ func metalAgentArgs(agentBin string, paths metalAgentPaths, p metaljoin.Payload,
 	return args
 }
 
-// installMetalAgent writes the LaunchAgent plist and (re)starts it. An
-// existing plist, from an earlier join or make install-metal-agent, is kept
-// as paths.PlistBackup. It returns when the old agent had been booted out:
-// the new agent's status is newer than that.
+// metalJoinPlistMarker marks a LaunchAgent plist join wrote. join and leave
+// replace or remove only a plist that carries it: one installed another way
+// (make install-metal-agent, a playbook) runs the agent with the Mac's own
+// arguments, such as its model store and allowlist.
+const metalJoinPlistMarker = "<!-- Written by llmkube metal join; llmkube metal leave removes it. -->"
+
+// readMetalAgentPlist reports whether the LaunchAgent plist exists and
+// whether join wrote it.
+func readMetalAgentPlist(path string) (exists, joined bool, err error) {
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, fmt.Errorf("read %s: %w", path, err)
+	}
+	return true, isJoinPlist(raw), nil
+}
+
+func isJoinPlist(raw []byte) bool { return bytes.Contains(raw, []byte(metalJoinPlistMarker)) }
+
+// checkMetalAgentPlist refuses, before join changes anything, to replace a
+// LaunchAgent join did not write, unless force.
+func checkMetalAgentPlist(paths metalAgentPaths, force bool) error {
+	exists, joined, err := readMetalAgentPlist(paths.Plist)
+	if err != nil || !exists || joined || force {
+		return err
+	}
+	return fmt.Errorf("%s runs a Metal agent that llmkube metal join did not install "+
+		"(make install-metal-agent or a playbook), with this Mac's own arguments; join would replace it. "+
+		"Pass --force to replace it (join keeps it as %s), or join another Mac", paths.Plist, paths.PlistBackup)
+}
+
+// installMetalAgent writes the LaunchAgent plist and (re)starts it. A plist
+// join did not write is kept as paths.PlistBackup; an earlier join's is not,
+// so a backup is never overwritten by join's own. It returns when the old
+// agent had been booted out: the new agent's status is newer than that.
 func installMetalAgent(ctx context.Context, host metalHost, paths metalAgentPaths, args []string,
 	log io.Writer) (time.Time, error) {
 	if err := os.MkdirAll(paths.LogDir, 0o700); err != nil {
@@ -464,7 +508,7 @@ func installMetalAgent(ctx context.Context, host metalHost, paths metalAgentPath
 	if err := os.MkdirAll(filepath.Dir(paths.Plist), 0o755); err != nil {
 		return time.Time{}, fmt.Errorf("create %s: %w", filepath.Dir(paths.Plist), err)
 	}
-	if old, err := os.ReadFile(paths.Plist); err == nil {
+	if old, err := os.ReadFile(paths.Plist); err == nil && !isJoinPlist(old) {
 		if err := os.MkdirAll(filepath.Dir(paths.PlistBackup), 0o700); err != nil {
 			return time.Time{}, fmt.Errorf("create %s: %w", filepath.Dir(paths.PlistBackup), err)
 		}
@@ -509,6 +553,7 @@ func renderMetalAgentPlist(args []string, home, logFile string) ([]byte, error) 
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+` + metalJoinPlistMarker + `
 <plist version="1.0">
 <dict>
     <key>Label</key>
@@ -667,7 +712,8 @@ func newMetalLeaveCommand() *cobra.Command {
 		Short: "Stop the Metal agent on this Mac and remove what join set up",
 		Long: `Stop the com.llmkube.metal-agent LaunchAgent and remove its plist and the
 agent's kubeconfig and token that 'llmkube metal join' wrote. The agent's
-ingress identity and model store stay.
+ingress identity and model store stay. A LaunchAgent join did not write
+(make install-metal-agent, a playbook) is left running.
 
 This only cleans up the Mac: the agent's token stays valid until it expires.
 To revoke it and delete the Mac's objects in the cluster, an admin runs
@@ -703,11 +749,23 @@ func runMetalLeave(cmd *cobra.Command) error {
 			}
 		}
 	}
-	if err := host.launchctl(ctx, "bootout", "gui/"+strconv.Itoa(host.uid)+"/"+metalAgentLabel); err != nil {
-		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "the agent was not running (%v)\n", err)
+	exists, joined, err := readMetalAgentPlist(paths.Plist)
+	if err != nil {
+		return err
+	}
+	files := []string{paths.Kubeconfig, paths.Token}
+	domain := "gui/" + strconv.Itoa(host.uid)
+	switch {
+	case joined:
+		if err := host.launchctl(ctx, "bootout", domain+"/"+metalAgentLabel); err != nil {
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "the agent was not running (%v)\n", err)
+		}
+		files = append([]string{paths.Plist}, files...)
+	case exists:
+		_, _ = fmt.Fprintf(out, "left %s running: llmkube metal join did not install it\n", paths.Plist)
 	}
 	removed := 0
-	for _, f := range []string{paths.Plist, paths.Kubeconfig, paths.Token} {
+	for _, f := range files {
 		err := os.Remove(f)
 		switch {
 		case err == nil:
@@ -723,6 +781,10 @@ func runMetalLeave(cmd *cobra.Command) error {
 	}
 	_, _ = fmt.Fprintf(out, "left the cluster on this Mac; to revoke its token and delete its objects, "+
 		"an admin runs: llmkube metal remove %s -n %s\n", mac, namespace)
+	if _, err := os.Stat(paths.PlistBackup); joined && err == nil {
+		_, _ = fmt.Fprintf(out, "join had replaced a LaunchAgent; to start it again: cp %q %q && launchctl bootstrap %s %q\n",
+			paths.PlistBackup, paths.Plist, domain, paths.Plist)
+	}
 	return nil
 }
 

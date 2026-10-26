@@ -496,6 +496,80 @@ func TestMetalJoinVerified(t *testing.T) {
 	}
 }
 
+// TestMetalJoinKeepsALaunchAgentItDidNotWrite: a Mac set up with make
+// install-metal-agent runs the agent with its own arguments. join refuses to
+// replace that plist before it uses the string; with --force it replaces it,
+// keeps it, and leave says how to bring it back.
+func TestMetalJoinKeepsALaunchAgentItDidNotWrite(t *testing.T) {
+	_, c, ns := metalEnvtest(t)
+	mac := newFakeMac(t)
+	paths := mac.paths()
+	joinString, _ := issueJoinString(t, ns)
+	const production = "<plist>the Mac's own agent</plist>"
+	if err := os.MkdirAll(filepath.Dir(paths.Plist), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.Plist, []byte(production), 0o644); err != nil { //nolint:gosec // G306: a plist
+		t.Fatal(err)
+	}
+
+	_, _, err := runMetal(t, "join", joinString, "--wait", "0")
+	if err == nil || !strings.Contains(err.Error(), "did not install") || !strings.Contains(err.Error(), "--force") {
+		t.Fatalf("join over another LaunchAgent: err = %v, want a refusal naming --force", err)
+	}
+	if got, _ := os.ReadFile(paths.Plist); string(got) != production || len(mac.calls) != 0 {
+		t.Errorf("a refused join left the plist %q and ran launchctl %q", got, mac.calls)
+	}
+	if _, err := os.Stat(paths.Kubeconfig); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a refused join wrote the kubeconfig: %v", err)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "llmkube-metal-mac-a-join"},
+		&corev1.Secret{}); err != nil {
+		t.Errorf("a refused join used up the join string: get join Secret: %v", err)
+	}
+
+	if _, stderr, err := runMetal(t, "join", joinString, "--wait", "0", "--force"); err != nil {
+		t.Fatalf("join --force: %v\n%s", err, stderr)
+	}
+	if kept, err := os.ReadFile(paths.PlistBackup); err != nil || string(kept) != production {
+		t.Errorf("backup %s = %q, %v; want the replaced plist", paths.PlistBackup, kept, err)
+	}
+	stdout, _, err := runMetal(t, "leave")
+	if err != nil {
+		t.Fatalf("leave: %v", err)
+	}
+	if _, err := os.Stat(paths.Plist); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("join's plist after leave: %v, want removed", err)
+	}
+	if !strings.Contains(stdout, "cp \""+paths.PlistBackup+"\"") {
+		t.Errorf("leave does not say how to restore the replaced LaunchAgent: %q", stdout)
+	}
+}
+
+// TestMetalLeaveLeavesALaunchAgentJoinDidNotWrite: leave on a Mac whose
+// agent was installed another way neither stops it nor removes its plist.
+func TestMetalLeaveLeavesALaunchAgentJoinDidNotWrite(t *testing.T) {
+	mac := newFakeMac(t)
+	paths := mac.paths()
+	const production = "<plist>the Mac's own agent</plist>"
+	if err := os.MkdirAll(filepath.Dir(paths.Plist), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.Plist, []byte(production), 0o644); err != nil { //nolint:gosec // G306: a plist
+		t.Fatal(err)
+	}
+	stdout, _, err := runMetal(t, "leave")
+	if err != nil {
+		t.Fatalf("leave: %v", err)
+	}
+	if got, _ := os.ReadFile(paths.Plist); string(got) != production || len(mac.calls) != 0 {
+		t.Errorf("leave left the plist %q and ran launchctl %q; want both untouched", got, mac.calls)
+	}
+	if !strings.Contains(stdout, "did not install it") {
+		t.Errorf("leave does not say why it left the agent: %q", stdout)
+	}
+}
+
 // TestMetalJoinWaitTimesOutAndSaysWhy: when the cluster never verifies the
 // Mac, join fails after --wait with the conditions it last saw, and leaves
 // the agent installed to keep trying.
@@ -695,8 +769,12 @@ func TestInstallMetalAgentKeepsThePreviousPlistOutsideLaunchAgents(t *testing.T)
 	if err := os.WriteFile(paths.Plist, []byte("previous"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := installMetalAgent(context.Background(), host, paths, []string{mac.agentBin}, io.Discard); err != nil {
-		t.Fatalf("install: %v", err)
+	// The second install replaces join's own plist, which must not
+	// overwrite the backup of the one join replaced first.
+	for range 2 {
+		if _, err := installMetalAgent(context.Background(), host, paths, []string{mac.agentBin}, io.Discard); err != nil {
+			t.Fatalf("install: %v", err)
+		}
 	}
 	if kept, err := os.ReadFile(paths.PlistBackup); err != nil || string(kept) != "previous" {
 		t.Errorf("backup %s = %q, %v; want the previous plist", paths.PlistBackup, kept, err)

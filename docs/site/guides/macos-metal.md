@@ -831,7 +831,11 @@ elsewhere). In order:
    `llama-server`, which the agent cannot start without:
    `--llama-server`, else `/opt/homebrew/bin` or `/usr/local/bin`, else
    on `PATH`. Either one missing stops join before it changes anything,
-   so the join string still works after you install it.
+   so the join string still works after you install it. So does a
+   `com.llmkube.metal-agent` LaunchAgent that `join` did not write
+   (`make install-metal-agent`, a playbook): it runs the agent with the
+   Mac's own arguments, so `join` refuses to replace it without
+   `--force`.
 3. With the join token, which trusts only the string's CA, mints the
    agent's own token for the Mac's ServiceAccount (`--token-lifetime`,
    7 days by default).
@@ -844,9 +848,11 @@ elsewhere). In order:
    ~10 seconds, as above). A failure before this step leaves the
    string usable, so you can fix the cause and run `join` again.
 6. Writes `~/Library/LaunchAgents/com.llmkube.metal-agent.plist`
-   and starts it with `launchctl bootstrap`. An existing plist is kept
-   as `com.llmkube.metal-agent.plist.bak` in the state directory, not
-   in `LaunchAgents`, where launchd could load it at login. The agent runs with `--kubeconfig`,
+   and starts it with `launchctl bootstrap`. A plist `join` did not
+   write, replaced with `--force`, is kept as
+   `com.llmkube.metal-agent.plist.bak` in the state directory, not in
+   `LaunchAgents`, where launchd could load it at login; a later `join`
+   does not overwrite that copy. The agent runs with `--kubeconfig`,
    `--namespace`, `--metal-node` and `--renew-service-account-token`,
    and logs to `~/Library/Logs/llmkube/metal-agent.log`.
 7. Waits up to `--wait` (3 minutes; `0` does not wait) for the
@@ -866,6 +872,7 @@ elsewhere). In order:
 | `--llama-server` | Homebrew's, else on `PATH` | Path to `llama-server`; join passes the path it found to the agent. |
 | `--token-lifetime` | `168h` (7 days) | Lifetime of the agent's token (at least `10m`). |
 | `--wait` | `3m` | How long to wait for `Reachable`; `0` returns once the agent is started. |
+| `--force` | off | Replace a `com.llmkube.metal-agent` LaunchAgent that `join` did not write. |
 
 **The agent renews its own token.** With
 `--renew-service-account-token`, the agent requests a new token for
@@ -879,7 +886,9 @@ again. Running `join` again on a Mac replaces its setup.
 
 `llmkube metal leave` undoes `join` on the Mac: it stops the
 LaunchAgent and removes its plist, the kubeconfig and the token. The
-ingress identity and the model store stay. It does not revoke
+ingress identity and the model store stay. A LaunchAgent `join` did
+not write is left running. If `join --force` replaced one, `leave`
+prints the commands that put it back. It does not revoke
 anything; the token stays valid until it expires, so also run
 `llmkube metal remove` where you have cluster access.
 
