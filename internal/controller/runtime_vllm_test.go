@@ -644,6 +644,7 @@ func TestVLLMBuildArgs(t *testing.T) {
 			// not merely the absence of one string.
 			exactArgs: []string{
 				"/models/test", "--port", "8000", "--host", "::",
+				"--served-model-name", "test-model", "/models/test",
 				"--tool-call-parser", "hermes", "--enable-auto-tool-choice",
 			},
 		},

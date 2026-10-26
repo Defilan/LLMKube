@@ -163,11 +163,8 @@ func (b *SGLangBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, mode
 	}
 
 	// --served-model-name: skip if user already set it in extraArgs.
-	servedName := isvc.Spec.ModelRef
-	if servedName == "" && model != nil {
-		servedName = model.Name
-	}
-	if servedName != "" && !hasMatchingExtraArg(isvc.Spec.ExtraArgs, "served-model-name") {
+	if servedName := servedModelName(isvc, model); servedName != "" &&
+		!hasMatchingExtraArg(isvc.Spec.ExtraArgs, "served-model-name") {
 		args = append(args, "--served-model-name", servedName)
 	}
 

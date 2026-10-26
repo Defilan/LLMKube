@@ -88,7 +88,7 @@ func (b *VLLMBackend) DisableServiceLinks() bool { return true }
 // BuildArgs generates the vLLM server CLI arguments. Arguments are emitted in a
 // deterministic order so snapshot-style tests and diff reviews stay stable:
 //
-//  1. --model, --host, --port (always)
+//  1. --model, --host, --port (always), --served-model-name
 //  2. Typed VLLMConfig flags, top-to-bottom as declared on the struct
 //  3. Tensor parallel auto-derived from GPU count (when user did not set it)
 //  4. ExtraArgs (user escape hatch, always last so user flags win)
@@ -121,6 +121,18 @@ func (b *VLLMBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, model 
 			bindAddr = isvc.Spec.BindAddress
 		}
 		args = append(args, "--host", bindAddr)
+	}
+	// --served-model-name: answer to the modelRef, as SGLang and llama.cpp do,
+	// so a ModelRouter's rewrite to it reaches this backend (#1988). The source
+	// stays a second name because it is the id vLLM served before, which
+	// clients may have saved; vLLM reports the first name in responses. Skip if
+	// the user set it in extraArgs (extraArgs wins).
+	if servedName := servedModelName(isvc, model); servedName != "" &&
+		!hasMatchingExtraArg(isvc.Spec.ExtraArgs, "served-model-name") {
+		args = append(args, "--served-model-name", servedName)
+		if source != servedName {
+			args = append(args, source)
+		}
 	}
 	// NOTE: vLLM has no --enable-metrics flag. Its OpenAI server always exposes
 	// Prometheus metrics at /metrics, so there is nothing to enable; passing the

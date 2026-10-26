@@ -107,11 +107,7 @@ func (b *LlamaCppBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, mo
 	// it llama.cpp reports the namespaced file path, which Open WebUI and other
 	// OpenAI clients show verbatim, and which changes when a service moves
 	// namespace. Skip if the user already set --alias in extraArgs.
-	servedName := isvc.Spec.ModelRef
-	if servedName == "" && model != nil {
-		servedName = model.Name
-	}
-	if servedName != "" && !hasMatchingExtraArg(isvc.Spec.ExtraArgs, "alias") {
+	if servedName := servedModelName(isvc, model); servedName != "" && !hasMatchingExtraArg(isvc.Spec.ExtraArgs, "alias") {
 		args = append(args, "--alias", servedName)
 	}
 

@@ -53,6 +53,71 @@ func hasMatchingExtraArgAny(extraArgs []string, names ...string) bool {
 	return false
 }
 
+// extraArgValues returns the values args give the named flag, in the
+// "--name=v" form or the "--name v1 v2" form (vLLM's --served-model-name takes
+// one or more names), and whether the flag appears at all.
+func extraArgValues(args []string, name string) ([]string, bool) {
+	flag := "--" + name
+	var values []string
+	found := false
+	for i, a := range args {
+		if v, ok := strings.CutPrefix(a, flag+"="); ok {
+			found = true
+			values = append(values, v)
+			continue
+		}
+		if a != flag {
+			continue
+		}
+		found = true
+		for _, v := range args[i+1:] {
+			if strings.HasPrefix(v, "-") {
+				break
+			}
+			values = append(values, v)
+		}
+	}
+	return values, found
+}
+
+// servedModelName is the model id the controller tells a runtime to serve
+// (--served-model-name for vLLM and SGLang, --alias for llama.cpp): the
+// modelRef, else the Model name. It mirrors servedModelName in
+// pkg/agent/agent.go, and a ModelRouter rewrites requests to it
+// (servedModelNames), so they must agree (#1988).
+func servedModelName(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model) string {
+	if isvc.Spec.ModelRef != "" {
+		return isvc.Spec.ModelRef
+	}
+	if model != nil {
+		return model.Name
+	}
+	return ""
+}
+
+// servedModelNames returns the model ids a vLLM or SGLang container answers
+// to, the one it reports first: the user's --served-model-name, else the name
+// BuildArgs adds. With spec.command set, BuildArgs is not used and the
+// container gets spec.args then spec.extraArgs (setCommandAndArgs), so only
+// the user's flag counts and nil means the id is unknown. vLLM also answers to
+// its positional source, which is left out: it is not known here.
+func servedModelNames(isvc *inferencev1alpha1.InferenceService) []string {
+	args := isvc.Spec.ExtraArgs
+	if len(isvc.Spec.Command) > 0 {
+		args = append(append([]string{}, isvc.Spec.Args...), args...)
+	}
+	if names, ok := extraArgValues(args, "served-model-name"); ok {
+		return names
+	}
+	if len(isvc.Spec.Command) > 0 {
+		return nil
+	}
+	if name := servedModelName(isvc, nil); name != "" {
+		return []string{name}
+	}
+	return nil
+}
+
 // resolveServingMode returns spec.mode when set, otherwise infers it from the
 // runtime flags or endpoint path. A reranker passes both --reranking and
 // --embedding, so rerank is checked first. Defaults to chat.

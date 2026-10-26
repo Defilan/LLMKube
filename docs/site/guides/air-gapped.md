@@ -832,14 +832,12 @@ memory, so `resources.memory` (or `memoryLimit`) has to cover the
 runtime's own usage plus whatever lands in `/dev/shm`. The size cap
 is a ceiling, not a reservation; size memory with it as headroom.
 
-**Served model name.** vLLM is started with the model path as its
-positional argument and, unless you add one, no `--served-model-name`.
-It then reports and accepts the path itself (for example
-`/model-source/Qwen3-8B-FP8-220b46e3`) as the model id, which clients
-must echo in every request and which changes when the source moves.
-Add `extraArgs: ["--served-model-name", "<name>"]`, as in the example.
-SGLang gets `--served-model-name` set to `spec.modelRef`
-automatically, unless `extraArgs` already sets it. Check with:
+**Served model name.** vLLM and SGLang get `--served-model-name` set
+to `spec.modelRef`, unless `extraArgs` already sets it, as in the
+example. vLLM also keeps answering to the model path it is started with
+(for example `/model-source/Qwen3-8B-FP8-220b46e3`), the id it served
+before LLMKube set the flag, but reports the served name first and in
+responses. Check with:
 
 ```bash
 kubectl -n default port-forward svc/qwen3-8b-fp8 8000:8000 &
