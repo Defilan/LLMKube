@@ -85,6 +85,31 @@ func healthyPort(t *testing.T) int {
 	return port
 }
 
+// recordCmd returns a fake-engine script line that writes cmd's output to path
+// atomically, so a reader never sees a partial file.
+func recordCmd(cmd, path string) string {
+	return "{ " + cmd + "; } > '" + path + ".tmp' && mv '" + path + ".tmp' '" + path + "'\n"
+}
+
+// childFile reads a file a fake engine wrote with recordCmd. StartProcess can
+// return before the script has run: healthyPort, not the child, answers the
+// health check, and an oMLX start gives up after its startup timeout. So it
+// waits, bounded, for the file (#2245).
+func childFile(t *testing.T, path string) []byte {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			return data
+		}
+		if !os.IsNotExist(err) || time.Now().After(deadline) {
+			t.Fatalf("fake engine did not write %s: %v", path, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // TestMetalStartProcess_ChildExitFailsFast is the regression for a
 // llama-server that dies on startup (a rejected flag, say). The executor used
 // to poll /health for the whole startup timeout and report only "timeout

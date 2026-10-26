@@ -61,17 +61,13 @@ func writeLocalModel(t *testing.T, dir, file string) string {
 func argsRecordingServer(t *testing.T) (bin, argsFile string) {
 	t.Helper()
 	argsFile = filepath.Join(t.TempDir(), "args")
-	bin = fakeLlamaServer(t, "for a in \"$@\"; do echo \"$a\"; done > '"+argsFile+"'\nexec sleep 60\n")
+	bin = fakeLlamaServer(t, recordCmd(`for a in "$@"; do echo "$a"; done`, argsFile)+"exec sleep 60\n")
 	return bin, argsFile
 }
 
 func modelArg(t *testing.T, argsFile string) string {
 	t.Helper()
-	data, err := os.ReadFile(argsFile)
-	if err != nil {
-		t.Fatalf("fake llama-server did not record its args: %v", err)
-	}
-	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	lines := strings.Split(strings.TrimSpace(string(childFile(t, argsFile))), "\n")
 	for i, a := range lines {
 		if a == "--model" && i+1 < len(lines) {
 			return lines[i+1]

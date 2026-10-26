@@ -123,21 +123,20 @@ func TestOMLXStartProcess_WorkingDirIsModelStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	pwdPath := filepath.Join(t.TempDir(), "pwd")
-	bin := fakeOMLXDaemon(t, "pwd -P > '"+pwdPath+"'\nexit 1\n")
+	bin := fakeOMLXDaemon(t, recordCmd("pwd -P", pwdPath)+"exit 1\n")
 
 	port, err := allocateLoopbackPort()
 	if err != nil {
 		t.Fatal(err)
 	}
 	e := NewOMLXExecutor(bin, store, port, newNopLogger())
-	e.SetStartupTimeout(300 * time.Millisecond)
+	// The start kills the daemon when its health wait expires, so the
+	// timeout must outlast the fake's shell start under load (#2245).
+	e.SetStartupTimeout(2 * time.Second)
 
 	_, _ = e.StartProcess(context.Background(), ExecutorConfig{Name: "isvc", Namespace: "ns", ModelName: "m"})
 
-	data, err := os.ReadFile(pwdPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	data := childFile(t, pwdPath)
 	want, _ := filepath.EvalSymlinks(e.modelDir)
 	if got := strings.TrimSpace(string(data)); got != want {
 		t.Errorf("engine working dir = %q, want model store %q", got, want)
