@@ -225,6 +225,7 @@ func TestMetalNodeReporterOnUsesLeaseOverride(t *testing.T) {
 			logger:     newNopLogger(),
 			ingressPin: "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80=",
 		}
+		a.ingressListening.Store(true)
 		ctx, cancel := context.WithCancel(context.Background())
 		if !a.startMetalNodeReporter(ctx) {
 			cancel()

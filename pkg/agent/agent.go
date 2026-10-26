@@ -23,11 +23,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -288,15 +290,18 @@ type MetalAgent struct {
 	config MetalAgentConfig
 	// ingressPin is the SPKI pin of the ingress identity, set by
 	// prepareIngress in relay mode and reported to the MetalNode.
-	ingressPin     string
-	watcher        *InferenceServiceWatcher
-	executors      map[string]ProcessExecutor // runtime name -> executor
-	registry       *ServiceRegistry
-	processes      map[string]*ManagedProcess // namespacedName -> process
-	logger         *zap.SugaredLogger
-	mu             sync.RWMutex
-	memoryProvider MemoryProvider
-	memoryFraction float64
+	ingressPin string
+	// ingressListening is set once the ingress port is bound; the MetalNode
+	// report carries the pin and port only from then on.
+	ingressListening atomic.Bool
+	watcher          *InferenceServiceWatcher
+	executors        map[string]ProcessExecutor // runtime name -> executor
+	registry         *ServiceRegistry
+	processes        map[string]*ManagedProcess // namespacedName -> process
+	logger           *zap.SugaredLogger
+	mu               sync.RWMutex
+	memoryProvider   MemoryProvider
+	memoryFraction   float64
 	// memoryCheckWarnOnly is true when config.MemoryCheckMode resolved to
 	// MemoryCheckModeWarn; an incomplete admission check then logs and
 	// proceeds instead of failing closed.
@@ -720,14 +725,22 @@ func (a *MetalAgent) Start(ctx context.Context) error {
 		return err
 	}
 
+	// The ingress is the only way the cluster reaches an engine in relay
+	// mode, so losing it (a bind failure included) is fatal. It is bound
+	// before the reporter starts, so the first report's port answers.
+	var ingressLn net.Listener
+	if ingressSrv != nil {
+		if ingressLn, err = a.listenIngress(ingressSrv); err != nil {
+			return err
+		}
+	}
+
 	// Heartbeat and report through the MetalNode's Lease (--metal-node), now
-	// that the ingress pin is known. Off by default.
+	// that the ingress pin is known and its port bound. Off by default.
 	a.startMetalNodeReporter(ctx)
 
-	// The ingress is the only way the cluster reaches an engine in relay
-	// mode, so losing it (a bind failure included) is fatal.
 	if ingressSrv != nil {
-		go a.runIngress(ctx, ingressSrv, fatalErrChan)
+		go a.runIngress(ctx, ingressSrv, ingressLn, fatalErrChan)
 		go a.warnIfDaemonsExposed()
 	}
 

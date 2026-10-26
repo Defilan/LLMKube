@@ -176,7 +176,7 @@ func (a *MetalAgent) metalNodeReport(ctx context.Context) metalnode.Report {
 		GPUCores:     capacity.GPUCores,
 		MetalVersion: capacity.MetalVersion,
 	}
-	if p := a.config.IngressPort; a.ingressPin != "" && p > 0 && p <= 65535 {
+	if p := a.config.IngressPort; a.ingressPin != "" && a.ingressListening.Load() && p > 0 && p <= 65535 {
 		report.IngressSPKI = a.ingressPin
 		report.IngressPort = int32(p)
 	}
