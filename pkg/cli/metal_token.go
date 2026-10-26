@@ -173,6 +173,21 @@ func runMetalTokenCreate(cmd *cobra.Command, mac string, opts *metalTokenOptions
 	if err != nil {
 		return err
 	}
+	payload := metaljoin.Payload{
+		V:             metaljoin.Version,
+		Server:        target.Server,
+		CA:            ca.Raw,
+		Pin:           pin,
+		TLSServerName: tlsServerName,
+		Namespace:     target.Namespace,
+		Mac:           mac,
+		// Stands in for the token until it is minted, so every other field
+		// is checked as Encode will check it, before anything is written.
+		Token: "pending",
+	}
+	if err := payload.Validate(); err != nil {
+		return fmt.Errorf("the join string would be invalid: %w", err)
+	}
 
 	scheme, err := metalScheme()
 	if err != nil {
@@ -191,15 +206,8 @@ func runMetalTokenCreate(cmd *cobra.Command, mac string, opts *metalTokenOptions
 	if err != nil {
 		return err
 	}
-	joinString, err := metaljoin.Encode(metaljoin.Payload{
-		Server:        target.Server,
-		CA:            ca.Raw,
-		Pin:           pin,
-		TLSServerName: tlsServerName,
-		Namespace:     target.Namespace,
-		Mac:           mac,
-		Token:         issued.token,
-	})
+	payload.Token = issued.token
+	joinString, err := metaljoin.Encode(payload)
 	if err != nil {
 		return fmt.Errorf("build the join string: %w", err)
 	}

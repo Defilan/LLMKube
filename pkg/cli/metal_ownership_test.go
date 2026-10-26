@@ -212,3 +212,18 @@ func TestMetalStepGuardsRefuseForeignObjects(t *testing.T) {
 		}
 	}
 }
+
+// TestMetalTokenCreateRefusesAnInvalidJoinStringBeforeWriting: a value the
+// TLS check accepts but the join string does not (certificate host names
+// match without regard to case, a join string's tlsServerName must be a
+// lower-case DNS name) is refused before the first write. Found only by
+// Encode at the end, it used to leave the Mac's objects and a live join
+// token behind, and kill an earlier unused string.
+func TestMetalTokenCreateRefusesAnInvalidJoinStringBeforeWriting(t *testing.T) {
+	_, c, ns := metalEnvtest(t)
+	_, _, err := runMetal(t, "token", "create", "mac-a", "-n", ns, "--tls-server-name", "LOCALHOST")
+	if err == nil || !strings.Contains(err.Error(), "tlsServerName") {
+		t.Fatalf("token create: err = %v, want a refusal naming tlsServerName", err)
+	}
+	assertNothingWritten(t, c, ns, &corev1.ConfigMap{})
+}
