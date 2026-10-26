@@ -1150,11 +1150,15 @@ func buildMultiFileInitCommand(useCache, isS3, isHFAuth, withSHA256 bool, refres
 	// Warm FUSE caches need no lock or writes. Only the prefetch stager may
 	// download there; ordinary filesystems retain the directory-wide lock.
 	// Use Linux FUSE_SUPER_MAGIC: BusyBox stat reports its name as UNKNOWN.
+	// An init image whose stat has no -f cannot tell, so it stages under the
+	// lock as it did before FUSE detection, with a warning, instead of failing
+	// on every filesystem under a remedy (prefetch) that hits the same stat
+	// (#2253).
 	remedy := "set spec.modelCache.prefetch: true on every InferenceService using this claim, or use storage with cross-node flock support"
 	if isS3 {
 		remedy = "s3:// sources do not support prefetch; use storage with cross-node flock support, or pre-stage the files and use a pvc:// source"
 	}
-	prefix := `cache_fs=$(stat -f -c %t "$CACHE_DIR" 2>/dev/null || stat -f -c %t "$(dirname "$CACHE_DIR")") || { echo "ERROR: ModelCacheLockUnsupported: cannot determine cache filesystem; use an init image with stat -f support" >&2; exit 1; }; ` +
+	prefix := `cache_fs=$(stat -f -c %t "$CACHE_DIR" 2>/dev/null || stat -f -c %t "$(dirname "$CACHE_DIR")") || { echo "WARNING: cannot determine the cache filesystem: this init image's stat has no -f; staging under the directory lock, which does not exclude pods on other nodes on a FUSE cache" >&2; cache_fs=unknown; }; ` +
 		`if [ "$cache_fs" != 65735546 ]; then mkdir -p "$CACHE_DIR" || exit 1; ` + cacheDirLock +
 		`elif [ "${LLMKUBE_PREFETCH_STAGER:-false}" = true ]; then mkdir -p "$CACHE_DIR" || exit 1; fi; ` +
 		`llmkube_prepare_download() { if [ "$cache_fs" = 65735546 ] && [ "${LLMKUBE_PREFETCH_STAGER:-false}" != true ]; then ` +
