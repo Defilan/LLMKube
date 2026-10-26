@@ -62,6 +62,11 @@ const (
 	metalJoinRequestTimeout        = 30 * time.Second
 )
 
+// defaultLlamaServerPaths mirrors the agent's search list
+// (cmd/metal-agent defaultLlamaServerPaths): Apple Silicon, then Intel
+// Homebrew.
+var defaultLlamaServerPaths = []string{"/opt/homebrew/bin/llama-server", "/usr/local/bin/llama-server"}
+
 // metalHost is what join and leave need from the Mac. Tests replace it.
 type metalHost struct {
 	goos string
@@ -71,6 +76,8 @@ type metalHost struct {
 	launchctl func(ctx context.Context, args ...string) error
 	// lookPath finds a program on PATH.
 	lookPath func(string) (string, error)
+	// llamaServerPaths are where the agent looks for llama-server.
+	llamaServerPaths []string
 	// executable is this llmkube binary's path.
 	executable func() (string, error)
 }
@@ -91,8 +98,9 @@ var newMetalHost = func() (metalHost, error) {
 			}
 			return nil
 		},
-		lookPath:   exec.LookPath,
-		executable: os.Executable,
+		lookPath:         exec.LookPath,
+		llamaServerPaths: defaultLlamaServerPaths,
+		executable:       os.Executable,
 	}, nil
 }
 
@@ -157,7 +165,7 @@ again replaces the earlier setup; 'llmkube metal leave' removes it.`,
 	cmd.Flags().StringVar(&opts.agentBinary, "agent-binary", "",
 		"Path to llmkube-metal-agent (default: on PATH, else next to this llmkube)")
 	cmd.Flags().StringVar(&opts.llamaServer, "llama-server", "",
-		"Path to llama-server, passed to the agent (default: the agent finds it)")
+		"Path to llama-server, which the agent needs (default: Homebrew's, else on PATH)")
 	cmd.Flags().DurationVar(&opts.tokenLifetime, "token-lifetime", metalAgentTokenLifetimeDefault,
 		"Lifetime of the agent's token; the agent renews it at half (at least 10m)")
 	cmd.Flags().DurationVar(&opts.wait, "wait", metalJoinWaitDefault,
@@ -196,11 +204,15 @@ func runMetalJoin(cmd *cobra.Command, joinString string, opts *metalJoinOptions)
 	if err != nil {
 		return err
 	}
+	llamaServer, err := findLlamaServer(host, opts.llamaServer)
+	if err != nil {
+		return err
+	}
 	paths := newMetalAgentPaths(host.home)
 	if err := metalJoinSetup(ctx, p, opts.tokenLifetime, paths, log); err != nil {
 		return err
 	}
-	if err := installMetalAgent(ctx, host, paths, metalAgentArgs(agentBin, paths, p, opts.llamaServer), log); err != nil {
+	if err := installMetalAgent(ctx, host, paths, metalAgentArgs(agentBin, paths, p, llamaServer), log); err != nil {
 		return err
 	}
 	if opts.wait == 0 {
@@ -237,20 +249,52 @@ func findMetalAgentBinary(host metalHost, flag string) (string, error) {
 			candidates = append(candidates, filepath.Join(filepath.Dir(self), metalAgentBinary))
 		}
 	}
-	for _, c := range candidates {
-		abs, err := filepath.Abs(c)
-		if err != nil {
-			continue
-		}
-		if info, err := os.Stat(abs); err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0 {
-			return abs, nil
-		}
+	if abs, ok := firstExecutable(candidates); ok {
+		return abs, nil
 	}
 	if flag != "" {
 		return "", fmt.Errorf("--agent-binary %s is not an executable file", flag)
 	}
 	return "", fmt.Errorf("%s not found on PATH or next to llmkube; install it "+
 		"(brew install defilantech/tap/llmkube-metal-agent) or pass --agent-binary", metalAgentBinary)
+}
+
+// findLlamaServer is --llama-server, else the first of the agent's own search
+// paths, else llama-server on PATH. The agent exits at startup without
+// llama-server, which from here would only show as a Mac that never reports,
+// so join refuses first. The agent gets the path join found: launchd's PATH
+// is not the shell's.
+func findLlamaServer(host metalHost, flag string) (string, error) {
+	candidates := []string{flag}
+	if flag == "" {
+		candidates = append([]string(nil), host.llamaServerPaths...)
+		if p, err := host.lookPath("llama-server"); err == nil {
+			candidates = append(candidates, p)
+		}
+	}
+	if abs, ok := firstExecutable(candidates); ok {
+		return abs, nil
+	}
+	if flag != "" {
+		return "", fmt.Errorf("--llama-server %s is not an executable file", flag)
+	}
+	return "", fmt.Errorf("llama-server not found in %s or on PATH, and the agent cannot start without it; "+
+		"install it (brew install llama.cpp) or pass --llama-server", strings.Join(host.llamaServerPaths, ", "))
+}
+
+// firstExecutable returns the absolute path of the first candidate that is
+// an executable regular file.
+func firstExecutable(candidates []string) (string, bool) {
+	for _, c := range candidates {
+		abs, err := filepath.Abs(c)
+		if err != nil {
+			continue
+		}
+		if info, err := os.Stat(abs); err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0 {
+			return abs, true
+		}
+	}
+	return "", false
 }
 
 // metalJoinSetup redeems the join token: it mints the agent's own token,
@@ -393,9 +437,7 @@ func metalAgentArgs(agentBin string, paths metalAgentPaths, p metaljoin.Payload,
 		"--metal-node", p.Mac,
 		"--renew-service-account-token",
 		"--log-level", "info",
-	}
-	if llamaServer != "" {
-		args = append(args, "--llama-server", llamaServer)
+		"--llama-server", llamaServer,
 	}
 	return args
 }

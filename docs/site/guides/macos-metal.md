@@ -827,7 +827,11 @@ elsewhere). In order:
 1. Decodes the string and checks the CA against its pin, then prints
    the pin. Compare it with the one `token create` printed.
 2. Finds `llmkube-metal-agent`: `--agent-binary`, else on `PATH`,
-   else next to `llmkube` (a release archive, a Homebrew prefix).
+   else next to `llmkube` (a release archive, a Homebrew prefix). Finds
+   `llama-server`, which the agent cannot start without:
+   `--llama-server`, else `/opt/homebrew/bin` or `/usr/local/bin`, else
+   on `PATH`. Either one missing stops join before it changes anything,
+   so the join string still works after you install it.
 3. With the join token, which trusts only the string's CA, mints the
    agent's own token for the Mac's ServiceAccount (`--token-lifetime`,
    7 days by default).
@@ -853,7 +857,7 @@ elsewhere). In order:
 | Flag | Default | Meaning |
 |---|---|---|
 | `--agent-binary` | on `PATH`, else next to `llmkube` | Path to `llmkube-metal-agent`. |
-| `--llama-server` | the agent finds it | Path to `llama-server`, passed to the agent. |
+| `--llama-server` | Homebrew's, else on `PATH` | Path to `llama-server`; join passes the path it found to the agent. |
 | `--token-lifetime` | `168h` (7 days) | Lifetime of the agent's token (at least `10m`). |
 | `--wait` | `3m` | How long to wait for `Reachable`; `0` returns once the agent is started. |
 

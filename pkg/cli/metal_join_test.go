@@ -47,10 +47,11 @@ import (
 // fakeMac stands in for the Mac join and leave run on: a temporary home, a
 // llmkube-metal-agent on PATH, and a launchctl that records its calls.
 type fakeMac struct {
-	home     string
-	agentBin string
-	calls    []string
-	failOn   string
+	home        string
+	agentBin    string
+	llamaServer string
+	calls       []string
+	failOn      string
 }
 
 func newFakeMac(t *testing.T) *fakeMac {
@@ -61,6 +62,10 @@ func newFakeMac(t *testing.T) *fakeMac {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(m.agentBin, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	m.llamaServer = filepath.Join(filepath.Dir(m.agentBin), "llama-server")
+	if err := os.WriteFile(m.llamaServer, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	prev := newMetalHost
@@ -83,7 +88,8 @@ func newFakeMac(t *testing.T) *fakeMac {
 				}
 				return "", exec.ErrNotFound
 			},
-			executable: func() (string, error) { return filepath.Join(m.home, "llmkube"), nil },
+			llamaServerPaths: []string{m.llamaServer},
+			executable:       func() (string, error) { return filepath.Join(m.home, "llmkube"), nil },
 		}, nil
 	}
 	t.Cleanup(func() { newMetalHost = prev })
@@ -256,7 +262,7 @@ func assertMetalAgentPlist(t *testing.T, mac *fakeMac, paths metalAgentPaths, ns
 		}
 	}
 	want := []string{mac.agentBin, "--kubeconfig", paths.Kubeconfig, "--namespace", ns, "--metal-node", "mac-a",
-		"--renew-service-account-token", "--log-level", "info"}
+		"--renew-service-account-token", "--log-level", "info", "--llama-server", mac.llamaServer}
 	if strings.Join(args, "\x00") != strings.Join(want, "\x00") {
 		t.Errorf("agent arguments %q, want %q", args, want)
 	}
@@ -322,6 +328,8 @@ func TestMetalJoinRefusesBeforeAnyChange(t *testing.T) {
 			_ = os.Chmod(m.agentBin, 0o644) //nolint:gosec // G302: not executable on purpose
 		},
 			[]string{"join", joinString, "--agent-binary", "AGENT"}, "not an executable"},
+		{"no llama-server", func(m *fakeMac) { _ = os.Remove(m.llamaServer) }, []string{"join", joinString},
+			"brew install llama.cpp"},
 		{"short token lifetime", nil, []string{"join", joinString, "--token-lifetime", "5m"}, "10m"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -494,5 +502,58 @@ func TestFindMetalAgentBinary(t *testing.T) {
 	}
 	if _, err := findMetalAgentBinary(host(""), filepath.Join(dir, "missing")); err == nil {
 		t.Error("a missing --agent-binary was accepted")
+	}
+}
+
+func TestFindLlamaServer(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	exe := func(name string) string {
+		p := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	brew := exe("homebrew/llama-server")
+	onPath := exe("path/llama-server")
+	flagged := exe("built/llama-server")
+	host := func(searched []string, path string) metalHost {
+		return metalHost{
+			llamaServerPaths: searched,
+			lookPath: func(string) (string, error) {
+				if path == "" {
+					return "", exec.ErrNotFound
+				}
+				return path, nil
+			},
+		}
+	}
+	missing := filepath.Join(dir, "nowhere/llama-server")
+	for _, tc := range []struct {
+		name string
+		host metalHost
+		flag string
+		want string
+	}{
+		{"the agent's search path first", host([]string{missing, brew}, onPath), "", brew},
+		{"else PATH", host([]string{missing}, onPath), "", onPath},
+		{"the flag over both", host([]string{brew}, onPath), flagged, flagged},
+	} {
+		if got, err := findLlamaServer(tc.host, tc.flag); err != nil || got != tc.want {
+			t.Errorf("%s: %q, %v; want %s", tc.name, got, err, tc.want)
+		}
+	}
+	if _, err := findLlamaServer(host([]string{missing}, ""), ""); err == nil ||
+		!strings.Contains(err.Error(), "brew install llama.cpp") {
+		t.Errorf("no llama-server anywhere: err = %v, want an install hint", err)
+	}
+	if _, err := findLlamaServer(host([]string{brew}, ""), missing); err == nil {
+		t.Error("a missing --llama-server was accepted")
 	}
 }
