@@ -79,6 +79,10 @@ func foreignObjects() []foreignObject {
 		{"Secret", func(ns string, l map[string]string) client.Object {
 			return &corev1.Secret{ObjectMeta: meta(ns, "llmkube-metal-mac-a-join", l), Data: map[string][]byte{"k": []byte("v")}}
 		}},
+		{"MetalNode", func(ns string, l map[string]string) client.Object {
+			return &inferencev1alpha1.MetalNode{ObjectMeta: meta(ns, "mac-a", l), Spec: inferencev1alpha1.MetalNodeSpec{
+				ServiceAccountName: "someone-else", LeaseName: "someone-else", HostIP: "10.0.0.9"}}
+		}},
 	}
 }
 
@@ -188,6 +192,7 @@ func TestMetalStepGuardsRefuseForeignObjects(t *testing.T) {
 		"RoleBinding":        ensureMetalRoleBindings,
 		"shared RoleBinding": ensureMetalRoleBindings,
 		"Lease":              ensureMetalLease,
+		"MetalNode":          ensureMetalNode,
 		"Secret": func(ctx context.Context, a metalApply) error {
 			_, err := recreateJoinSecret(ctx, a)
 			return err

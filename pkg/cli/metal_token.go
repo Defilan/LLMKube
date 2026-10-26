@@ -347,6 +347,7 @@ func metalDerivedObjects(namespace string, n metalNames) []struct {
 		{"RoleBinding", &rbacv1.RoleBinding{ObjectMeta: om(n.SharedBinding)}},
 		{"Lease", &coordinationv1.Lease{ObjectMeta: om(n.Lease)}},
 		{"Secret", &corev1.Secret{ObjectMeta: om(n.JoinSecret)}},
+		{"MetalNode", &inferencev1alpha1.MetalNode{ObjectMeta: om(n.MetalNode)}},
 	}
 }
 
@@ -560,20 +561,15 @@ func ensureMetalLease(ctx context.Context, a metalApply) error {
 
 // ensureMetalNode creates the MetalNode or points an existing one at the
 // Mac's ServiceAccount and Lease, keeping the admin's hostIP and verifier
-// placement. A MetalNode is this Mac by kind and name, so an unlabeled one
-// (applied by hand) is adopted.
+// placement. Like every other object of the Mac's, an existing one must be
+// labeled for this Mac.
 func ensureMetalNode(ctx context.Context, a metalApply) error {
 	c, namespace, n, log := a.c, a.namespace, a.names, a.log
 	mn := &inferencev1alpha1.MetalNode{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: n.MetalNode}}
 	res, err := controllerutil.CreateOrUpdate(ctx, c, mn, func() error {
-		labels := mn.GetLabels()
-		if labels == nil {
-			labels = map[string]string{}
+		if err := adoptCheck("MetalNode", mn, n.Mac); err != nil {
+			return err
 		}
-		for k, v := range metalLabels(n.Mac) {
-			labels[k] = v
-		}
-		mn.SetLabels(labels)
 		mn.Spec.ServiceAccountName = n.ServiceAccount
 		mn.Spec.LeaseName = n.Lease
 		return nil

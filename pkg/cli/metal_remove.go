@@ -24,7 +24,6 @@ import (
 	"github.com/spf13/cobra"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
@@ -99,12 +98,7 @@ func runMetalRemove(cmd *cobra.Command, mac, namespaceFlag string, includeUnlabe
 func metalRemove(ctx context.Context, c client.Client, namespace, mac string, includeUnlabeled bool,
 	out, log io.Writer) error {
 	n := newMetalNames(mac)
-	targets := append(metalDerivedObjects(namespace, n), struct {
-		kind string
-		obj  client.Object
-	}{"MetalNode", &inferencev1alpha1.MetalNode{
-		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: n.MetalNode},
-	}})
+	targets := metalDerivedObjects(namespace, n)
 
 	removed, skippedSA, skippedUnlabeled := 0, false, false
 	for _, t := range targets {
