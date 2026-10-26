@@ -532,7 +532,9 @@ func installMetalAgent(ctx context.Context, host metalHost, paths metalAgentPath
 	// same microsecond still counts as the new agent's.
 	started := time.Now().Truncate(time.Microsecond)
 	if err := host.launchctl(ctx, "bootstrap", domain, paths.Plist); err != nil {
-		return time.Time{}, fmt.Errorf("start the agent: %w", err)
+		return time.Time{}, fmt.Errorf("start the agent: %w; the join string is used up but the agent's "+
+			"credentials are in place, so once that is fixed start it with: launchctl bootstrap %s %q",
+			err, domain, paths.Plist)
 	}
 	_, _ = fmt.Fprintf(log, "started the %s LaunchAgent (%s)\n", metalAgentLabel, paths.Plist)
 	return started, nil

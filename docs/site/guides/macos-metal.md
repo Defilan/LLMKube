@@ -854,7 +854,10 @@ elsewhere). In order:
    `LaunchAgents`, where launchd could load it at login; a later `join`
    does not overwrite that copy. The agent runs with `--kubeconfig`,
    `--namespace`, `--metal-node` and `--renew-service-account-token`,
-   and logs to `~/Library/Logs/llmkube/metal-agent.log`.
+   and logs to `~/Library/Logs/llmkube/metal-agent.log`. If
+   `launchctl bootstrap` fails, the string is already used, but the
+   credentials are in place: the error prints the command that starts
+   the agent once the cause is fixed.
 7. Waits up to `--wait` (3 minutes; `0` does not wait) for the
    MetalNode to report `Reachable`, printing each change of
    `AgentConnected` and `Reachable`. Only status for the agent this

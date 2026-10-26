@@ -570,6 +570,20 @@ func TestMetalLeaveLeavesALaunchAgentJoinDidNotWrite(t *testing.T) {
 	}
 }
 
+// TestMetalJoinSaysHowToStartAfterBootstrapFails: the string is used up by
+// then, so the error must say how to start the agent without a new one.
+func TestMetalJoinSaysHowToStartAfterBootstrapFails(t *testing.T) {
+	_, _, ns := metalEnvtest(t)
+	mac := newFakeMac(t)
+	mac.failOn = "bootstrap"
+	joinString, _ := issueJoinString(t, ns)
+	_, _, err := runMetal(t, "join", joinString, "--wait", "0")
+	if want := "launchctl bootstrap gui/501 \"" + mac.paths().Plist + "\""; err == nil ||
+		!strings.Contains(err.Error(), want) {
+		t.Errorf("join with a failing bootstrap: err = %v, want it to say %s", err, want)
+	}
+}
+
 // TestMetalJoinWaitTimesOutAndSaysWhy: when the cluster never verifies the
 // Mac, join fails after --wait with the conditions it last saw, and leaves
 // the agent installed to keep trying.
