@@ -330,15 +330,16 @@ func (r *ModelRouterReconciler) resolveInferenceServiceAddress(
 }
 
 // localBackendServedModel returns the model identifier the runtime behind an
-// InferenceService actually serves when that differs from the InferenceService
-// name, and "" when it does not. oMLX serves the model-store directory
-// basename, mirroring the agent's model-id derivation in
+// InferenceService actually serves, and "" to keep the InferenceService name.
+// vLLM and SGLang reject a request for a name they do not serve, so they get
+// the name their container is started with (servedModelNames): the user's
+// --served-model-name, else the modelRef (#1988). oMLX serves the model-store
+// directory basename, mirroring the agent's model-id derivation in
 // pkg/agent/executor_omlx.go (filepath.Base(ModelSource)); the two sides must
-// agree or the router rewrites to a name oMLX rejects. Every other runtime
-// serves the InferenceService name, so this returns "". A missing
-// InferenceService or Model, or an empty ModelRef, degrades to "" (the
-// InferenceService name fallback) rather than failing the compile; the address
-// path already reports the backend unhealthy.
+// agree or the router rewrites to a name oMLX rejects. llama.cpp ignores the
+// field. A missing InferenceService or Model, or an empty ModelRef, degrades
+// to "" (the InferenceService name fallback) rather than failing the compile;
+// the address path already reports the backend unhealthy.
 func (r *ModelRouterReconciler) localBackendServedModel(
 	ctx context.Context,
 	namespace, name string,
@@ -347,7 +348,17 @@ func (r *ModelRouterReconciler) localBackendServedModel(
 	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, isvc); err != nil {
 		return ""
 	}
-	if isvc.Spec.Runtime != inferencev1alpha1.RuntimeOMLX || isvc.Spec.ModelRef == "" {
+	switch runtimeNameLabel(isvc) {
+	case RuntimeVLLM, RuntimeSGLANG:
+		if names := servedModelNames(isvc); len(names) > 0 {
+			return names[0]
+		}
+		return ""
+	case inferencev1alpha1.RuntimeOMLX:
+	default:
+		return ""
+	}
+	if isvc.Spec.ModelRef == "" {
 		return ""
 	}
 	model := &inferencev1alpha1.Model{}

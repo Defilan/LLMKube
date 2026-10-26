@@ -379,12 +379,12 @@ spec:
         name: reranker
 ```
 
-`chat-vllm` must start vLLM with `--served-model-name=chat-large` in its `extraArgs`, since LLMKube does not set that flag.
+`chat-vllm` must start vLLM with `--served-model-name=chat-large` in its `extraArgs`: without it, LLMKube starts vLLM serving the InferenceService's `spec.modelRef` (and the model path), not `chat-large`.
 
 The router generates, all in its own namespace and owned by it:
 
 - one `HTTPRoute` named after the router, attached to the Gateway, with a single rule named `models` at `/` whose only backend is `AgentgatewayModel` `*`. The rule sits at `/` because agentgateway strips the rule's path prefix before it classifies the endpoint: under `/v1`, `/v1/embeddings` would parse as a chat completion;
-- one `AgentgatewayModel` per backend, named `<router>-<backend>` (cut and hashed past 63 characters), attached to that rule. Its `match.model` is the backend's `displayName`, else its `name`, so served names such as `Qwen3.5-2B` or `org/model` work. It reaches the `InferenceService`'s Service through a custom provider, and the request keeps its model name, so the served name must be one the runtime answers to: llama.cpp ignores it, and vLLM needs a matching `--served-model-name` in `extraArgs`.
+- one `AgentgatewayModel` per backend, named `<router>-<backend>` (cut and hashed past 63 characters), attached to that rule. Its `match.model` is the backend's `displayName`, else its `name`, so served names such as `Qwen3.5-2B` or `org/model` work. It reaches the `InferenceService`'s Service through a custom provider, and the request keeps its model name, so the served name must be one the runtime answers to: llama.cpp ignores it, and vLLM answers to its `--served-model-name` from `extraArgs`, else to `spec.modelRef`.
 
 The provider and API formats come from the `InferenceService`:
 
@@ -403,7 +403,7 @@ The router reports `AgentGatewayReady=False` and generates nothing when:
 
 - the `AgentgatewayModel` CRD is not installed (`AgentgatewayModelCRDNotInstalled`);
 - the spec has `rules`, a `defaultRoute`, an `external` backend, `resolution: endpoint`, a backend `endpointPicker`, a served name containing `*`, or two backends serving one name (`UnsupportedInModelRouting`; the webhook rejects these at apply time). Fallback between backends and external backends need an `AgentgatewayBackend`, which this mode does not generate yet;
-- a backend's `InferenceService` runs a runtime other than `llamacpp` or `vllm`, or runs vLLM without a `--served-model-name` matching the backend's served name (`UnsupportedRuntimeInModelRouting`);
+- a backend's `InferenceService` runs a runtime other than `llamacpp` or `vllm`, or runs vLLM serving a name other than the backend's served name (`UnsupportedRuntimeInModelRouting`);
 - a generated name is held by an object LLMKube did not create (`GeneratedResourceNameTaken`); delete or rename that object.
 
 When you replace hand-written `AgentgatewayModel`s with a router, remove the hand-written ones for the same model names on that listener, so each name has one model.

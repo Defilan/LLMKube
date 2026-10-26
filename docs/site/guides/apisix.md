@@ -621,11 +621,9 @@ forwards, replacing whatever `model` the client sent. Without it, the client's
 `model` passes through unchanged, and vLLM rejects a request for any name it
 does not serve.
 
-Set `options.model` to the runtime's served model name. vLLM serves the model
-under the path or repository id LLMKube starts it with unless
-`--served-model-name` is set, which is why the manifest above sets it. SGLang
-gets `--served-model-name` set to `spec.modelRef` automatically. To check the
-name, ask the runtime with the key:
+Set `options.model` to the runtime's served model name. vLLM and SGLang get
+`--served-model-name` set to `spec.modelRef` unless `extraArgs` sets it, as the
+manifest above does. To check the name, ask the runtime with the key:
 
 ```bash
 curl -sS http://localhost:8000/v1/models -H "Authorization: Bearer $UPSTREAM_KEY"

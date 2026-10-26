@@ -21,6 +21,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"slices"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -241,32 +242,10 @@ func newAgentGatewayModel(mr *inferencev1alpha1.ModelRouter, route string, b age
 }
 
 // vllmServesModel reports whether vLLM answers to model. The request keeps its
-// model name, and LLMKube starts vLLM without --served-model-name (#1988), so
-// the name must come from the user's args. vLLM sees spec.args only with a
-// command override (setCommandAndArgs), otherwise just spec.extraArgs.
+// model name, so it must be one the container is started with: the user's
+// --served-model-name, else the modelRef LLMKube sets (#1988).
 func vllmServesModel(isvc *inferencev1alpha1.InferenceService, model string) bool {
-	args := isvc.Spec.ExtraArgs
-	if len(isvc.Spec.Command) > 0 {
-		args = append(append([]string{}, isvc.Spec.Args...), args...)
-	}
-	for i, a := range args {
-		if v, ok := strings.CutPrefix(a, "--served-model-name="); ok && v == model {
-			return true
-		}
-		if a != "--served-model-name" {
-			continue
-		}
-		// vLLM takes one or more names after the flag.
-		for _, v := range args[i+1:] {
-			if strings.HasPrefix(v, "-") {
-				break
-			}
-			if v == model {
-				return true
-			}
-		}
-	}
-	return false
+	return slices.Contains(servedModelNames(isvc), model)
 }
 
 // resolveAgentGatewayModelBackends returns an agentGatewayRefusalError for an

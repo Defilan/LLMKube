@@ -701,8 +701,11 @@ func TestModelRouterAgentGateway_ModelRoutingRefusals(t *testing.T) {
 			func(mr *inferencev1alpha1.ModelRouter) { mr.Spec.DefaultRoute = "llama" }},
 		{"unmapped-runtime", "sglang", modelRouterAgentGatewayReasonUnsupportedRuntime, `runtime "sglang"`,
 			func(*inferencev1alpha1.ModelRouter) {}},
-		{"vllm-without-served-name", "bare-vllm", modelRouterAgentGatewayReasonUnsupportedRuntime,
-			`"--served-model-name=bare-vllm"`, func(*inferencev1alpha1.ModelRouter) {}},
+		// vLLM serves its modelRef, bare-vllm, so a different served name is
+		// refused (#1988).
+		{"vllm-serves-another-name", "bare-vllm", modelRouterAgentGatewayReasonUnsupportedRuntime,
+			`"--served-model-name=chat-large"`,
+			func(mr *inferencev1alpha1.ModelRouter) { mr.Spec.Backends[0].DisplayName = "chat-large" }},
 		{"unknown-listener", "llama", modelRouterAgentGatewayReasonNotAllowed, `no listener named "models"`,
 			func(mr *inferencev1alpha1.ModelRouter) { mr.Spec.AgentGatewayRef.SectionName = "models" }},
 	}
@@ -721,6 +724,29 @@ func TestModelRouterAgentGateway_ModelRoutingRefusals(t *testing.T) {
 			assertNotExistsInNamespace(t, c, gatewayHTTPRouteGVK(), ns, mr.Name)
 			assertNotExistsInNamespace(t, c, agentGatewayModelGVK(), ns, mr.Name+"-"+tt.isvc)
 		})
+	}
+}
+
+// vLLM serves its modelRef with no extraArgs (#1988), so a backend whose
+// served name is the modelRef compiles.
+func TestModelRouterAgentGateway_ModelRoutingVLLMServesModelRef(t *testing.T) {
+	c, cfg, stop := startAgentGatewayTestEnv(t, true)
+	defer stop()
+	ns := newTestNamespace(t, c)
+
+	makeGateway(t, c, ns, "ai-gateway", nil, nil)
+	makeModelISvc(t, c, ns, "bare-vllm", RuntimeVLLM, "", 8000)
+	mr := modelRoutingRouter(ns, "by-ref", "bare-vllm")
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+	reconcileAgentGatewayRouter(t, newModelRouterAgentGatewayReconciler(t, cfg), mr)
+	if cond, _ := agentGatewayReadyCondition(t, c, mr); cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("expected AgentGatewayReady=True, got %+v", cond)
+	}
+	m := getUnstructuredInNamespace(t, c, agentGatewayModelGVK(), ns, "by-ref-bare-vllm")
+	if got, _, _ := unstructured.NestedString(m.Object, "spec", "match", "model"); got != "bare-vllm" {
+		t.Errorf("match.model = %q, want bare-vllm", got)
 	}
 }
 
