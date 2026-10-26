@@ -38,10 +38,10 @@ const (
 	sha256WiredDigestLower = "d9ba44419f2a73ed1a666885066c65a235ab70f337e2b31cbb3d062a5f5b8d4b"
 )
 
+// The atomic writer is shared with unpinned size records, not a digest gate.
 var sha256HelperTokens = []string{
 	"llmkube_sha256_hash",
 	"llmkube_precheck_sha256",
-	"llmkube_atomic_write",
 	"llmkube_marker_hit_sha256",
 	"llmkube_check_sha256",
 	"llmkube_publish_sha256",
@@ -299,8 +299,8 @@ func TestModelStorageConfig_MultiFileDigestWiring(t *testing.T) {
 						if !strings.Contains(calls, `[ "$remote_size" != "0" ] && llmkube_accept_file "$dest"; then`) {
 							t.Errorf("OnChange size-match is not gated by llmkube_accept_file:\n%s", calls)
 						}
-					} else if !strings.Contains(calls, `if [ -f "$dest" ] && llmkube_accept_file "$dest"; then`) {
-						t.Errorf("IfNotPresent cache probe is not gated by llmkube_accept_file:\n%s", calls)
+					} else if !strings.Contains(calls, `if [ -f "$dest" ] && { if [ -n "${MODEL_SHA256:-}" ]; then llmkube_accept_file "$dest"; else llmkube_cached_size_matches; fi; }; then`) {
+						t.Errorf("IfNotPresent cache probe must verify pinned digests and check unpinned sizes:\n%s", calls)
 					}
 				})
 			}
