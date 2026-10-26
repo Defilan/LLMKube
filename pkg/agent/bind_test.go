@@ -76,22 +76,21 @@ func TestOMLXBindHostOverrideReachesDaemon(t *testing.T) {
 		t.Fatal(err)
 	}
 	argsPath := filepath.Join(t.TempDir(), "args")
-	bin := fakeOMLXDaemon(t, "echo \"$@\" > '"+argsPath+"'\nexit 1\n")
+	bin := fakeOMLXDaemon(t, recordCmd(`echo "$@"`, argsPath)+"exit 1\n")
 
 	port, err := allocateLoopbackPort()
 	if err != nil {
 		t.Fatal(err)
 	}
 	e := NewOMLXExecutor(bin, store, port, newNopLogger())
-	e.SetStartupTimeout(300 * time.Millisecond)
+	// The start kills the daemon when its health wait expires, so the
+	// timeout must outlast the fake's shell start under load (#2245).
+	e.SetStartupTimeout(2 * time.Second)
 
 	_, _ = e.StartProcess(context.Background(),
 		ExecutorConfig{Name: "isvc", Namespace: "ns", ModelName: "m", BindHost: "0.0.0.0"})
 
-	data, err := os.ReadFile(argsPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	data := childFile(t, argsPath)
 	if got := flagValue(strings.Fields(string(data)), "--host"); got != "0.0.0.0" {
 		t.Errorf("oMLX daemon --host = %q, want 0.0.0.0 (args %q)", got, strings.TrimSpace(string(data)))
 	}

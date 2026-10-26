@@ -311,8 +311,8 @@ func TestTensorFoldStartProcess_HealthyChildThenStop(t *testing.T) {
 	argsFile := filepath.Join(out, "args")
 	envFile := filepath.Join(out, "env")
 	bin := fakeTensorFold(t,
-		"for a in \"$@\"; do echo \"$a\"; done > '"+argsFile+"'\n"+
-			"echo \"$TENSORFOLD_NO_UPDATE_CHECK\" > '"+envFile+"'\n"+
+		recordCmd(`for a in "$@"; do echo "$a"; done`, argsFile)+
+			recordCmd(`echo "$TENSORFOLD_NO_UPDATE_CHECK"`, envFile)+
 			"exec sleep 60\n")
 	e, cfg, logPath := tensorFoldFixture(t, bin)
 	port := healthyPort(t)
@@ -497,11 +497,7 @@ func TestBuildExecutors_TensorFold(t *testing.T) {
 
 func readLines(t *testing.T, path string) []string {
 	t.Helper()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read %s: %v", path, err)
-	}
-	return strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	return strings.Split(strings.TrimRight(string(childFile(t, path)), "\n"), "\n")
 }
 
 func TestTensorFoldStartProcess_OnSpawnedErrorKillsChild(t *testing.T) {
