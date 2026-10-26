@@ -360,13 +360,64 @@ func TestProxyModelsDisplayName(t *testing.T) {
 		t.Fatalf("decode /v1/models: %v", err)
 	}
 	data, _ := got["data"].([]any)
-	// First model should use DisplayName, second should use Model (cloud backend).
+	// The first model uses its DisplayName. The cloud backend has none, so it
+	// is listed under its Name, not its upstream Model (#2256).
 	if len(data) != 2 {
 		t.Fatalf("expected 2 models, got %d", len(data))
 	}
 	first, _ := data[0].(map[string]any)
 	if first["id"] != "qwen3-coder-30b" {
 		t.Errorf("first model id = %v, want qwen3-coder-30b", first["id"])
+	}
+	second, _ := data[1].(map[string]any)
+	if second["id"] != "cloud-opus" {
+		t.Errorf("second model id = %v, want the backend name cloud-opus", second["id"])
+	}
+}
+
+// TestProxyModelsListedIDsRoute: under BackendNameMatch, every id /v1/models
+// lists reaches the backend it names. A cloud backend used to be listed under
+// its upstream Model, which BackendNameMatch does not resolve, so a client
+// that picked it from the list was served by the default route (#2256).
+func TestProxyModelsListedIDsRoute(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		displayName string // given to the cloud backend
+	}{
+		{"cloud backend without displayName", ""},
+		{"cloud backend with displayName", "claude-opus-4-7-20260101"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newProxyHarness(t)
+			h.cfg.DefaultRouteStrategy = DefaultRouteStrategyBackendNameMatch
+			h.cfg.Backends[1].DisplayName = tc.displayName
+			backendFor := map[string]*fakeBackend{"local-qwen": h.localBack, "cloud-opus": h.cloudBack}
+
+			rec := httptest.NewRecorder()
+			h.handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+			var got struct {
+				Data []struct {
+					ID string `json:"id"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+				t.Fatalf("decode /v1/models: %v", err)
+			}
+			if len(got.Data) != len(h.cfg.Backends) {
+				t.Fatalf("/v1/models lists %d models, want %d", len(got.Data), len(h.cfg.Backends))
+			}
+			for i, m := range got.Data {
+				want := backendFor[h.cfg.Backends[i].Name]
+				before := want.calls.Load()
+				resp := h.post(t, map[string]any{"model": m.ID,
+					"messages": []map[string]string{{"role": "user", "content": "hi"}}}, nil)
+				_ = resp.Body.Close()
+				if resp.StatusCode != http.StatusOK || want.calls.Load() != before+1 {
+					t.Errorf("model %q (listed for backend %s): status %d, backend calls %d -> %d; want it served by %s",
+						m.ID, h.cfg.Backends[i].Name, resp.StatusCode, before, want.calls.Load(), h.cfg.Backends[i].Name)
+				}
+			}
+		})
 	}
 }
 

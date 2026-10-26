@@ -173,7 +173,7 @@ Point any OpenAI-compatible client at that URL and it just works. The proxy serv
 | `POST /v1/rerank` | Reranking |
 | `POST /v1/messages` | Anthropic Messages API: Claude Code and the Anthropic SDKs |
 | `POST /v1/messages/count_tokens` | Anthropic token counting |
-| `GET /v1/models` | Model discovery |
+| `GET /v1/models` | Model discovery: one entry per backend, under its `displayName`, else its `name`, the id `BackendNameMatch` resolves. An external backend's upstream `model` is not listed. |
 
 The two Anthropic routes are placed, balanced and session-bound exactly like chat completions, and headers such as `anthropic-version` and `anthropic-beta` pass through. The backend must serve them itself: vLLM does natively; a backend that does not returns its own `404`, which reaches the client unchanged and does not count against the backend. Token budgets charge Anthropic responses from their own usage fields (cached input included), and errors the router itself returns on these routes use the Anthropic error shape.
 
@@ -190,7 +190,7 @@ Headers that change routing:
 `defaultRouteStrategy` controls what happens to a request that matches no rule, before the `defaultRoute` fallback applies:
 
 - **`Static`** (default) routes every unmatched request to `defaultRoute`.
-- **`BackendNameMatch`** first checks whether the request's `model` field exactly equals a backend `name`; if so, it routes straight to that backend. Only when no backend name matches does it fall back to `defaultRoute`. This lets clients address a backend directly (`{"model": "cloud-opus"}`) without writing a pass-through rule for each one.
+- **`BackendNameMatch`** first checks whether the request's `model` field exactly equals a backend's `displayName`, else its `name`; if so, it routes straight to that backend. Only when no backend matches does it fall back to `defaultRoute`. This lets clients address a backend directly (`{"model": "cloud-opus"}`) without writing a pass-through rule for each one.
 
 The lookup is against backend `name` — the identifier you publish to clients — never the upstream provider `model`, so the proxied API surface stays on its own side of the boundary. Explicit rules always win: name matching only fires when no rule accepted the request, and it never bypasses a `failClosed` rule.
 
