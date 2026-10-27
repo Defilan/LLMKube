@@ -271,7 +271,6 @@ rules:
   - inference.llmkube.dev
   resources:
   - gpuquotas
-  - metalnodes
   verbs:
   - get
   - list
@@ -319,6 +318,14 @@ rules:
   - models/finalizers
   verbs:
   - update
+- apiGroups:
+  - inference.llmkube.dev
+  resources:
+  - metalnodes
+  verbs:
+  - get
+  - list
+  - watch
 - apiGroups:
   - inference.networking.k8s.io
   resources:

@@ -134,7 +134,7 @@ type MetalNodeReconciler struct {
 	Now func() time.Time
 }
 
-// +kubebuilder:rbac:groups=inference.llmkube.dev,resources=metalnodes,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=inference.llmkube.dev,resources=metalnodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=inference.llmkube.dev,resources=metalnodes/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=inference.llmkube.dev,resources=metalnodes/finalizers,verbs=update
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch

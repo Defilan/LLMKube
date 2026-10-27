@@ -169,8 +169,6 @@ rules:
   verbs:
   - get
   - list
-  - patch
-  - update
   - watch
 # The metal-agent's heartbeat Lease, read by the MetalNode controller.
 - apiGroups:
