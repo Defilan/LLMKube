@@ -233,12 +233,21 @@ var modelTransferSignatures = []modelTransferSignature{
 		// both. It only fires for a container that writes the cache
 		// (writesModelCache): the prefetched serving pod mounts the same claim
 		// read-only and this remedy does not apply to it.
+		//
+		// The diagnosis cannot tell from the pod whether the operator disabled
+		// fsGroup (an OpenShift SCC injects one into the pod either way), so
+		// the remedy names both causes: the prep switched off, and, with the
+		// prep on and fsGroup off, an --init-container-user that is not the
+		// init image's uid (#2204).
 		reason: ReasonModelCacheNotWritable,
 		remedy: "the downloader cannot write to the model cache. The cache-prep init container fixes ownership, " +
 			"and it is off when the operator runs with --model-cache-prep=never (chart value modelCache.prep): " +
 			"that setting is only right for storage that applies the pod fsGroup itself (a CSI driver with " +
 			"fsGroupPolicy File). Either turn the prep back on (modelCache.prep: always) or chown the cache root " +
-			"to the downloader's uid, for example with `llmkube cache prep`",
+			"to the downloader's uid, for example with `llmkube cache prep`. If the prep is already on and the " +
+			"operator default fsGroup is disabled (--default-fsgroup=0, the OpenShift preset), the prep chowns the " +
+			"root to --init-container-user (chart value controllerManager.initContainer.user, default 101) unless " +
+			"spec.podSecurityContext.runAsUser is set: set that flag to the uid --init-container-image runs as",
 		matches: []string{"permission denied"},
 	},
 }

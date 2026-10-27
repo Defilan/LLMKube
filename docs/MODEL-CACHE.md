@@ -1062,7 +1062,7 @@ Before this change the `fsGroup <= 0` branch ran `chown 100:100 /models && chmod
 | Value | Effect |
 |-------|--------|
 | `always` (default) | The prep runs in every cache-backed pod and every prefetch Job. |
-| `never` | The prep is never injected. The downloader still runs non-root; if the volume's ownership is wrong it fails with `Permission denied` and the `ModelCacheNotWritable` diagnosis names this setting. |
+| `never` | The prep is never injected. The downloader still runs non-root; if the volume's ownership is wrong it fails with `Permission denied` and the `ModelCacheNotWritable` diagnosis names this setting, and `--init-container-user` for the case where the prep is on with fsGroup disabled. |
 
 Use `never` only when you know the cache's ownership is right without the prep: a CSI driver with `fsGroupPolicy: File` and a pod that sets `fsGroup` (kubelet applies only the pod's fsGroup), or a claim you pre-provisioned with the downloader's ownership. A supplied `spec.podSecurityContext` replaces the operator's default entirely, so `fsGroup` must be restated there. Then the cache-backed pods contain no root container at all, which is what a `restricted` namespace needs, and the prefetch Job additionally carries `runAsNonRoot` with a numeric uid, `allowPrivilegeEscalation: false`, `ALL` dropped, and a pod-level `seccompProfile: RuntimeDefault`.
 
