@@ -113,10 +113,13 @@ func newRouterService(mr *inferencev1alpha1.ModelRouter) *corev1.Service {
 			ExternalTrafficPolicy: etp,
 			Ports: []corev1.ServicePort{
 				{
-					Name:       "http",
-					Port:       port,
-					NodePort:   nodePort,
-					TargetPort: intstr.FromInt(int(port)),
+					Name:     "http",
+					Port:     port,
+					NodePort: nodePort,
+					// spec.endpoint.port is the Service port only: the proxy
+					// always listens on routerProxyPort, so a Service on port 80
+					// still reaches it without the pod binding below 1024 (#2278).
+					TargetPort: intstr.FromInt(int(routerProxyPort)),
 					Protocol:   corev1.ProtocolTCP,
 				},
 			},

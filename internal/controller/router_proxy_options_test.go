@@ -12,12 +12,15 @@ package controller
 
 import (
 	"context"
+	"net"
 	"reflect"
+	"strconv"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -234,5 +237,76 @@ func TestReconcileRouterDeploymentAppliesRuntimeClassName(t *testing.T) {
 	}
 	if got := dep.Spec.Template.Spec.RuntimeClassName; got != nil {
 		t.Errorf("live RuntimeClassName after removal = %q, want nil", *got)
+	}
+}
+
+// proxyListenPort is the port the router-proxy container is told to listen on:
+// the value of its --listen argument in the Deployment the controller builds.
+func proxyListenPort(t *testing.T, mr *inferencev1alpha1.ModelRouter) int {
+	t.Helper()
+	dep := (&ModelRouterReconciler{RouterProxyImage: "img"}).newRouterDeployment(mr, "hash", false)
+	args := dep.Spec.Template.Spec.Containers[0].Args
+	for i, a := range args {
+		if a == "--listen" && i+1 < len(args) {
+			_, port, err := net.SplitHostPort(args[i+1])
+			if err != nil {
+				t.Fatalf("--listen %q: %v", args[i+1], err)
+			}
+			n, err := strconv.Atoi(port)
+			if err != nil {
+				t.Fatalf("--listen port %q: %v", port, err)
+			}
+			return n
+		}
+	}
+	t.Fatalf("router-proxy container has no --listen argument: %q", args)
+	return 0
+}
+
+// TestRouterServiceTargetsTheProxyListenPort pins #2278: spec.endpoint.port
+// sets the Service port, and the Service always forwards to the port the
+// proxy listens on. Before, targetPort followed spec.endpoint.port, so any
+// value but 8080 pointed the Service at a port nothing listened on.
+func TestRouterServiceTargetsTheProxyListenPort(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		endpoint *inferencev1alpha1.EndpointSpec
+		wantPort int32
+	}{
+		{"no endpoint", nil, routerProxyPort},
+		{"port 80", &inferencev1alpha1.EndpointSpec{Port: 80}, 80},
+		{"port 8080", &inferencev1alpha1.EndpointSpec{Port: 8080}, 8080},
+		{"NodePort on 9000", &inferencev1alpha1.EndpointSpec{Port: 9000, Type: "NodePort"}, 9000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mr := routerWithEndpoint(tc.endpoint)
+			p := newRouterService(mr).Spec.Ports[0]
+			if p.Port != tc.wantPort {
+				t.Errorf("Service port = %d, want %d", p.Port, tc.wantPort)
+			}
+			if listen := proxyListenPort(t, mr); p.TargetPort.IntValue() != listen {
+				t.Errorf("Service targetPort = %s, but the proxy listens on %d", p.TargetPort.String(), listen)
+			}
+		})
+	}
+}
+
+// TestReconcileRouterServiceRepointsTargetPort: a Service an older operator
+// built with targetPort equal to spec.endpoint.port is corrected on the next
+// reconcile, so upgrading fixes a router that was unreachable.
+func TestReconcileRouterServiceRepointsTargetPort(t *testing.T) {
+	mr := routerWithEndpoint(&inferencev1alpha1.EndpointSpec{Port: 80})
+	rec, c, key := seededRouterService(t, mr)
+	live := &corev1.Service{}
+	if err := c.Get(context.Background(), key, live); err != nil {
+		t.Fatal(err)
+	}
+	live.Spec.Ports[0].TargetPort = intstr.FromInt(80)
+	if err := c.Update(context.Background(), live); err != nil {
+		t.Fatal(err)
+	}
+	got := reconcileAndGetService(t, rec, c, mr, key)
+	if p := got.Spec.Ports[0]; p.Port != 80 || p.TargetPort.IntValue() != proxyListenPort(t, mr) {
+		t.Errorf("after reconcile: port %d -> targetPort %s, want 80 -> %d", p.Port, p.TargetPort.String(), proxyListenPort(t, mr))
 	}
 }
