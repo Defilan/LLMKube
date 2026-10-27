@@ -168,8 +168,8 @@ it is fixed. Check them on every Mac before upgrading its metal-agent:
   the agent unloaded. The last command prints `state = running` once the
   agent is back. Engines started by the old agent keep running and the new
   agent adopts them, so they keep the flags they started with; to apply new
-  defaults, run `llmkube-metal-agent stop-engines` after the `bootout` and
-  before reinstalling. The new plist uses
+  defaults, run `llmkube-metal-agent stop-engines` after the wait and before
+  reinstalling. The new plist uses
   the default store `~/Library/Application Support/llmkube/models` and logs to
   `~/Library/Logs/llmkube/metal-agent.log`. For a hand-maintained plist,
   remove the `--model-store /tmp/...` pair (or point it at a directory the

@@ -179,14 +179,20 @@ reassignment, Model deleted) is stopped after the agent's first list.
 oMLX services still reload when the agent restarts; adopting the oMLX daemon is
 planned.
 
-To stop the engines, stop the agent first, then run `stop-engines`. Running it
-while the agent is up lets the health monitor respawn an engine that then
-outlives the agent:
+To stop the engines, stop the agent first and wait for it to exit, then run
+`stop-engines`. `bootout` returns while the agent is still stopping, and an
+agent still running can start an engine after `stop-engines` has read the
+records, or let its health monitor respawn one; either engine outlives the
+agent:
 
 ```bash
 launchctl bootout gui/$(id -u)/com.llmkube.metal-agent
+while launchctl print gui/$(id -u)/com.llmkube.metal-agent >/dev/null 2>&1; do sleep 1; done
 llmkube-metal-agent stop-engines
 ```
+
+Run `stop-engines` as the user the agent runs as, not with `sudo`: it refuses
+records that user does not own, or that others could write.
 
 `stop-engines` stops every engine the agent started (as a process group, after
 the same start-time check), unloads the model of each Ollama service, and
@@ -206,6 +212,7 @@ engines and start the agent again:
 
 ```bash
 launchctl bootout gui/$(id -u)/com.llmkube.metal-agent
+while launchctl print gui/$(id -u)/com.llmkube.metal-agent >/dev/null 2>&1; do sleep 1; done
 llmkube-metal-agent stop-engines
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
 ```

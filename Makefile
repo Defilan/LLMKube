@@ -407,6 +407,11 @@ install-metal-agent: build-metal-agent ## Install Metal agent and launchd servic
 uninstall-metal-agent: ## Uninstall Metal agent and launchd service (stops its engines too).
 	@echo "Stopping Metal agent service..."
 	@launchctl bootout gui/$$(id -u)/$(LLMKUBE_METAL_AGENT_LABEL) 2>/dev/null || true
+	@# bootout returns while the agent is still stopping; an agent still running
+	@# can start or respawn an engine after stop-engines has read the records.
+	@i=0; while launchctl print gui/$$(id -u)/$(LLMKUBE_METAL_AGENT_LABEL) >/dev/null 2>&1 && [ $$i -lt 30 ]; do \
+		sleep 1; i=$$((i+1)); \
+	done
 	@if [ -x /usr/local/bin/llmkube-metal-agent ]; then \
 		echo "Stopping engines started by the Metal agent..."; \
 		/usr/local/bin/llmkube-metal-agent stop-engines || { \
