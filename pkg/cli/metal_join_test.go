@@ -48,7 +48,8 @@ import (
 )
 
 // fakeMac stands in for the Mac join and leave run on: a temporary home, a
-// llmkube-metal-agent on PATH, and a launchctl that records its calls.
+// llmkube-metal-agent on PATH, and a launchctl that records its calls and,
+// like launchd, refuses to bootstrap a service that is still loaded.
 type fakeMac struct {
 	home        string
 	agentBin    string
@@ -57,6 +58,11 @@ type fakeMac struct {
 	failOn      string
 	// onBootstrap runs when launchctl bootstrap succeeds: the agent starts.
 	onBootstrap func()
+	loaded      bool
+	// stopPolls is how many launchctl print calls a booted-out agent stays
+	// loaded for while it stops.
+	stopPolls int
+	stopping  int
 }
 
 func newFakeMac(t *testing.T) *fakeMac {
@@ -85,8 +91,29 @@ func newFakeMac(t *testing.T) *fakeMac {
 				if m.failOn != "" && strings.HasPrefix(call, m.failOn) {
 					return errors.New("launchctl failed")
 				}
-				if args[0] == "bootstrap" && m.onBootstrap != nil {
-					m.onBootstrap()
+				switch args[0] {
+				case "bootout":
+					if !m.loaded {
+						return errors.New("Boot-out failed: 3: No such process")
+					}
+					m.stopping = m.stopPolls
+					m.loaded = m.stopping > 0
+				case "print":
+					if !m.loaded {
+						return errors.New("Could not find service")
+					}
+					if m.stopping > 0 {
+						m.stopping--
+						m.loaded = m.stopping > 0
+					}
+				case "bootstrap":
+					if m.loaded {
+						return errors.New("Bootstrap failed: 5: Input/output error")
+					}
+					m.loaded = true
+					if m.onBootstrap != nil {
+						m.onBootstrap()
+					}
 				}
 				return nil
 			},
@@ -316,7 +343,8 @@ func assertMetalAgentPlist(t *testing.T, mac *fakeMac, paths metalAgentPaths, ns
 			t.Errorf("plutil -lint: %v: %s", err, out)
 		}
 	}
-	wantCalls := []string{"bootout gui/501/" + metalAgentLabel, "bootstrap gui/501 " + paths.Plist}
+	wantCalls := []string{"bootout gui/501/" + metalAgentLabel, "print gui/501/" + metalAgentLabel,
+		"bootstrap gui/501 " + paths.Plist}
 	if strings.Join(mac.calls, "; ") != strings.Join(wantCalls, "; ") {
 		t.Errorf("launchctl calls %q, want %q", mac.calls, wantCalls)
 	}
@@ -581,6 +609,40 @@ func TestMetalJoinSaysHowToStartAfterBootstrapFails(t *testing.T) {
 	if want := "launchctl bootstrap gui/501 \"" + mac.paths().Plist + "\""; err == nil ||
 		!strings.Contains(err.Error(), want) {
 		t.Errorf("join with a failing bootstrap: err = %v, want it to say %s", err, want)
+	}
+}
+
+// TestMetalJoinWaitsForThePreviousAgentToStop: bootout returns while a
+// running agent is still stopping, and launchd refuses a bootstrap until it
+// has (seen on an M3 Air rejoining with --force). A rejoin waits for the old
+// agent to unload instead of failing, and the wait is bounded.
+func TestMetalJoinWaitsForThePreviousAgentToStop(t *testing.T) {
+	_, _, ns := metalEnvtest(t)
+	mac := newFakeMac(t)
+	joinString, _ := issueJoinString(t, ns)
+	if _, stderr, err := runMetal(t, "join", joinString, "--wait", "0"); err != nil {
+		t.Fatalf("first join: %v\n%s", err, stderr)
+	}
+
+	mac.stopPolls, mac.calls = 3, nil
+	joinString, _ = issueJoinString(t, ns)
+	if _, stderr, err := runMetal(t, "join", joinString, "--wait", "0"); err != nil {
+		t.Fatalf("rejoin while the previous agent stops: %v\n%s", err, stderr)
+	}
+	if !mac.loaded || mac.calls[len(mac.calls)-1] != "bootstrap gui/501 "+mac.paths().Plist {
+		t.Errorf("launchctl calls %q, want the new agent bootstrapped last", mac.calls)
+	}
+
+	prev := metalAgentUnloadTimeout
+	metalAgentUnloadTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { metalAgentUnloadTimeout = prev })
+	mac.stopPolls = 1 << 30
+	joinString, _ = issueJoinString(t, ns)
+	start := time.Now()
+	_, _, err := runMetal(t, "join", joinString, "--wait", "0")
+	if err == nil || !strings.Contains(err.Error(), "launchctl bootstrap gui/501") || time.Since(start) > 10*time.Second {
+		t.Errorf("rejoin while the previous agent never stops: err = %v after %s, want the bootstrap hint "+
+			"once the unload wait gives up", err, time.Since(start))
 	}
 }
 

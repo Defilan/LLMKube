@@ -528,6 +528,7 @@ func installMetalAgent(ctx context.Context, host metalHost, paths metalAgentPath
 	// Not loaded yet is the usual case for bootout; anything else surfaces
 	// when bootstrap fails.
 	_ = host.launchctl(ctx, "bootout", domain+"/"+metalAgentLabel)
+	waitMetalAgentUnloaded(ctx, host, domain+"/"+metalAgentLabel)
 	// Truncated to the Lease's renewTime precision, so a renewal in the
 	// same microsecond still counts as the new agent's.
 	started := time.Now().Truncate(time.Microsecond)
@@ -538,6 +539,28 @@ func installMetalAgent(ctx context.Context, host metalHost, paths metalAgentPath
 	}
 	_, _ = fmt.Fprintf(log, "started the %s LaunchAgent (%s)\n", metalAgentLabel, paths.Plist)
 	return started, nil
+}
+
+// metalAgentUnloadTimeout bounds the wait for launchd to finish unloading the
+// previous agent. launchd's default ExitTimeOut is 20 s before it kills the
+// process.
+var metalAgentUnloadTimeout = 30 * time.Second
+
+const metalAgentUnloadPoll = 100 * time.Millisecond
+
+// waitMetalAgentUnloaded waits until launchd no longer knows service. bootout
+// returns while a running agent is still stopping, and a bootstrap then fails
+// with "Bootstrap failed: 5: Input/output error". Past the timeout it returns
+// anyway, and the bootstrap error says how to start the agent.
+func waitMetalAgentUnloaded(ctx context.Context, host metalHost, service string) {
+	deadline := time.Now().Add(metalAgentUnloadTimeout)
+	for host.launchctl(ctx, "print", service) == nil && time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(metalAgentUnloadPoll):
+		}
+	}
 }
 
 // renderMetalAgentPlist renders the LaunchAgent, matching
