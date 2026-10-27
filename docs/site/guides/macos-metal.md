@@ -575,8 +575,13 @@ MetalNode's namespace, owned by the MetalNode, placed by
   against `https://<address>:<ingressPort>/health`, ignoring any
   `.curlrc` and any proxy settings, so it tests the direct path. The ingress
   answers 401 without a relay token, which is enough: the handshake
-  only completes against the pinned key, so the result proves both
-  the path and the Mac's identity, and the controller needs no token.
+  only completes against the pinned key, so the result proves that
+  the address serves the key the agent reported. It does not prove
+  the server is the Mac: the agent reports the pin itself, so it could
+  report another server's public key and address (an API server's
+  key is visible to any client) and read as `Reachable`. Treat
+  `status.hostIP` as the agent's claim, checked for a path, not as an
+  authenticated identity; nothing in LLMKube routes to it yet.
 - Per-candidate results are `Reachable`, `Timeout`, `Refused`,
   `PinMismatch`, `NotAllowed` or `Error`. The first `Reachable`
   address in order becomes `status.hostIP`, which is set only while

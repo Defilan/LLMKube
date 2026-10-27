@@ -45,6 +45,7 @@ import (
 	"github.com/defilantech/llmkube/internal/platform"
 	"github.com/defilantech/llmkube/pkg/agent"
 	"github.com/defilantech/llmkube/pkg/agent/policy"
+	"github.com/defilantech/llmkube/pkg/metalnode"
 )
 
 var (
@@ -140,6 +141,22 @@ func validateMetalNodeFlags(node, lease string) error {
 		if errs := validation.IsDNS1123Subdomain(lease); len(errs) > 0 {
 			return fmt.Errorf("--metal-node-lease %q is not a valid object name: %s", lease, strings.Join(errs, "; "))
 		}
+	}
+	return nil
+}
+
+// validateMetalNodeIngress refuses a --metal-node agent whose relay ingress
+// port the MetalNode report cannot carry. The agent checks each report before
+// renewing the Lease, so a port below metalnode.MinIngressPort would stop the
+// heartbeat at runtime with only a warning, and the MetalNode would say the
+// agent never renewed. Legacy mode starts no ingress and reports no port.
+func validateMetalNodeIngress(node string, ingressPort int, legacy bool) error {
+	if node == "" || legacy {
+		return nil
+	}
+	if ingressPort < metalnode.MinIngressPort || ingressPort > 65535 {
+		return fmt.Errorf("--ingress-port %d cannot be reported for --metal-node: it must be %d-65535",
+			ingressPort, metalnode.MinIngressPort)
 	}
 	return nil
 }
@@ -636,6 +653,10 @@ func main() {
 	logger := baseLogger.Sugar()
 
 	if err := validateMetalNodeFlags(cfg.MetalNode, cfg.MetalNodeLease); err != nil {
+		logger.Errorw("invalid MetalNode flags", "error", err)
+		os.Exit(1)
+	}
+	if err := validateMetalNodeIngress(cfg.MetalNode, cfg.IngressPort, cfg.LegacyDirectEndpoints); err != nil {
 		logger.Errorw("invalid MetalNode flags", "error", err)
 		os.Exit(1)
 	}
