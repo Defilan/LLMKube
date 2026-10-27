@@ -667,6 +667,168 @@ on schedule does not wake the controller; its 60 s resync does.
 | `Reachable` | `AgentNotConnected` | `Unknown`: the agent is not connected, so nothing is dialed and `hostIP` is empty. |
 | `Reachable` | `InvalidSpec` | `spec.hostIP` is not an IP address; nothing is dialed until it is fixed. |
 
+## Join a Mac
+
+Joining a Mac takes two commands on two machines, and the Mac never
+sees your cluster credentials:
+
+1. **Where you have cluster access** (your laptop, a bastion), an
+   admin creates the Mac's identity and a join string:
+
+   ```bash
+   llmkube metal token create mac-studio -n default
+   # llmkube metal join llmkube://eyJ2IjoxLCJzZXJ2ZXIiOi...
+   # valid for 30 minutes (until 2026-10-25 15:04 PDT), single use, Mac mac-studio in namespace default
+   # CA pin: sha256:a5fee586b3b05aaff494d200d4c072e2e37126eaef344e2f295ad87479272655
+   ```
+
+   The first line is the whole command to paste on the Mac, alone on
+   its line. Progress goes to stderr, so stdout copies cleanly;
+   `-o json` prints `joinCommand`, `expiresAt`, `caPin`, `namespace`
+   and `mac` for scripts.
+
+2. **On the Mac**, `llmkube metal join <join-string>` sets up the
+   agent with that identity. `join` is the Mac side of
+   [#2232](https://github.com/defilantech/LLMKube/issues/2232) and
+   ships separately; this section covers what the admin side creates
+   and how to revoke it.
+
+The join string carries the API server URL, the cluster's CA
+certificate, the CA's pin, the namespace, the Mac's name and a join
+token. The Mac trusts only that CA (no system roots). Compare the
+`CA pin` line with the pin `join` prints on the Mac: if they differ,
+the string was altered on the way.
+
+### What `token create` creates
+
+Everything is in the namespace you pass with `-n` (default: your
+kubeconfig context's namespace, else `default`), named after the Mac
+(`<mac>` must be a DNS label, at most 63 characters), and labeled
+`app.kubernetes.io/managed-by=llmkube-cli` and
+`inference.llmkube.dev/metal-node=<mac>`:
+
+| Object | Name | Notes |
+|---|---|---|
+| ServiceAccount | `llmkube-metal-<mac>` | `automountServiceAccountToken: false`. The Mac's identity. |
+| Role | `llmkube-metal-<mac>` | The per-Mac rules below. |
+| RoleBinding | `llmkube-metal-<mac>` | Binds the per-Mac Role to the ServiceAccount. |
+| RoleBinding | `llmkube-metal-<mac>-shared` | Binds the shared `llmkube-metal-agent` Role to the ServiceAccount. |
+| Lease | `<mac>` | The agent's heartbeat. `leaseDurationSeconds: 45`; the label lets the MetalNode controller watch it. |
+| MetalNode | `<mac>` | `spec.serviceAccountName` and `spec.leaseName` point at the two above. |
+| Secret | `llmkube-metal-<mac>-join` | Opaque and empty: it exists only so the join token can be bound to it. |
+
+The per-Mac Role grants only the Mac's own objects, all by
+`resourceNames`:
+
+```yaml
+rules:
+  # Renew its own credential (and no one else's).
+  - apiGroups: [""]
+    resources: ["serviceaccounts/token"]
+    resourceNames: ["llmkube-metal-<mac>"]
+    verbs: ["create"]
+  # Read its own MetalNode. The agent never writes it.
+  - apiGroups: ["inference.llmkube.dev"]
+    resources: ["metalnodes"]
+    resourceNames: ["<mac>"]
+    verbs: ["get"]
+  # Heartbeat and report.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["<mac>"]
+    verbs: ["get", "update"]
+  # Delete its join Secret once, which kills the join token.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["llmkube-metal-<mac>-join"]
+    verbs: ["delete"]
+```
+
+Everything else the agent does comes from the shared
+`llmkube-metal-agent` Role, the same audited rules as
+[`deployment/macos/metal-agent-rbac.yaml`](https://github.com/defilantech/LLMKube/blob/main/deployment/macos/metal-agent-rbac.yaml).
+If the namespace has no such Role, `token create` creates it from a
+copy of that file built into the CLI. If one exists with different
+rules (the chart's `metalAgent.rbac.secretNames` pins the Secret rule
+to names, for example), it is left as it is and `token create` prints
+a warning.
+
+`token create` is safe to re-run. It updates its own objects, keeps
+the Lease (the agent's heartbeat) and any `hostIP` or `verifier` you
+set on the MetalNode, and refuses to take over an object with one of
+these names that is not labeled for this Mac (or is labeled for
+another Mac). It checks all of them before it writes anything, so a
+refusal leaves the cluster as it was. If you created the
+objects by hand as in [Creating the objects](#creating-the-objects),
+label them (`kubectl label ... inference.llmkube.dev/metal-node=<mac>`)
+or delete them first.
+
+### The join token
+
+- **Short-lived.** It works for 30 minutes (`--ttl`, from `10m`, the
+  shortest token the API server issues, to `24h`). The printed expiry
+  is the API server's.
+- **Single use.** The token is bound to the join Secret. `join`
+  trades it for the agent's own credential and then deletes the
+  Secret, which invalidates the token even inside its 30 minutes
+  (within ~10 seconds: the API server caches a token it just
+  accepted).
+- **A credential until it is used.** Until the string is redeemed or
+  expires, whoever holds it can act as the Mac, including minting the
+  Mac's own long-lived tokens. Treat it like a password: paste it
+  only on the Mac.
+- **One unused string per Mac.** Running `token create` again for the
+  same Mac recreates the Secret, so a previous string that was never
+  used stops working. It does **not** revoke a string that was
+  already redeemed: its holder may already have minted tokens of
+  their own. If a string may have leaked, run
+  `llmkube metal remove <mac>` (that revokes every token for the Mac
+within ~10 seconds)
+  and then `token create` again.
+- **Checked before anything is created.** The command reads the API
+  server's certificate and verifies it against your kubeconfig's CA.
+  It refuses a kubeconfig with `insecure-skip-tls-verify` or no CA,
+  since the Mac would have nothing to trust. When the server address
+  is not in the certificate (a tailnet address, say), it sets the TLS
+  server name to `kubernetes` if the certificate covers that, or
+  stops and lists the names the certificate does cover.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-n`, `--namespace` | context namespace, else `default` | Namespace for the Mac's objects. |
+| `--ttl` | `30m` | How long the join string works (`10m` to `24h`). |
+| `--server` | the context's server | API server URL the Mac connects to, for when the Mac reaches it by another address. This machine must reach it too, to check its certificate, unless `--assume-same-server`. |
+| `--assume-same-server` | off | When this machine cannot reach `--server` (an address only the Mac can reach), check the certificate the context's server presents instead. Nothing then proves `--server` is the same API server; the Mac still verifies it against the CA when it joins. |
+| `--tls-server-name` | automatic | Name the Mac verifies the certificate against. It must be in the certificate. |
+| `-o`, `--output` | `text` | `text` or `json`. |
+
+### Revoking a Mac
+
+```bash
+llmkube metal remove mac-studio -n default
+```
+
+`remove` deletes the Mac's ServiceAccount first and waits until it is
+gone. That is the revocation: every token the Mac holds stops working
+within ~10 seconds, including the ones minted from the join string or
+by the agent itself (the API server keeps accepting a token it
+accepted in the last ~10 seconds for up to ~10 seconds more). Then it
+deletes the per-Mac Role, both RoleBindings, the Lease, the join
+Secret and the MetalNode, and prints each one it removed. It never
+deletes the shared `llmkube-metal-agent` Role, and objects that are
+already gone are skipped, so running it twice is fine. It does not
+touch the Mac itself; stop the agent there.
+
+`remove` deletes only objects labeled
+`inference.llmkube.dev/metal-node=<mac>`. Anything else with one of
+the Mac's names (another application's Lease, objects labeled for
+another Mac, a MetalNode applied by hand) is left in place and listed
+as `skipped`. If the ServiceAccount is among them, nothing was
+revoked and the command fails. For a Mac whose objects you applied by
+hand without the label, `--include-unlabeled` also deletes unlabeled
+objects with the Mac's names, with a warning for each; objects
+labeled for another Mac are never deleted.
+
 ## Optional: Apple Silicon power metrics
 
 For [InferCost](https://github.com/defilantech/infercost) (LLMKube's
