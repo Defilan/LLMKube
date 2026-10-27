@@ -132,6 +132,7 @@ func (a *MetalAgent) prepareIngress() (*ingress.Server, error) {
 	if err := a.registry.EnableIngress(a.config.IngressPort, pin); err != nil {
 		return nil, fmt.Errorf("enable ingress registration: %w", err)
 	}
+	a.ingressPin = pin
 	a.logger.Infow("relay mode: engines bind 127.0.0.1, served through the ingress",
 		"ingressPort", a.config.IngressPort, "spkiPin", pin, "stateDir", stateDir,
 		"identityDir", filepath.Join(stateDir, "ingress"))
@@ -142,8 +143,20 @@ func (a *MetalAgent) prepareIngress() (*ingress.Server, error) {
 
 // runIngress serves srv on all interfaces until ctx ends. Any exit before
 // that (a bind failure included) is reported on fatalErrChan.
-func (a *MetalAgent) runIngress(ctx context.Context, srv *ingress.Server, fatalErrChan chan<- error) {
-	err := srv.Start(ctx, fmt.Sprintf(":%d", a.config.IngressPort))
+// listenIngress binds the ingress port. Only then does the MetalNode report
+// carry the port and pin: advertised earlier, the controller's dial-back would
+// find the port closed after every agent restart.
+func (a *MetalAgent) listenIngress(srv *ingress.Server) (net.Listener, error) {
+	ln, err := srv.Listen(fmt.Sprintf(":%d", a.config.IngressPort))
+	if err != nil {
+		return nil, fmt.Errorf("ingress on port %d: %w", a.config.IngressPort, err)
+	}
+	a.ingressListening.Store(true)
+	return ln, nil
+}
+
+func (a *MetalAgent) runIngress(ctx context.Context, srv *ingress.Server, ln net.Listener, fatalErrChan chan<- error) {
+	err := srv.Serve(ctx, ln)
 	if ctx.Err() != nil {
 		return
 	}

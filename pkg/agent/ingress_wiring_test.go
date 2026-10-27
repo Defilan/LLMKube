@@ -18,10 +18,13 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -403,5 +406,77 @@ func TestWarnIfDaemonsExposed_OMLX(t *testing.T) {
 	a.warnIfDaemonsExposed()
 	if n := logs.FilterMessageSnippet("oMLX").Len(); n != 0 {
 		t.Errorf("closed oMLX port still warned %d time(s)", n)
+	}
+}
+
+// TestMetalNodeReportAdvertisesIngressOnceBound: the MetalNode report carries
+// the ingress pin and port only once the port is bound, and what it then
+// advertises answers TLS with that pin. Advertised before the bind, the
+// controller's dial-back hit a closed port after every agent restart and
+// marked the Mac unreachable.
+func TestMetalNodeReportAdvertisesIngressOnceBound(t *testing.T) {
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := probe.Addr().(*net.TCPAddr).Port
+	_ = probe.Close()
+
+	a, _, _ := refusalFixture(t, MetalAgentConfig{IngressPort: port, StateDir: t.TempDir()}, refusalISVC("llm"))
+	srv, err := a.prepareIngress()
+	if err != nil || srv == nil {
+		t.Fatalf("prepareIngress: srv %v, err %v", srv, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if got := a.metalNodeReport(ctx); got.IngressSPKI != "" || got.IngressPort != 0 {
+		t.Fatalf("report before the ingress is bound = pin %q port %d, want neither", got.IngressSPKI, got.IngressPort)
+	}
+
+	ln, err := a.listenIngress(srv)
+	if err != nil {
+		t.Fatalf("listenIngress: %v", err)
+	}
+	got := a.metalNodeReport(ctx)
+	if got.IngressSPKI != a.ingressPin || int(got.IngressPort) != port {
+		t.Fatalf("report once bound = pin %q port %d, want %q and %d", got.IngressSPKI, got.IngressPort, a.ingressPin, port)
+	}
+	fatal := make(chan error, 1)
+	go a.runIngress(ctx, srv, ln, fatal)
+
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp",
+		net.JoinHostPort("127.0.0.1", strconv.Itoa(int(got.IngressPort))),
+		&tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13}) //nolint:gosec // the pin below is the check
+	if err != nil {
+		t.Fatalf("TLS to the advertised port: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	sum := sha256.Sum256(conn.ConnectionState().PeerCertificates[0].RawSubjectPublicKeyInfo)
+	if pin := base64.StdEncoding.EncodeToString(sum[:]); pin != got.IngressSPKI {
+		t.Errorf("the advertised port presents SPKI %q, want the advertised pin %q", pin, got.IngressSPKI)
+	}
+}
+
+// TestListenIngressBindFailureAdvertisesNothing: when the ingress port is
+// taken, the agent fails and its report never claims the port.
+func TestListenIngressBindFailureAdvertisesNothing(t *testing.T) {
+	// The same all-interfaces bind listenIngress makes, so it collides.
+	taken, err := net.Listen("tcp", ":0") //nolint:gosec // G102: the port is held only for this test
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = taken.Close() }()
+	port := taken.Addr().(*net.TCPAddr).Port
+
+	a, _, _ := refusalFixture(t, MetalAgentConfig{IngressPort: port, StateDir: t.TempDir()}, refusalISVC("llm"))
+	srv, err := a.prepareIngress()
+	if err != nil || srv == nil {
+		t.Fatalf("prepareIngress: srv %v, err %v", srv, err)
+	}
+	if _, err := a.listenIngress(srv); err == nil {
+		t.Fatal("listenIngress on a taken port succeeded, want an error")
+	}
+	if got := a.metalNodeReport(context.Background()); got.IngressSPKI != "" || got.IngressPort != 0 {
+		t.Errorf("report after a failed bind = pin %q port %d, want neither", got.IngressSPKI, got.IngressPort)
 	}
 }

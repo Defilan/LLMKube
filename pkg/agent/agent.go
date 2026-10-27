@@ -23,11 +23,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -262,6 +264,19 @@ type MetalAgentConfig struct {
 	// as "<isvc>", no ingress is started. Only for a controller that
 	// predates relay support; removed in a future release.
 	LegacyDirectEndpoints bool
+
+	// MetalNode is the MetalNode this agent reports for (--metal-node).
+	// Empty disables reporting: no Lease call is made.
+	MetalNode string
+	// MetalNodeLease names the Lease the agent renews (--metal-node-lease);
+	// empty means the MetalNode's own name.
+	MetalNodeLease string
+	// APIServerHost is the kubeconfig's server URL. The route to it decides
+	// the order of the candidate addresses the agent reports.
+	APIServerHost string
+	// HostCapacity is the hardware reported to the MetalNode, collected once
+	// at startup.
+	HostCapacity HostCapacity
 }
 
 // processInspectorFactory builds the inspector NewMetalAgent hands the engine
@@ -272,15 +287,21 @@ var processInspectorFactory = newProcessInspector
 // MetalAgent watches Kubernetes InferenceService resources and manages
 // native inference processes with Metal acceleration
 type MetalAgent struct {
-	config         MetalAgentConfig
-	watcher        *InferenceServiceWatcher
-	executors      map[string]ProcessExecutor // runtime name -> executor
-	registry       *ServiceRegistry
-	processes      map[string]*ManagedProcess // namespacedName -> process
-	logger         *zap.SugaredLogger
-	mu             sync.RWMutex
-	memoryProvider MemoryProvider
-	memoryFraction float64
+	config MetalAgentConfig
+	// ingressPin is the SPKI pin of the ingress identity, set by
+	// prepareIngress in relay mode and reported to the MetalNode.
+	ingressPin string
+	// ingressListening is set once the ingress port is bound; the MetalNode
+	// report carries the pin and port only from then on.
+	ingressListening atomic.Bool
+	watcher          *InferenceServiceWatcher
+	executors        map[string]ProcessExecutor // runtime name -> executor
+	registry         *ServiceRegistry
+	processes        map[string]*ManagedProcess // namespacedName -> process
+	logger           *zap.SugaredLogger
+	mu               sync.RWMutex
+	memoryProvider   MemoryProvider
+	memoryFraction   float64
 	// memoryCheckWarnOnly is true when config.MemoryCheckMode resolved to
 	// MemoryCheckModeWarn; an incomplete admission check then logs and
 	// proceeds instead of failing closed.
@@ -705,9 +726,21 @@ func (a *MetalAgent) Start(ctx context.Context) error {
 	}
 
 	// The ingress is the only way the cluster reaches an engine in relay
-	// mode, so losing it (a bind failure included) is fatal.
+	// mode, so losing it (a bind failure included) is fatal. It is bound
+	// before the reporter starts, so the first report's port answers.
+	var ingressLn net.Listener
 	if ingressSrv != nil {
-		go a.runIngress(ctx, ingressSrv, fatalErrChan)
+		if ingressLn, err = a.listenIngress(ingressSrv); err != nil {
+			return err
+		}
+	}
+
+	// Heartbeat and report through the MetalNode's Lease (--metal-node), now
+	// that the ingress pin is known and its port bound. Off by default.
+	a.startMetalNodeReporter(ctx)
+
+	if ingressSrv != nil {
+		go a.runIngress(ctx, ingressSrv, ingressLn, fatalErrChan)
 		go a.warnIfDaemonsExposed()
 	}
 

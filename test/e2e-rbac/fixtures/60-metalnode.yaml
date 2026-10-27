@@ -1,0 +1,25 @@
+# A MetalNode and the agent Lease it names. The controller reads the Lease
+# uncached (leases get), watches labeled Leases through its own cache (leases
+# list/watch) and writes MetalNode status. The renewTime is fixed in the past,
+# so the agent counts as disconnected and no verifier pod is started; pod
+# create/delete are grants the InferenceService controller already exercises.
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: MetalNode
+metadata:
+  name: rbac-mac
+spec:
+  serviceAccountName: llmkube-metal-rbac-mac
+  leaseName: rbac-mac
+---
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: rbac-mac
+  labels:
+    inference.llmkube.dev/metal-node: rbac-mac
+  annotations:
+    llmkube.ai/metal-node-report: '{"version":"rbac-e2e","ingressPort":9443,"ingressSPKI":"q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80=","candidates":[{"address":"100.64.0.2","source":"tailnet"}]}'
+spec:
+  holderIdentity: rbac-mac
+  leaseDurationSeconds: 45
+  renewTime: "2026-01-01T00:00:00.000000Z"

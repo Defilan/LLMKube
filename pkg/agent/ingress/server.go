@@ -259,10 +259,28 @@ func (s *Server) proxy(port int) *httputil.ReverseProxy {
 // There is no read or write timeout (streams can run for minutes); only
 // request headers are bounded.
 func (s *Server) Start(ctx context.Context, addr string) error {
-	ln, err := net.Listen("tcp", addr)
+	ln, err := s.Listen(addr)
 	if err != nil {
 		return err
 	}
+	return s.Serve(ctx, ln)
+}
+
+// Listen binds addr without serving yet. Connections to the listener queue
+// until Serve runs, so a caller can advertise the port once it is bound.
+func (s *Server) Listen(addr string) (net.Listener, error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	s.addr = ln.Addr()
+	s.mu.Unlock()
+	return ln, nil
+}
+
+// Serve serves TLS on ln, from Listen, until ctx is done.
+func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	srv := &http.Server{
 		Handler:           s,
 		ReadHeaderTimeout: 10 * time.Second,
@@ -273,10 +291,6 @@ func (s *Server) Start(ctx context.Context, addr string) error {
 			Certificates: []tls.Certificate{s.cert},
 		},
 	}
-	s.mu.Lock()
-	s.addr = ln.Addr()
-	s.mu.Unlock()
-
 	stopped := make(chan struct{})
 	defer close(stopped)
 	//nolint:gosec // G118: the parent ctx is already cancelled here; graceful

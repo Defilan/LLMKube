@@ -104,68 +104,126 @@ func roleGrants(role *rbacv1.Role, apiGroup, resource, verb string) bool {
 	return false
 }
 
+// rbacCall is one (apiGroup, resource, verb) the agent's code uses.
+type rbacCall struct {
+	name     string
+	apiGroup string
+	resource string
+	verb     string
+}
+
+// metalAgentSharedCalls are the Kubernetes API calls the Metal agent's own
+// code makes (pkg/agent, cmd/metal-agent) that the shared, audited Role in
+// deployment/macos/metal-agent-rbac.yaml grants, enumerated by grepping every
+// client Get/List/Create/Update/Patch/Delete/Status().Update and the event
+// recorder.
+var metalAgentSharedCalls = []rbacCall{
+	// InferenceServiceWatcher.poll/listExisting (watcher.go) and the
+	// agent's own re-Gets (agent.go, pressure.go, refusal.go).
+	{"get InferenceServices", "inference.llmkube.dev", "inferenceservices", "get"},
+	{"list InferenceServices", "inference.llmkube.dev", "inferenceservices", "list"},
+	// pressure.go, refusal.go, agent.go write scheduling/condition status.
+	{"update InferenceServices status", "inference.llmkube.dev", "inferenceservices/status", "update"},
+	// watcher.go shouldWatch, agent.go reconcileProcess fetch the
+	// referenced Model.
+	{"get Models", "inference.llmkube.dev", "models", "get"},
+	// registry.go upsertEndpoint/checkEndpointOwnership/WithdrawOwnedEndpoints/
+	// ReconcileOrphanEndpoints/RemoveRelayRegistrations, ingress_wiring.go
+	// relay-adoption check.
+	{"get Services", "", "services", "get"},
+	{"list Services", "", "services", "list"},
+	{"create Services", "", "services", "create"},
+	{"update Services", "", "services", "update"},
+	{"delete Services", "", "services", "delete"},
+	// registry.go upsertEndpoint/checkEndpointOwnership/removeLegacySlice/
+	// deleteOrphanPair.
+	{"get EndpointSlices", "discovery.k8s.io", "endpointslices", "get"},
+	{"create EndpointSlices", "discovery.k8s.io", "endpointslices", "create"},
+	{"update EndpointSlices", "discovery.k8s.io", "endpointslices", "update"},
+	{"delete EndpointSlices", "discovery.k8s.io", "endpointslices", "delete"},
+	// registry.go reapLegacyEndpoints reaps the pre-EndpointSlice
+	// core/v1 Endpoints object.
+	{"get legacy Endpoints", "", "endpoints", "get"},
+	{"delete legacy Endpoints", "", "endpoints", "delete"},
+	// pressure.go emitInferenceEvent / cmd/metal-agent's EventRecorder
+	// (client-go's EventSinkImpl uses Create then Patch for aggregation).
+	{"create Events", "", "events", "create"},
+	{"patch Events", "", "events", "patch"},
+	// s3.go resolveS3Credentials/resolveHFAuth read Model.spec.sourceSecretRef;
+	// ingress/tokens.go reads the fixed-name relay token Secret
+	// "llmkube-metal-relay" on every relayed request in the (default)
+	// non---legacy-direct-endpoints mode.
+	{"get Secrets", "", "secrets", "get"},
+}
+
+// metalAgentPerMacCalls are the calls the agent makes only on its own
+// objects. They are granted by the small per-Mac Role that
+// `llmkube metal token create` creates, scoped by resourceNames to that one
+// Mac's objects, and never by the shared Role: RBAC cannot scope a shared
+// rule to "the caller's own Lease", so a shared leases rule would let every
+// Mac renew every other Mac's heartbeat. deployment/macos/README.md documents
+// the per-Mac Role.
+var metalAgentPerMacCalls = []rbacCall{
+	// metalnode_reporter.go renew: Get then Update of its own Lease, only
+	// with --metal-node set.
+	{"get own MetalNode Lease", "coordination.k8s.io", "leases", "get"},
+	{"update own MetalNode Lease", "coordination.k8s.io", "leases", "update"},
+}
+
 // TestMetalAgentRBACCoversAgentAPICalls pins deployment/macos/metal-agent-rbac.yaml
-// to the Kubernetes API calls the Metal agent's own code makes (pkg/agent,
-// cmd/metal-agent), enumerated by grepping every client Get/List/Create/
-// Update/Patch/Delete/Status().Update and the event recorder. It is not a
-// substitute for that audit: a new agent code path that starts a genuinely
-// new (group, resource, verb) tuple must add a row here as well as a rule to
-// the manifest. It exists to catch the manifest silently losing a rule an
-// existing code path already depends on (e.g. an edit that drops a line).
+// to metalAgentSharedCalls. It is not a substitute for the audit: a new agent
+// code path that starts a genuinely new (group, resource, verb) tuple must
+// add a row there as well as a rule to the manifest (or to the per-Mac Role).
+// It exists to catch the manifest silently losing a rule an existing code
+// path already depends on (e.g. an edit that drops a line).
 func TestMetalAgentRBACCoversAgentAPICalls(t *testing.T) {
 	role := loadRBACRole(t)
-
-	tests := []struct {
-		name     string
-		apiGroup string
-		resource string
-		verb     string
-	}{
-		// InferenceServiceWatcher.poll/listExisting (watcher.go) and the
-		// agent's own re-Gets (agent.go, pressure.go, refusal.go).
-		{"get InferenceServices", "inference.llmkube.dev", "inferenceservices", "get"},
-		{"list InferenceServices", "inference.llmkube.dev", "inferenceservices", "list"},
-		// pressure.go, refusal.go, agent.go write scheduling/condition status.
-		{"update InferenceServices status", "inference.llmkube.dev", "inferenceservices/status", "update"},
-		// watcher.go shouldWatch, agent.go reconcileProcess fetch the
-		// referenced Model.
-		{"get Models", "inference.llmkube.dev", "models", "get"},
-		// registry.go upsertEndpoint/checkEndpointOwnership/WithdrawOwnedEndpoints/
-		// ReconcileOrphanEndpoints/RemoveRelayRegistrations, ingress_wiring.go
-		// relay-adoption check.
-		{"get Services", "", "services", "get"},
-		{"list Services", "", "services", "list"},
-		{"create Services", "", "services", "create"},
-		{"update Services", "", "services", "update"},
-		{"delete Services", "", "services", "delete"},
-		// registry.go upsertEndpoint/checkEndpointOwnership/removeLegacySlice/
-		// deleteOrphanPair.
-		{"get EndpointSlices", "discovery.k8s.io", "endpointslices", "get"},
-		{"create EndpointSlices", "discovery.k8s.io", "endpointslices", "create"},
-		{"update EndpointSlices", "discovery.k8s.io", "endpointslices", "update"},
-		{"delete EndpointSlices", "discovery.k8s.io", "endpointslices", "delete"},
-		// registry.go reapLegacyEndpoints reaps the pre-EndpointSlice
-		// core/v1 Endpoints object.
-		{"get legacy Endpoints", "", "endpoints", "get"},
-		{"delete legacy Endpoints", "", "endpoints", "delete"},
-		// pressure.go emitInferenceEvent / cmd/metal-agent's EventRecorder
-		// (client-go's EventSinkImpl uses Create then Patch for aggregation).
-		{"create Events", "", "events", "create"},
-		{"patch Events", "", "events", "patch"},
-		// s3.go resolveS3Credentials/resolveHFAuth read Model.spec.sourceSecretRef;
-		// ingress/tokens.go reads the fixed-name relay token Secret
-		// "llmkube-metal-relay" on every relayed request in the (default)
-		// non---legacy-direct-endpoints mode.
-		{"get Secrets", "", "secrets", "get"},
-	}
-
-	for _, tt := range tests {
+	for _, tt := range metalAgentSharedCalls {
 		t.Run(tt.name, func(t *testing.T) {
 			if !roleGrants(role, tt.apiGroup, tt.resource, tt.verb) {
 				t.Errorf("metal-agent-rbac.yaml Role %q does not grant verb %q on resource %q (apiGroup %q)",
 					role.Name, tt.verb, tt.resource, tt.apiGroup)
 			}
 		})
+	}
+}
+
+// TestMetalAgentRBACGrantsOnlyAgentCalls is the other direction: every
+// (group, resource, verb) the shared Role grants is one the agent uses. A
+// rule added to the manifest without an agent call behind it, or a wildcard,
+// fails here.
+func TestMetalAgentRBACGrantsOnlyAgentCalls(t *testing.T) {
+	role := loadRBACRole(t)
+	used := map[string]bool{}
+	for _, c := range metalAgentSharedCalls {
+		used[c.apiGroup+"/"+c.resource+"/"+c.verb] = true
+	}
+	for _, rule := range role.Rules {
+		if len(rule.ResourceNames) > 0 || len(rule.NonResourceURLs) > 0 {
+			t.Errorf("shared Role rule %+v: resourceNames and nonResourceURLs do not belong in the shared Role", rule)
+		}
+		for _, g := range rule.APIGroups {
+			for _, res := range rule.Resources {
+				for _, verb := range rule.Verbs {
+					if !used[g+"/"+res+"/"+verb] {
+						t.Errorf("metal-agent-rbac.yaml grants verb %q on resource %q (apiGroup %q), which no agent call uses",
+							verb, res, g)
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestMetalAgentRBACLeavesPerMacRulesOut keeps the self-scoped calls out of
+// the shared Role.
+func TestMetalAgentRBACLeavesPerMacRulesOut(t *testing.T) {
+	role := loadRBACRole(t)
+	for _, c := range metalAgentPerMacCalls {
+		if roleGrants(role, c.apiGroup, c.resource, c.verb) {
+			t.Errorf("metal-agent-rbac.yaml grants %q on %q (apiGroup %q) to every Mac; it belongs in the per-Mac Role (%s)",
+				c.verb, c.resource, c.apiGroup, c.name)
+		}
 	}
 }
 

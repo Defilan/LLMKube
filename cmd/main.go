@@ -261,6 +261,11 @@ func main() {
 		"Name of the ConfigMap containing a custom CA certificate to trust for model downloads.")
 	flag.StringVar(&initContainerImage, "init-container-image", "docker.io/curlimages/curl:8.18.0",
 		"Container image for the model downloader init container.")
+	var metalNodeAllowedCIDRs string
+	flag.StringVar(&metalNodeAllowedCIDRs, "metal-node-allowed-cidrs", controller.DefaultMetalNodeAllowedCIDRs,
+		"Comma-separated CIDRs a MetalNode's dial-back verifier pod may connect to. A candidate address a Mac "+
+			"reports outside them is marked NotAllowed and never dialed; loopback, link-local and multicast "+
+			"addresses are never dialed whatever this says. Empty allows nothing.")
 	flag.Int64Var(&defaultFSGroup, "default-fsgroup", 102,
 		"Default fsGroup for inference pods when Spec.PodSecurityContext is not set. "+
 			"102 matches curlimages/curl curl_group GID and lets the init container "+
@@ -530,8 +535,10 @@ func main() {
 
 	// The watch canary (#2069) scopes the manager's Lease informer to exactly
 	// its own lease: ByObject keys by GVK, so this must never cover a GVK
-	// another controller watches (the ModelRouter and the CA-cert path watch
-	// ConfigMaps; nothing else watches Leases). Scope only when enabled.
+	// another controller watches through the manager cache (the ModelRouter
+	// and the CA-cert path watch ConfigMaps). The MetalNode controller does
+	// watch Leases, but through a label-scoped cache of its own, so this
+	// scope does not narrow it. Scope only when enabled.
 	var cacheOpts cache.Options
 	canaryNamespace := watchcanary.ResolveNamespace(watchCanaryNamespace, leaderElectionNamespace)
 	if watchCanaryInterval > 0 {
@@ -806,6 +813,24 @@ func main() {
 		VRAMPerDeviceGiB: gpuSharingVRAMPerDeviceGiB,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "GPUQuota")
+		os.Exit(1)
+	}
+	// MetalNode fills each Mac's status from the agent's Lease and verifies
+	// the Mac with a dial-back pod. No feature gate: it does nothing until a
+	// MetalNode exists.
+	metalNodeAllowed, err := controller.ParseMetalNodeAllowedCIDRs(metalNodeAllowedCIDRs)
+	if err != nil {
+		setupLog.Error(err, "invalid --metal-node-allowed-cidrs")
+		os.Exit(1)
+	}
+	if err := (&controller.MetalNodeReconciler{
+		Client:             mgr.GetClient(),
+		Scheme:             mgr.GetScheme(),
+		APIReader:          mgr.GetAPIReader(),
+		InitContainerImage: initContainerImage,
+		AllowedCIDRs:       metalNodeAllowed,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "MetalNode")
 		os.Exit(1)
 	}
 	// Federation: exactly one of the two sides runs per operator instance,
