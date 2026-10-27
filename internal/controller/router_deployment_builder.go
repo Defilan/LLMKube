@@ -83,11 +83,33 @@ func (r *ModelRouterReconciler) reconcileRouterDeployment(
 		existing.Spec.Template.Annotations,
 		desired.Spec.Template.Annotations,
 	)
+	if !r.EmitScrapeAnnotations {
+		// The merge keeps keys the desired template no longer sets, so drop
+		// the scrape annotations an earlier run with the flag added: a router
+		// moved to routerPodMonitor must not be scraped twice. Only values
+		// the operator would set are removed.
+		for k, v := range routerProxyScrapeAnnotations() {
+			if existing.Spec.Template.Annotations[k] == v {
+				delete(existing.Spec.Template.Annotations, k)
+			}
+		}
+	}
 	existing.Labels = mergePreservingExternal(existing.Labels, desired.Labels)
 	if err := setControllerReferenceUnblocked(mr, existing, r.Scheme); err != nil {
 		return fmt.Errorf("set owner ref on existing router Deployment: %w", err)
 	}
 	return r.Update(ctx, existing)
+}
+
+// routerProxyScrapeAnnotations are the annotations --emit-scrape-annotations
+// adds to router-proxy pods. They mirror buildPodAnnotations for inference
+// pods, pointed at the listener --metrics-bind-address opens (#2263).
+func routerProxyScrapeAnnotations() map[string]string {
+	return map[string]string{
+		"prometheus.io/scrape": "true",
+		"prometheus.io/path":   "/metrics",
+		"prometheus.io/port":   fmt.Sprintf("%d", routerProxyMetricsPort),
+	}
 }
 
 // newRouterDeployment is the in-memory blueprint of the proxy
@@ -148,6 +170,11 @@ func (r *ModelRouterReconciler) newRouterDeployment(
 		// changes. controller-runtime's CreateOrUpdate doesn't trigger
 		// a rollout on its own; the hash annotation does.
 		routerProxyConfigHashAnnotation: configHash,
+	}
+	if r.EmitScrapeAnnotations {
+		for k, v := range routerProxyScrapeAnnotations() {
+			podAnnotations[k] = v
+		}
 	}
 
 	// Proxies that call the API (ModelPool activation, endpoint tracking) run
