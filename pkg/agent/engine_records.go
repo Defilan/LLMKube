@@ -12,9 +12,14 @@ import (
 	"time"
 )
 
-// engineRecordVersion is the record format. A record with any other version is
-// ignored by adoption (PR 2) rather than misread.
-const engineRecordVersion = 2
+// engineRecordVersion is the record format this agent writes. A version-1
+// record (0.10.5 to 0.10.11, before engines led their own process group) is
+// read only so the engine it names can be retired as a single PID; any other
+// version is reported and left alone rather than misread.
+const (
+	engineRecordVersion       = 2
+	legacyEngineRecordVersion = 1
+)
 
 const (
 	engineRecordProvisional = "provisional"
@@ -136,16 +141,24 @@ func (s *engineRecordStore) WriteRunning(p *ManagedProcess) error {
 	return nil
 }
 
-// List reads every record in the directory. Records of another version or
-// unparsable files are skipped and reported, never acted on.
+// List reads every record in the directory. Records of another version,
+// unparsable files and files that fail checkPrivate are skipped and reported,
+// never acted on. A directory that fails checkPrivate yields no records.
 func (s *engineRecordStore) List() ([]engineRecord, []error) {
 	if s.dirErr != nil {
 		return nil, []error{s.dirErr}
 	}
-	entries, err := os.ReadDir(s.dir)
+	info, err := os.Lstat(s.dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
+	if err != nil {
+		return nil, []error{fmt.Errorf("list engine records in %s: %w", s.dir, err)}
+	}
+	if err := checkPrivate(s.dir, info, true); err != nil {
+		return nil, []error{fmt.Errorf("refusing engine records: %w", err)}
+	}
+	entries, err := os.ReadDir(s.dir)
 	if err != nil {
 		return nil, []error{fmt.Errorf("list engine records in %s: %w", s.dir, err)}
 	}
@@ -161,9 +174,9 @@ func (s *engineRecordStore) List() ([]engineRecord, []error) {
 			errs = append(errs, fmt.Errorf("engine record %s: unexpected file name", name))
 			continue
 		}
-		rec, ok := s.read(ns, n)
-		if !ok {
-			errs = append(errs, fmt.Errorf("engine record %s: unreadable or not version %d", name, engineRecordVersion))
+		rec, err := s.load(ns, n)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("engine record %s: %w", name, err))
 			continue
 		}
 		recs = append(recs, rec)
@@ -194,22 +207,74 @@ func (s *engineRecordStore) startToken(pid int) (string, error) {
 	return tok, nil
 }
 
+// read returns the current-version record of namespace/name, if there is a
+// valid one.
 func (s *engineRecordStore) read(namespace, name string) (engineRecord, bool) {
+	rec, err := s.load(namespace, name)
+	return rec, err == nil && rec.Version == engineRecordVersion
+}
+
+// load reads the record file of namespace/name. A record names a process the
+// agent will signal, so it is trusted only if no one but the agent's user
+// could have written it (checkPrivate), and only for the service its file is
+// named after: Remove deletes by the record's own namespace and name.
+func (s *engineRecordStore) load(namespace, name string) (engineRecord, error) {
+	path := s.path(namespace, name)
 	// O_NOFOLLOW: a symlink planted in the records directory is no record.
-	f, err := os.OpenFile(s.path(namespace, name), os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
-		return engineRecord{}, false
+		return engineRecord{}, err
 	}
 	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		return engineRecord{}, err
+	}
+	if err := checkPrivate(path, info, false); err != nil {
+		return engineRecord{}, err
+	}
 	data, err := io.ReadAll(f)
 	if err != nil {
-		return engineRecord{}, false
+		return engineRecord{}, err
 	}
 	var rec engineRecord
-	if json.Unmarshal(data, &rec) != nil || rec.Version != engineRecordVersion {
-		return engineRecord{}, false
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return engineRecord{}, fmt.Errorf("unparsable: %w", err)
 	}
-	return rec, true
+	if rec.Version != engineRecordVersion && rec.Version != legacyEngineRecordVersion {
+		return engineRecord{}, fmt.Errorf("version %d is not one this agent reads", rec.Version)
+	}
+	if rec.Namespace != namespace || rec.Name != name {
+		return engineRecord{}, fmt.Errorf("names service %s/%s, not the %s/%s its file is named for",
+			rec.Namespace, rec.Name, namespace, name)
+	}
+	return rec, nil
+}
+
+// checkPrivate refuses a records directory (dir) or record file that another
+// user could have written: it must be owned by the user the agent runs as and
+// not writable by group or others, and a record must be a regular file.
+// Otherwise whoever could plant a record could aim the agent, or a
+// stop-engines run, at a process group of their choosing.
+func checkPrivate(path string, info os.FileInfo, dir bool) error {
+	switch {
+	case dir && !info.IsDir():
+		return fmt.Errorf("%s is not a directory", path)
+	case !dir && !info.Mode().IsRegular():
+		return fmt.Errorf("%s is not a regular file", path)
+	}
+	uid := os.Geteuid()
+	owner, ok := fileOwner(path, info)
+	if !ok {
+		return fmt.Errorf("%s: cannot read its owner", path)
+	}
+	if owner != uid {
+		return fmt.Errorf("%s is owned by uid %d, not uid %d the agent runs as", path, owner, uid)
+	}
+	if perm := info.Mode().Perm(); perm&0o022 != 0 {
+		return fmt.Errorf("%s has mode %04o, which lets other users write it", path, perm)
+	}
+	return nil
 }
 
 func (s *engineRecordStore) write(rec engineRecord) error {

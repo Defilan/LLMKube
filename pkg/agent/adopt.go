@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 )
 
 // Outcomes of evaluating one engine record at startup, the result label of
@@ -82,6 +83,9 @@ func (a *MetalAgent) adoptOne(ctx context.Context, rec engineRecord) (outcome st
 		return adoptionInterrupted, true
 	}
 	switch {
+	case rec.Version == legacyEngineRecordVersion:
+		// An engine of an agent from before process groups is never adopted.
+		return a.retireLegacy(rec)
 	case rec.Runtime == runtimeOMLX:
 		// The oMLX daemon is not adopted; its services reload.
 		return adoptionDiscarded, false
@@ -98,6 +102,12 @@ func (a *MetalAgent) adoptOne(ctx context.Context, rec engineRecord) (outcome st
 		}
 	case !a.provenOurs(rec):
 		return adoptionDiscarded, false
+	case !inRecordedGroup(rec):
+		// Ours by its start token, but the kernel does not put it in the
+		// group it leads on record: a group stop would miss it, and dropping
+		// the record would orphan it. stopEngineGroup refuses it without a
+		// signal, so the record stays for a later attempt.
+		return a.stopUnwanted(rec, "not in its recorded process group")
 	case !a.runsRecordedExecutable(rec):
 		// The start token proves the process is the one the agent forked, but
 		// it now runs something else than recorded (a wrapper that exec'd the
@@ -136,6 +146,29 @@ func (a *MetalAgent) stopUnwanted(rec engineRecord, why string) (outcome string,
 	return adoptionStopped, false
 }
 
+// retireLegacy stops the engine of a version-1 record if it still runs and is
+// provably the recorded process, and drops the record once it is gone. One
+// that cannot be stopped keeps its record for the next attempt.
+func (a *MetalAgent) retireLegacy(rec engineRecord) (outcome string, keepRecord bool) {
+	if rec.PID <= 0 {
+		return adoptionDiscarded, false
+	}
+	err := stopLegacyEngine(rec.PID, rec.StartToken, a.inspect)
+	switch {
+	case err == nil, engineStopped(err) && !errors.Is(err, errProcessAlreadyGone):
+		// Signalled and stopped, by SIGTERM or after the grace period.
+		a.logger.Infow("stopped the engine of a record from an older agent",
+			"key", rec.Namespace+"/"+rec.Name, "pid", rec.PID)
+		return adoptionStopped, false
+	case errors.Is(err, errProcessAlreadyGone):
+		return adoptionDiscarded, false
+	default:
+		a.logger.Warnw("failed to stop the engine of a record from an older agent; keeping its record",
+			"key", rec.Namespace+"/"+rec.Name, "pid", rec.PID, "error", err)
+		return adoptionStopped, true
+	}
+}
+
 // provenOurs reports whether the record's PID is alive and is still the
 // process the agent forked: same kernel start token (exec does not change it)
 // and leader of the recorded process group. Every engine the agent spawns
@@ -151,6 +184,13 @@ func (a *MetalAgent) provenOurs(rec engineRecord) bool {
 	}
 	tok, err := a.inspect.StartToken(rec.PID)
 	return err == nil && rec.StartToken != "" && tok == rec.StartToken
+}
+
+// inRecordedGroup reports whether the kernel puts a proven-ours engine in the
+// process group its record says it leads.
+func inRecordedGroup(rec engineRecord) bool {
+	pgid, err := getpgidFn(rec.PID)
+	return err == nil && pgid == rec.PGID
 }
 
 // runsRecordedExecutable reports whether a proven-ours engine still runs the

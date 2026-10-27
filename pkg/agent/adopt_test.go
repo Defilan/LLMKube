@@ -76,6 +76,15 @@ func newAdoptAgent(t *testing.T, in adoptInspector, healthy bool, alive map[int]
 		return nil
 	}
 	t.Cleanup(func() { killFn = orig })
+	// A live scripted engine leads its own group; a dead one is unknown.
+	origPGID := getpgidFn
+	getpgidFn = func(pid int) (int, error) {
+		if !live[pid] {
+			return 0, syscall.ESRCH
+		}
+		return pid, nil
+	}
+	t.Cleanup(func() { getpgidFn = origPGID })
 	return a, &sent
 }
 
@@ -677,5 +686,51 @@ func TestWithdrawInheritedEndpoints_SkipsAdopted(t *testing.T) {
 	}
 	if ready, _ := endpointReady(t, c, gone); ready {
 		t.Errorf("startup withdrawal left the endpoint of a service with no engine Ready")
+	}
+}
+
+// A version-1 record's engine ran in the old agent's process group, so
+// adoption stops it as a single PID once its start token proves it, never as
+// a group, and drops the record.
+func TestAdopt_VersionOneRecordStopsTheEngineAlone(t *testing.T) {
+	in := adoptInspector{tokens: map[int]string{4242: "t1"}, exes: map[int]string{4242: "/bin/engine"}}
+	a, sent := newAdoptAgent(t, in, true, map[int]bool{4242: true})
+	writeRawRecord(t, filepath.Dir(a.engineRecords.Dir()), "svc", map[string]any{
+		"version": legacyEngineRecordVersion, "namespace": "default", "name": "svc", "state": engineRecordRunning,
+		"pid": 4242, "startToken": "t1", "port": 18080, "runtime": runtimeLlamaServer,
+	})
+	adopted := a.adoptEngines(context.Background())
+	if adopted["default/svc"] {
+		t.Fatal("a version-1 engine was adopted")
+	}
+	for _, s := range *sent {
+		if strings.HasPrefix(s, "-") {
+			t.Fatalf("signal %s sent to a process group for a version-1 record", s)
+		}
+	}
+	if !slices.Contains(*sent, fmt.Sprintf("4242:%d", syscall.SIGTERM)) {
+		t.Fatalf("signals %v, want SIGTERM to PID 4242", *sent)
+	}
+	if recordExists(t, a, "svc") {
+		t.Fatal("the version-1 record was kept after its engine stopped")
+	}
+}
+
+// The record says the engine leads its group; when the kernel disagrees, the
+// engine (ours by its start token) is neither adopted nor signalled, and its
+// record stays: dropping it would orphan a running engine.
+func TestAdopt_GroupTheKernelDoesNotConfirmIsNotAdopted(t *testing.T) {
+	in := adoptInspector{tokens: map[int]string{4242: "t1"}, exes: map[int]string{4242: "/bin/engine"}}
+	a, sent := newAdoptAgent(t, in, true, map[int]bool{4242: true})
+	writeSpawned(t, a)
+	orig := getpgidFn
+	getpgidFn = func(int) (int, error) { return 1, nil }
+	t.Cleanup(func() { getpgidFn = orig })
+	if adopted := a.adoptEngines(context.Background()); adopted["default/svc"] {
+		t.Fatal("an engine outside its recorded group was adopted")
+	}
+	onlyProbes(t, *sent, "an engine outside its recorded group")
+	if !recordExists(t, a, "svc") {
+		t.Fatal("the record of an engine that is ours and still running was dropped")
 	}
 }

@@ -631,7 +631,18 @@ func scriptKill(t *testing.T, answer func(pid int, sig syscall.Signal) error) *[
 		return answer(pid, sig)
 	}
 	t.Cleanup(func() { killFn = orig })
+	scriptGroupLeader(t)
 	return sent
+}
+
+// scriptGroupLeader makes the kernel report that every scripted PID leads its
+// own process group, as an engine the agent spawned does, so a test of a fake
+// PID never asks the real kernel about a process it does not own.
+func scriptGroupLeader(t *testing.T) {
+	t.Helper()
+	orig := getpgidFn
+	getpgidFn = func(pid int) (int, error) { return pid, nil }
+	t.Cleanup(func() { getpgidFn = orig })
 }
 
 func TestStopEngineGroup_TokenChangedAtDeadlineNeverKills(t *testing.T) {

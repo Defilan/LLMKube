@@ -195,21 +195,31 @@ func TestEngineRecordStore_ReadIgnoresSymlink(t *testing.T) {
 	}
 }
 
+// A version-1 record is listed, so its engine can be retired; any other
+// version is skipped and reported.
 func TestEngineRecordStore_ListSkipsOtherVersions(t *testing.T) {
 	s, dir := newTestRecordStore(t)
 	if err := s.WriteRunning(&ManagedProcess{Name: "a", Namespace: "default", PID: 0, Runtime: "ollama"}); err != nil {
 		t.Fatal(err)
 	}
-	v1 := []byte(`{"version":1,"namespace":"default","name":"old","pid":4242}`)
-	if err := os.WriteFile(filepath.Join(dir, "default_old.json"), v1, 0o600); err != nil {
-		t.Fatal(err)
+	for name, raw := range map[string]string{
+		"old":    `{"version":1,"namespace":"default","name":"old","pid":4242}`,
+		"future": `{"version":3,"namespace":"default","name":"future","pid":4243}`,
+	} {
+		if err := os.WriteFile(filepath.Join(dir, "default_"+name+".json"), []byte(raw), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	recs, errs := s.List()
-	if len(recs) != 1 || recs[0].Name != "a" {
-		t.Fatalf("records = %+v, want only the version 2 record", recs)
+	got := map[string]int{}
+	for _, r := range recs {
+		got[r.Name] = r.Version
 	}
-	if len(errs) != 1 {
-		t.Fatalf("errs = %v, want one skipped-version error", errs)
+	if len(recs) != 2 || got["a"] != engineRecordVersion || got["old"] != legacyEngineRecordVersion {
+		t.Fatalf("records = %+v, want the version 2 record and the version 1 one", recs)
+	}
+	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "version 3") {
+		t.Fatalf("errs = %v, want one error naming the unread version 3", errs)
 	}
 }
 

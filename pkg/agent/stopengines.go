@@ -98,6 +98,15 @@ func withdrawEndpoint(ctx context.Context, registry *ServiceRegistry, rec engine
 // confirmed stopped (or was already gone), so the caller may drop the record.
 func stopRecordedEngine(ctx context.Context, cfg StopEnginesConfig, rec engineRecord, inspect processInspector) error {
 	switch {
+	case rec.Version == legacyEngineRecordVersion:
+		// An older agent's engine ran in the agent's group: stop it alone.
+		if rec.PID <= 0 {
+			return nil
+		}
+		if err := stopLegacyEngine(rec.PID, rec.StartToken, inspect); !engineStopped(err) {
+			return err
+		}
+		return nil
 	case rec.Runtime == runtimeOMLX:
 		// The oMLX daemon is not adopted, so it is not signalled either.
 		return nil

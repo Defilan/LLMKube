@@ -73,6 +73,10 @@ type signalFunc func(pid int, sig syscall.Signal) error
 
 var killFn signalFunc = syscall.Kill
 
+// getpgidFn returns the process group pid is in; a var so tests can script
+// the kernel's answer.
+var getpgidFn = syscall.Getpgid
+
 // stopEngineGroup stops an engine the agent did not spawn in this process (an
 // adopted engine, #2079) by signalling its process group. Nothing is signalled
 // until the PID is proven to be the recorded engine: it must lead its own group
@@ -90,6 +94,12 @@ func stopEngineGroup(pid, pgid int, token string, inspect processInspector) erro
 		return fmt.Errorf("refusing to signal process group %d: not led by engine PID %d", pgid, pid)
 	}
 	if err := verifyEngineIdentity(pid, token, inspect); err != nil {
+		return err
+	}
+	// The record says the engine leads pgid; the kernel must agree, or the
+	// group signal below would reach another group, or none, and an ESRCH from
+	// it would pass for an engine already gone.
+	if err := verifyEngineGroup(pid, pgid); err != nil {
 		return err
 	}
 	if err := killFn(-pgid, syscall.SIGTERM); err != nil {
@@ -119,6 +129,65 @@ func stopEngineGroup(pid, pgid int, token string, inspect processInspector) erro
 		return err
 	}
 	_ = killFn(-pgid, syscall.SIGKILL)
+	return &KilledAfterGraceError{PID: pid}
+}
+
+// verifyEngineGroup proves the living, identified engine pid is in process
+// group pgid. A PID gone since the identity check wraps errProcessAlreadyGone;
+// any other failure or a different group is a plain error, so the caller keeps
+// the record of an engine that may still run.
+func verifyEngineGroup(pid, pgid int) error {
+	got, err := getpgidFn(pid)
+	if errors.Is(err, syscall.ESRCH) {
+		return fmt.Errorf("process %d: %w (%w)", pid, errProcessAlreadyGone, err)
+	}
+	if err != nil {
+		return fmt.Errorf("cannot read the process group of process %d: %w", pid, err)
+	}
+	if got != pgid {
+		return fmt.Errorf("process %d is in process group %d, not its recorded group %d; not signalling", pid, got, pgid)
+	}
+	return nil
+}
+
+// stopLegacyEngine stops the engine of a version-1 record, written by an agent
+// from before engines led their own process group (0.10.5 to 0.10.11). Such an
+// engine ran in the agent's group, so it is signalled as a single PID, and
+// only after its start token proves it is the recorded process. Like
+// stopEngineGroup it never escalates on doubt. It returns nil once its signal
+// stopped the engine, and an error wrapping errProcessAlreadyGone when the PID
+// was dead or held another process before any signal.
+func stopLegacyEngine(pid int, token string, inspect processInspector) error {
+	if pid <= 0 {
+		return fmt.Errorf("refusing to stop invalid PID %d", pid)
+	}
+	if err := verifyEngineIdentity(pid, token, inspect); err != nil {
+		return err
+	}
+	if err := killFn(pid, syscall.SIGTERM); err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			return fmt.Errorf("process %d: %w", pid, errProcessAlreadyGone)
+		}
+		return fmt.Errorf("failed to send SIGTERM to process %d: %w", pid, err)
+	}
+	deadline := time.Now().Add(stopGracePeriod)
+	for time.Now().Before(deadline) {
+		err := killFn(pid, 0)
+		if errors.Is(err, syscall.ESRCH) {
+			return nil // it exited on SIGTERM
+		}
+		if errors.Is(err, syscall.EPERM) {
+			return fmt.Errorf("process %d is no longer ours (EPERM); not escalating", pid)
+		}
+		sleepUntil(deadline, stopPollInterval)
+	}
+	if err := verifyEngineIdentity(pid, token, inspect); err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+		return err
+	}
+	_ = killFn(pid, syscall.SIGKILL)
 	return &KilledAfterGraceError{PID: pid}
 }
 
