@@ -117,15 +117,15 @@ func hasEnv(isvc *inferencev1alpha1.InferenceService, name string) bool {
 // form is the only sendable one. vLLM hashes the Secret bytes unstripped
 // (authenticate.py in v0.32.0), so a value that needed trimming cannot match a
 // vLLM server's key; callers warn when they change the value.
+func trimHeaderValue(v string) string {
+	return strings.TrimRight(v, " \t\r\n")
+}
 
 // warnTrimmedKey tells the user a key was altered, so a 401 after it is
 // explained rather than mysterious.
 func warnTrimmedKey(source string) {
 	fmt.Printf("⚠️  %s ends in whitespace a header cannot carry; it was stripped. "+
 		"If requests get 401, the server's key may include those bytes\n", source)
-}
-func trimHeaderValue(v string) string {
-	return strings.TrimRight(v, " \t\r\n")
 }
 
 // readAPIKeySecret returns the Secret's value for ref, trimmed of bytes a
@@ -144,11 +144,15 @@ func readAPIKeySecret(
 	if len(value) == 0 {
 		return "", fmt.Errorf("API key Secret %s/%s key %q is empty", namespace, ref.Name, ref.Key)
 	}
-	if trimmed := trimHeaderValue(string(value)); trimmed != string(value) {
-		warnTrimmedKey(fmt.Sprintf("Secret %s/%s key %q", namespace, ref.Name, ref.Key))
-		return trimmed, nil
+	trimmed := trimHeaderValue(string(value))
+	if trimmed == "" {
+		return "", fmt.Errorf("API key Secret %s/%s key %q holds only whitespace a header cannot carry",
+			namespace, ref.Name, ref.Key)
 	}
-	return string(value), nil
+	if trimmed != string(value) {
+		warnTrimmedKey(fmt.Sprintf("Secret %s/%s key %q", namespace, ref.Name, ref.Key))
+	}
+	return trimmed, nil
 }
 
 // applyAPIKeyFromInferenceService resolves the key a Ready service already

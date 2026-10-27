@@ -448,6 +448,7 @@ func TestBenchmarkAPIKeySecretErrors(t *testing.T) {
 
 	createSecret(t, c, ns, "no-such-key", map[string]string{"other": benchAuthKey})
 	createSecret(t, c, ns, "empty-key", map[string]string{"key": ""})
+	createSecret(t, c, ns, "blank-key", map[string]string{"key": "\n"})
 
 	cases := []struct {
 		name string
@@ -469,6 +470,13 @@ func TestBenchmarkAPIKeySecretErrors(t *testing.T) {
 			ref:  &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "empty-key"}, Key: "key"},
 			want: `key "key" is empty`,
 		},
+		{
+			// What a Helm template with an unset value renders, and what a
+			// newline-only key file produces.
+			name: "whitespace only",
+			ref:  &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "blank-key"}, Key: "key"},
+			want: "holds only whitespace",
+		},
 	}
 	// -o markdown rather than json, so the "no key in the output" probe covers
 	// the summary tables too.
@@ -486,6 +494,9 @@ func TestBenchmarkAPIKeySecretErrors(t *testing.T) {
 			}
 			if strings.Contains(err.Error(), benchAuthKey) {
 				t.Fatalf("error printed a key value: %v", err)
+			}
+			if strings.Contains(out, "🔑 API key: from Secret") {
+				t.Fatalf("a key source was reported for a key that was not sent:\n%s", out)
 			}
 		})
 	}
