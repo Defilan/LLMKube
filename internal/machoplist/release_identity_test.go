@@ -281,15 +281,16 @@ func parsePlistDict(t *testing.T, raw []byte) map[string]any {
 }
 
 // TestArchivesShipDeploymentMacosWithoutTemplates checks the agent archives
-// carry every file under deployment/macos except the Info.plist templates,
-// which only the build uses (their __VERSION__ placeholder would confuse an
-// archive reader next to the real launchd plists). Expanding the archive globs
-// against the tree also catches a new file the globs would miss.
+// carry every file under deployment/macos except the build-only ones: the
+// Info.plist templates (their __VERSION__ placeholder would confuse an archive
+// reader next to the real launchd plists) and the Go source that embeds the
+// manifests into the CLI. Expanding the archive globs against the tree also
+// catches a new file the globs would miss.
 func TestArchivesShipDeploymentMacosWithoutTemplates(t *testing.T) {
 	cfg := loadGoreleaser(t)
 	var want []string
 	err := filepath.WalkDir(filepath.Join(repoRoot, "deployment/macos"), func(p string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() || strings.HasSuffix(p, ".tmpl") {
+		if err != nil || d.IsDir() || buildOnlyMacosFile(p) {
 			return err
 		}
 		rel, err := filepath.Rel(repoRoot, p)
@@ -336,8 +337,8 @@ func TestArchivesShipDeploymentMacosWithoutTemplates(t *testing.T) {
 				}
 			}
 			for f := range got {
-				if strings.HasSuffix(f, ".tmpl") {
-					t.Errorf("archive %s ships the build-only template %s", id, f)
+				if buildOnlyMacosFile(f) {
+					t.Errorf("archive %s ships the build-only file %s", id, f)
 				}
 			}
 			for _, f := range want {
@@ -347,4 +348,10 @@ func TestArchivesShipDeploymentMacosWithoutTemplates(t *testing.T) {
 			}
 		})
 	}
+}
+
+// buildOnlyMacosFile reports whether a file under deployment/macos is used only
+// to build the release, so the agent archives must leave it out.
+func buildOnlyMacosFile(path string) bool {
+	return strings.HasSuffix(path, ".tmpl") || strings.HasSuffix(path, ".go")
 }
