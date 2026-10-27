@@ -761,10 +761,11 @@ Behavior:
   outside the operator's cache label/discovery contract and may not appear in
   the listing. Each claim is read through a short-lived read-only pod the
   command creates and deletes, including a Pending `WaitForFirstConsumer`
-  claim, which that pod binds. On a multi-node cluster the pod is pinned to
-  the node whose kubelet holds the claim, so a strict RWO serving pod does not
-  make it stall on Multi-Attach; a claim nothing holds is not pinned, and the
-  pod is its first consumer. `cache list` needs permission to list, get,
+  claim, which that pod binds. For a `ReadWriteOnce` or `ReadWriteOncePod`
+  claim a pod holds, the pod is pinned to that pod's node, so a strict RWO
+  serving pod does not make it stall on Multi-Attach; a `ReadWriteMany` or
+  `ReadOnlyMany` claim is never pinned, and a claim nothing holds is not
+  pinned either: the pod is its first consumer. `cache list` needs permission to list, get,
   create, exec into and delete pods in the namespace, and exits nonzero when
   it cannot read any discovered claim. The inspector copies the holder's
   tolerations, so a tainted node that runs the claim does not reject it.
@@ -847,8 +848,27 @@ llmkube cache clear
 llmkube cache clear --force
 ```
 
-Entries are removed by a short-lived `busybox` pod that mounts the cache claim
-read-write, one pod per claim, deleted as soon as it is done.
+Entries are removed by a short-lived `busybox:1.37.0` pod that mounts the cache
+claim read-write, one pod per claim, deleted as soon as it is done. On a cluster
+that cannot pull that image, pass `--cache-image <ref>` (or set
+`LLMKUBE_CACHE_IMAGE`) to `cache list`, `cache clear` and `delete
+--purge-cache`; the flag wins over the variable. The image needs `sh`,
+`sleep`, `ls`, `rm` and a `du` that takes `-sb`, as busybox and GNU
+coreutils do.
+
+A `ReadWriteOncePod` claim another pod holds cannot be mounted a second time
+on any node, so `cache list` and `cache clear` refuse it at once, naming the
+access mode and the holding pod, instead of waiting for a pod that can never
+start. A pod that is already being deleted releases the claim, and so does a
+cache pod another running `llmkube` command deletes when it ends, so both are
+waited for, not refused. A cache pod llmkube left behind at a name the command
+does not use is named as such, since the command does not delete it: delete
+it and retry. For this check `cache clear` needs `list pods`; without it, it
+falls back to the old wait, while `cache list` reports the pod-list failure as
+it always has. `delete --purge-cache` waits for every holder, as it did
+before: the service it deleted takes its pods with it.
+`cache list` pins its inspector pod only for a `ReadWriteOnce` or `ReadWriteOncePod`
+claim: a `ReadWriteMany` or `ReadOnlyMany` claim is never pinned.
 
 `cache clear` with no flag and `cache clear --orphaned` act on the claims
 `cache list` discovers: `llmkube-model-cache` and the labeled per-service

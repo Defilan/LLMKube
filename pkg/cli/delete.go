@@ -22,6 +22,7 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -41,6 +42,7 @@ type deleteOptions struct {
 
 func NewDeleteCommand() *cobra.Command {
 	opts := &deleteOptions{}
+	var image string
 
 	cmd := &cobra.Command{
 		Use:     "delete [NAME]",
@@ -50,13 +52,17 @@ func NewDeleteCommand() *cobra.Command {
 		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.name = args[0]
-			return runDelete(opts)
+			return withCacheImage(image, func() error {
+				return runDelete(opts)
+			})
 		},
 	}
 
 	cmd.Flags().StringVarP(&opts.namespace, "namespace", "n", "default", "Kubernetes namespace")
 	cmd.Flags().BoolVar(&opts.purgeCache, "purge-cache", false,
 		"Also purge the model from the persistent cache when deleting the deployment")
+	cmd.Flags().StringVar(&image, "cache-image", "",
+		"Image for the short-lived pod that purges the cache (default busybox:1.37.0, or $"+cacheImageEnv+")")
 
 	return cmd
 }
@@ -176,7 +182,8 @@ func runDelete(opts *deleteOptions) error {
 			return fmt.Errorf("deployment deleted, but purging the cache failed: %w", err)
 		}
 		fmt.Printf("🗑️  Purging model cache (cache key: %s)...\n", cacheKey)
-		if err := purgeDeleteTargets(ctx, cfg, clientset, opts.namespace, cacheKey, purged); err != nil {
+		err = purgeDeleteTargets(ctx, cfg, k8sClient, clientset, opts.namespace, cacheKey, purged)
+		if err != nil {
 			return fmt.Errorf("deployment deleted, but purging the cache failed: %w; "+
 				"run 'llmkube cache clear -n %s' to clear what remains", err, opts.namespace)
 		}
@@ -186,10 +193,20 @@ func runDelete(opts *deleteOptions) error {
 	return nil
 }
 
+// waitForEveryHolder is the delete path's rule for a pod that holds a
+// ReadWriteOncePod claim: wait for it, as base did. The InferenceService and
+// Model this run deleted take their pods with them asynchronously, and those
+// come in more shapes than one owner chain proves (a Deployment's pods, the
+// multiNode rank pods the InferenceService controls itself, a prefetch Job's
+// pod), so refusing any of them would fail a purge that succeeds once the
+// cascade finishes. A holder that is not going away runs out the start
+// timeout, as before #2155.
+func waitForEveryHolder(*corev1.Pod) bool { return true }
+
 // purgeDeleteTargets removes cacheKey from every resolved claim, purging each
 // claim on its own so one failure is reported with the claim it belongs to.
 func purgeDeleteTargets(
-	ctx context.Context, cfg *rest.Config, clientset kubernetes.Interface,
+	ctx context.Context, cfg *rest.Config, k8sClient client.Client, clientset kubernetes.Interface,
 	namespace, cacheKey string, targets []purgeTarget,
 ) error {
 	if len(targets) == 0 {
@@ -199,7 +216,8 @@ func purgeDeleteTargets(
 	var errs []error
 	var outcomes []purgeOutcome
 	for _, target := range targets {
-		outcome, err := purgeCacheKeys(ctx, cfg, clientset, namespace, target.Name, []string{cacheKey})
+		outcome, err := purgeCacheKeysReleasing(ctx, cfg, k8sClient, clientset, namespace, target,
+			waitForEveryHolder, []string{cacheKey})
 		if err != nil {
 			errs = append(errs, fmt.Errorf("cache PVC %s: %w", target.Name, err))
 			continue
