@@ -93,7 +93,9 @@ checked against its recorded staged size before it is reused. Older entries
 without a valid size record are kept without contacting the origin, preserving
 the existing revision even if upstream has changed. Their current local size
 is recorded on a best-effort basis, except on FUSE where serving pods do not
-write to warm caches. This baseline detects subsequent size changes; it cannot
+write to warm caches; there the prefetch stager records it, so a FUSE cache
+staged before size records existed stops warning once a stager has run. This
+baseline detects subsequent size changes; it cannot
 prove that a legacy file was complete before the upgrade. A mismatch with a
 valid record triggers a fresh staging attempt; a failed download fails the
 init container. This also applies to unpinned files in a partially pinned
@@ -110,7 +112,15 @@ verification.
 The downloader checks the size again after publishing and removes the
 destination, checksum stamp, and staged size record if publication left the
 wrong size. Size records are written using a temporary file and rename so
-concurrent readers cannot observe a partially written number.
+concurrent readers cannot observe a partially written number. The same writer
+produces checksum stamps and rejection markers; its temporary files are named
+`<file>.llmkube-tmp.XXXXXX`. A pod that dies mid-write can leave one behind, so
+every downloader allowed to write the cache (any pod off FUSE, the prefetch
+stager on FUSE) removes such files once they are more than ten minutes old,
+along with the older `<file>.llmkube-size.XXXXXX` and
+`<marker>.sha256-rejected.XXXXXX` names. A stamp temporary from before this
+naming, `<file>.sha256.XXXXXX`, is not swept because that pattern can match a
+file a repository ships; delete one by hand if you find it.
 
 `OnChange` still revalidates each file against the current origin. A mutable
 source can therefore change shards independently during a refresh. Pin the
@@ -121,16 +131,26 @@ Concurrent staging requires filesystem locks that work across writer nodes.
 `ReadWriteMany` alone does not guarantee this. BlobFuse lists `flock` as an
 [unsupported operation](https://learn.microsoft.com/en-us/azure/storage/blobs/blobfuse2-known-issues).
 **Behavior change:** serving pods refuse to download missing or mismatched
-multi-file artifacts on FUSE mounts. Warm caches remain usable, including
-when the origin is offline; the serving downloader does not sweep temporary
-files or create a lock file on these mounts. Detection uses the Linux FUSE
-magic value, which also covers virtiofs (including Kata Containers volumes).
+artifacts on FUSE mounts, for single-file models as well as multi-file ones
+(single-file models since #2254). Warm caches remain usable, including when the
+origin is offline; the serving downloader does not sweep temporary files or
+create a lock file on these mounts. Under `RefreshPolicy: OnChange`, a serving
+pod that finds the upstream changed keeps a cached copy that passes its local
+checks and logs `Upstream changed for <file>; a serving pod does not stage on a
+FUSE cache, so it kept the cached copy`; it serves the old revision until a
+prefetch stager refreshes the cache. Detection uses the Linux FUSE magic value,
+which also covers virtiofs (including Kata Containers volumes).
 It reads the magic with `stat -f`; a custom init image whose `stat` lacks
 `-f` cannot detect FUSE, so it stages under the directory lock as before and
 logs a warning, which leaves a FUSE cache unprotected across nodes.
 The filesystem type alone cannot establish cross-node locking support.
+Upgrading to a release with this change rolls every cache-backed serving pod
+once, because the downloader's command changes.
 A refusal sets `ModelTransferHealthy=False` with reason
-`ModelCacheLockUnsupported` and a remedy in the condition message.
+`ModelCacheLockUnsupported`. The condition message carries the same remedy the
+downloader logs, which depends on the source kind (prefetch for HTTP/HF
+sources; storage with cross-node `flock` or a `pvc://` source for `s3://` and
+local sources).
 
 For HTTP/HF sources, set `spec.modelCache.prefetch: true` on every
 InferenceService using such a claim. The operator's prefetch Job is allowed
@@ -146,10 +166,13 @@ replacement. Serving pods wait for successful staging into their claim,
 then mount the cache read-only. See
 [Letting the service require a prefetch](#letting-the-service-require-a-prefetch).
 
-`s3://` sources do not support prefetch. Use storage with cross-node `flock`
-support, or stage the files separately and use a `pvc://` source. Avoid other
-writers (including separate Models sharing the same cache key) while a
-prefetch Job stages its directory. Other filesystems still use `flock`;
+`s3://` and local sources do not support prefetch. Use storage with cross-node
+`flock` support, or stage the files separately and use a `pvc://` source. The
+operator runs one prefetch stager at a time per cache directory and claim, so
+separate Models sharing a cache key take turns (see
+[Prefetch](#prefetch-eager-download)); avoid writers it does not manage, such
+as a hand-run Job mounting the claim, while a prefetch Job stages its
+directory. Other filesystems still use `flock`;
 their cross-node lock semantics must be supported by the storage provider.
 
 ## Integrity Verification (spec.sha256)
@@ -287,6 +310,16 @@ one entry per claim with the Job name, the phase (`Pending`, `Running`,
 that alters the files (the source, `files`, a revision, `fileSha256`) runs
 a new prefetch; one that does not (placement, tolerations) only refreshes
 the entry. Deleting a finished Job retries it.
+
+Prefetch stagers run one at a time per cache directory and claim. The cache
+directory is keyed on the source alone, so two Models on one source share it,
+and on a FUSE claim a stager writes without `flock`. While another prefetch Job
+(or a pod left from one) for the same directory and claim is still active, the
+operator does not create the next one: that Model's entry stays `Pending`,
+`PrefetchWaiting=True` (reason `PrefetchWaitingForStager`) names the Job and
+the Model it waits for, and the Model checks again every 15 seconds. Once the
+first Job has finished, the second starts and finds the files it already
+staged.
 
 Two conditions report what the field could not do:
 

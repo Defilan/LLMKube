@@ -122,6 +122,14 @@ const (
 	// prefetchPodStartGrace (an image pull, a volume that cannot attach); the
 	// entry names the container that is waiting.
 	ReasonPrefetchStalled = "PrefetchStalled"
+
+	// ConditionPrefetchWaiting is True while a target's Job is held because
+	// another prefetch stager is writing the same cache directory on the same
+	// claim (#2250). The message names that Job and its Model.
+	ConditionPrefetchWaiting = "PrefetchWaiting"
+	// ReasonPrefetchWaitingForStager is that hold, on PrefetchWaiting and on
+	// the Model's Progressing while its own target waits.
+	ReasonPrefetchWaitingForStager = "PrefetchWaitingForStager"
 )
 
 const (
@@ -141,6 +149,10 @@ const (
 	// prefetchReverifyRetry is the retry while a routine re-verification
 	// waits for a single-writer claim to be unmounted.
 	prefetchReverifyRetry = 10 * time.Minute
+	// prefetchStagerWait is the retry while another stager writes the same
+	// cache directory. That Job's events reach only its own Model, so the
+	// waiting one polls.
+	prefetchStagerWait = 15 * time.Second
 )
 
 // prefetchPodStartGrace is how long a scheduled Job pod may stay Pending
@@ -503,6 +515,7 @@ func (r *ModelReconciler) reconcilePrefetchState(ctx context.Context, model *inf
 		} else {
 			meta.RemoveStatusCondition(&model.Status.Conditions, ConditionPrefetchSkipped)
 		}
+		meta.RemoveStatusCondition(&model.Status.Conditions, ConditionPrefetchWaiting)
 		return false, ctrl.Result{}, nil
 	}
 	meta.RemoveStatusCondition(&model.Status.Conditions, ConditionPrefetchSkipped)
@@ -524,6 +537,7 @@ func (r *ModelReconciler) reconcilePrefetchState(ctx context.Context, model *inf
 		}
 		r.pruneStalePrefetch(ctx, model, nil, "")
 		meta.RemoveStatusCondition(&model.Status.Conditions, ConditionPrefetchTargetMismatch)
+		meta.RemoveStatusCondition(&model.Status.Conditions, ConditionPrefetchWaiting)
 		return false, ctrl.Result{}, nil
 	}
 
@@ -554,6 +568,7 @@ func (r *ModelReconciler) reconcilePrefetchState(ctx context.Context, model *inf
 		requeue    time.Duration
 		ownOutcome prefetchTargetOutcome
 		ownClaim   string
+		waiting    []string
 	)
 	for _, t := range targets {
 		entry := ensurePrefetchStatus(model, t.claim)
@@ -568,7 +583,11 @@ func (r *ModelReconciler) reconcilePrefetchState(ctx context.Context, model *inf
 			ownOutcome = outcome
 			ownClaim = t.claim
 		}
+		if outcome.reason == ReasonPrefetchWaitingForStager {
+			waiting = append(waiting, entry.Message)
+		}
 	}
+	setPrefetchWaiting(model, waiting)
 	if wantsOwn && ownClaim == "" {
 		// No own target this pass: the listing failed with nothing on record.
 		model.Status.Phase = "Pending"
@@ -1057,6 +1076,27 @@ func (r *ModelReconciler) startPrefetchTarget(ctx context.Context, model, jobMod
 	if err := controllerutil.SetControllerReference(model, job, r.Scheme); err != nil {
 		return prefetchTargetOutcome{}, fmt.Errorf("owner-ref prefetch job: %w", err)
 	}
+	// One stager at a time per cache directory and claim (#2250). The
+	// directory is keyed on the source alone, so two Models on one source
+	// share it, and on FUSE a stager writes without flock: two would curl -C -
+	// into the same partials. The second waits and then finds a warm cache.
+	r.stagerStartMu.Lock()
+	defer r.stagerStartMu.Unlock()
+	blocker, err := r.activeStager(ctx, model.Namespace, &job.Spec.Template.Spec)
+	if err != nil {
+		return prefetchTargetOutcome{}, err
+	}
+	if blocker != "" {
+		logger.Info("Another prefetch stager writes this cache directory; holding the Job", "job", job.Name, "claim", t.claim, "blocker", blocker)
+		msg := fmt.Sprintf("claim %q waits for %s, which stages the same cache directory; this Model's prefetch job %q starts once it has finished", t.claim, blocker, job.Name)
+		phase := inferencev1alpha1.PrefetchPhasePending
+		if reverify {
+			// Consumers keep serving what the entry records meanwhile.
+			phase = inferencev1alpha1.PrefetchPhaseSucceeded
+		}
+		setPrefetchPhase(entry, phase, msg)
+		return prefetchTargetOutcome{requeue: prefetchStagerWait, reason: ReasonPrefetchWaitingForStager}, nil
+	}
 	if err := r.Create(ctx, job); err != nil {
 		if apierrors.IsAlreadyExists(err) {
 			// Raced with a concurrent reconcile; the poll branch takes over.
@@ -1098,6 +1138,118 @@ func prefetchReverifyMessage(job, claim string) string {
 // prefetchRunningMessage is the entry message while a Job stages claim.
 func prefetchRunningMessage(job, claim string) string {
 	return fmt.Sprintf("prefetch job %q downloading into %q", job, claim)
+}
+
+// prefetchWriteTarget returns the claim and cache directory a prefetch pod
+// writes, read from the pod spec rather than from annotations, so a Job built
+// by an older operator is recognised too.
+func prefetchWriteTarget(spec *corev1.PodSpec) (claim, cacheDir string) {
+	claim = cacheClaimName(spec)
+	for _, c := range spec.InitContainers {
+		if c.Name != "model-downloader" {
+			continue
+		}
+		for _, env := range c.Env {
+			if env.Name == "CACHE_DIR" {
+				cacheDir = env.Value
+			}
+		}
+	}
+	return claim, cacheDir
+}
+
+// cacheClaimName returns the claim a pod's model-cache volume mounts, or "".
+func cacheClaimName(spec *corev1.PodSpec) string {
+	for _, v := range spec.Volumes {
+		if v.Name == "model-cache" && v.PersistentVolumeClaim != nil {
+			return v.PersistentVolumeClaim.ClaimName
+		}
+	}
+	return ""
+}
+
+// prefetchJobActive reports whether a prefetch Job may still have a writer:
+// not finished, being deleted (a stager's foreground deletion holds the Job
+// until its pods are gone), or counting pods that run or terminate.
+func prefetchJobActive(job *batchv1.Job) bool {
+	return (!jobSucceeded(job) && !jobFailed(job)) || job.DeletionTimestamp != nil || job.Status.Active > 0 ||
+		(job.Status.Terminating != nil && *job.Status.Terminating > 0)
+}
+
+// activeStager names a prefetch Job, or a pod left from one, that writes the
+// claim and cache directory spec would, and may still be writing; "" when
+// there is none. Pods are checked as well as Jobs because a Job deleted in
+// the background (by an older operator, or by hand) leaves its pod running.
+// The reads bypass the cache: the caller creates a Job on the answer, and a
+// Job another worker created a moment ago must already be visible.
+func (r *ModelReconciler) activeStager(ctx context.Context, namespace string, spec *corev1.PodSpec) (string, error) {
+	claim, cacheDir := prefetchWriteTarget(spec)
+	if claim == "" || cacheDir == "" {
+		return "", nil
+	}
+	var reader client.Reader = r.Client
+	if r.APIReader != nil {
+		reader = r.APIReader
+	}
+	selector := client.MatchingLabels{"app.kubernetes.io/component": "model-prefetch"}
+	jobs := &batchv1.JobList{}
+	if err := reader.List(ctx, jobs, client.InNamespace(namespace), selector); err != nil {
+		return "", fmt.Errorf("listing prefetch jobs: %w", err)
+	}
+	var blockers []string
+	for i := range jobs.Items {
+		job := &jobs.Items[i]
+		if !prefetchJobActive(job) {
+			continue
+		}
+		if c, d := prefetchWriteTarget(&job.Spec.Template.Spec); c == claim && d == cacheDir {
+			blockers = append(blockers, fmt.Sprintf("prefetch job %q%s", job.Name, ownerModelSuffix(job)))
+		}
+	}
+	pods := &corev1.PodList{}
+	if err := reader.List(ctx, pods, client.InNamespace(namespace), selector); err != nil {
+		return "", fmt.Errorf("listing prefetch pods: %w", err)
+	}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		if c, d := prefetchWriteTarget(&pod.Spec); c == claim && d == cacheDir {
+			blockers = append(blockers, fmt.Sprintf("prefetch pod %q (job %q)", pod.Name, pod.Labels["batch.kubernetes.io/job-name"]))
+		}
+	}
+	if len(blockers) == 0 {
+		return "", nil
+	}
+	// The same name every pass while the blocker lasts, so the message does
+	// not churn status.
+	sort.Strings(blockers)
+	return blockers[0], nil
+}
+
+// ownerModelSuffix names the Model controlling a Job for a message, or "".
+func ownerModelSuffix(job *batchv1.Job) string {
+	if ref := metav1.GetControllerOf(job); ref != nil && ref.Kind == "Model" {
+		return fmt.Sprintf(" of Model %q", ref.Name)
+	}
+	return ""
+}
+
+// setPrefetchWaiting reports the targets held behind another stager on
+// PrefetchWaiting, and removes the condition once none is.
+func setPrefetchWaiting(model *inferencev1alpha1.Model, waiting []string) {
+	if len(waiting) == 0 {
+		meta.RemoveStatusCondition(&model.Status.Conditions, ConditionPrefetchWaiting)
+		return
+	}
+	meta.SetStatusCondition(&model.Status.Conditions, metav1.Condition{
+		Type:               ConditionPrefetchWaiting,
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: model.Generation,
+		Reason:             ReasonPrefetchWaitingForStager,
+		Message:            strings.Join(waiting, "; "),
+	})
 }
 
 // pruneStalePrefetch drops entries no target wants any more. A Job still

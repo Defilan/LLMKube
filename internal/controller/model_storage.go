@@ -543,19 +543,23 @@ func buildModelInitCommand(isLocal, isS3, useCache, isHFAuth, withSHA256 bool, r
 	}
 
 	if useCache {
-		// The lock is taken after the mkdir, which it needs, and before any
-		// sweep or transfer; see cacheDirLock.
-		mkcache := `mkdir -p "$CACHE_DIR" || exit 1; ` + cacheDirLock
+		// The prologue takes the lock after the mkdir, which it needs, and
+		// before any sweep or transfer; on FUSE a serving pod takes neither
+		// and may only read a warm cache. See cacheStagingPrologue.
+		mkcache := cacheStagingPrologue(cacheLockRemedy(isS3, isLocal))
+		// Every transfer starts with this, so a serving pod on FUSE refuses
+		// before it writes anything.
+		staged := `llmkube_stage_allowed "${MODEL_PATH##*/}" || exit 1; `
 		if isLocal {
-			return fns + pre + mkcache + `rm -f "$MODEL_PATH.tmp" && ` + frames(`echo 'Copying model from local source...'; cp /host-model/model.gguf "$MODEL_PATH.tmp" && `+publish("$MODEL_PATH.tmp")+` && echo 'Model copied successfully'`, "Model already cached, skipping copy")
+			return fns + pre + mkcache + unlessFUSEReader(`rm -f "$MODEL_PATH.tmp"`) + frames(staged+`echo 'Copying model from local source...'; cp /host-model/model.gguf "$MODEL_PATH.tmp" && `+publish("$MODEL_PATH.tmp")+` && echo 'Model copied successfully'`, "Model already cached, skipping copy")
 		}
 		if isS3 {
-			return fns + pre + mkcache + `rm -f "$MODEL_PATH.tmp" && ` + frames(`echo 'Downloading model from S3...'; `+downloadProgressFn+s3AuthFn+`download_with_progress "$MODEL_PATH.tmp" "" s3_curl -f -L -o "$MODEL_PATH.tmp" "${AWS_ENDPOINT_URL}/${S3_BUCKET}/${S3_KEY}" --no-progress-meter && `+publish("$MODEL_PATH.tmp")+` && echo 'Model downloaded successfully'`, "Model already cached, skipping download")
+			return fns + pre + mkcache + unlessFUSEReader(`rm -f "$MODEL_PATH.tmp"`) + frames(staged+`echo 'Downloading model from S3...'; `+downloadProgressFn+s3AuthFn+`download_with_progress "$MODEL_PATH.tmp" "" s3_curl -f -L -o "$MODEL_PATH.tmp" "${AWS_ENDPOINT_URL}/${S3_BUCKET}/${S3_KEY}" --no-progress-meter && `+publish("$MODEL_PATH.tmp")+` && echo 'Model downloaded successfully'`, "Model already cached, skipping download")
 		}
 		if refreshPolicy == RefreshPolicyOnChange {
-			return fns + pre + mkcache + debrisSweep() + hfAuthPrefix(isHFAuth) + remoteRevalidateScript(isHFAuth, withSHA256)
+			return fns + pre + mkcache + unlessFUSEReader(debrisSweepCmd) + hfAuthPrefix(isHFAuth) + remoteRevalidateScript(isHFAuth, withSHA256, true)
 		}
-		return fns + pre + mkcache + downloadProgressFn + hfAuthPrefix(isHFAuth) + frames(`echo 'Downloading model...'; `+resumePrologue(isHFAuth)+`download_with_progress "$MODEL_PARTIAL" "$remote_size" `+curlCmd(isHFAuth)+` -f -L -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" --no-progress-meter && `+partialSizeGuard+publish("$MODEL_PARTIAL")+` && echo 'Model downloaded successfully'`, "Model already cached, skipping download")
+		return fns + pre + mkcache + downloadProgressFn + hfAuthPrefix(isHFAuth) + frames(staged+`echo 'Downloading model...'; `+resumePrologue(isHFAuth)+`download_with_progress "$MODEL_PARTIAL" "$remote_size" `+curlCmd(isHFAuth)+` -f -L -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" --no-progress-meter && `+partialSizeGuard+publish("$MODEL_PARTIAL")+` && echo 'Model downloaded successfully'`, "Model already cached, skipping download")
 	}
 
 	if isLocal {
@@ -565,7 +569,7 @@ func buildModelInitCommand(isLocal, isS3, useCache, isHFAuth, withSHA256 bool, r
 		return fns + pre + frames(`echo 'Downloading model from S3...'; `+downloadProgressFn+s3AuthFn+`download_with_progress "$MODEL_PATH.tmp" "" s3_curl -f -L -o "$MODEL_PATH.tmp" "${AWS_ENDPOINT_URL}/${S3_BUCKET}/${S3_KEY}" --no-progress-meter && `+publish("$MODEL_PATH.tmp")+` && echo 'Model downloaded successfully'`, "Model already exists, skipping download")
 	}
 	if refreshPolicy == RefreshPolicyOnChange {
-		return fns + pre + hfAuthPrefix(isHFAuth) + remoteRevalidateScript(isHFAuth, withSHA256)
+		return fns + pre + hfAuthPrefix(isHFAuth) + remoteRevalidateScript(isHFAuth, withSHA256, false)
 	}
 	return fns + pre + downloadProgressFn + hfAuthPrefix(isHFAuth) + frames(`echo 'Downloading model...'; `+resumePrologue(isHFAuth)+`download_with_progress "$MODEL_PARTIAL" "$remote_size" `+curlCmd(isHFAuth)+` -f -L -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" --no-progress-meter && `+partialSizeGuard+publish("$MODEL_PARTIAL")+` && echo 'Model downloaded successfully'`, "Model already exists, skipping download")
 }
@@ -616,7 +620,12 @@ func buildModelInitCommand(isLocal, isS3, useCache, isHFAuth, withSHA256 bool, r
 // already exists, the script logs and exits 0, keeping the cached file. Only a
 // genuinely-missing file (nothing cached and the fetch failed) fails the init
 // container.
-func remoteRevalidateScript(isHFAuth, withSHA256 bool) string {
+//
+// cached is true on the cache volume, where cacheStagingPrologue defines
+// llmkube_fuse_reader: a serving pod on FUSE never sweeps or transfers, keeps
+// a cached copy that passes the local checks, and otherwise refuses with
+// ModelCacheLockUnsupported (#2254).
+func remoteRevalidateScript(isHFAuth, withSHA256, cached bool) string {
 	c := curlCmd(isHFAuth)
 	// The two hash gates on this path: the size-match skip is only a cache
 	// hit once the stamp check agrees, and the offline "kept cached copy"
@@ -636,6 +645,19 @@ func remoteRevalidateScript(isHFAuth, withSHA256 bool) string {
 		publish = `llmkube_publish_sha256 "$MODEL_PARTIAL" "$MODEL_PATH"`
 		keepCached = `if llmkube_marker_hit_sha256 "$MODEL_PATH"; then echo 'spec.sha256 no longer matches the upstream bytes; kept the pinned cached copy'; exit 0; fi; if llmkube_check_sha256 "$MODEL_PATH"; then echo 'Revalidation unreachable; kept cached copy'; exit 0; else exit 1; fi; `
 	}
+	refresh := validatorDeriveAndSweep() +
+		`if download_with_progress "$MODEL_PARTIAL" "$remote_size" ` + c + ` -fsSL -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" --no-progress-meter && ` + partialSizeGuard + publish + `; then ` +
+		`echo 'Model revalidated (downloaded)'; ` +
+		`elif [ -f "$MODEL_PATH" ]; then ` + keepCached +
+		`else echo 'ERROR: model missing and revalidation failed'; exit 1; fi; `
+	if cached {
+		accept := `[ -f "$MODEL_PATH" ]`
+		if withSHA256 {
+			accept += ` && llmkube_check_sha256 "$MODEL_PATH"`
+		}
+		refresh = `if llmkube_fuse_reader; then if ` + accept + `; then ` + fuseKeptCachedEcho(`${MODEL_PATH##*/}`) +
+			`else llmkube_stage_allowed "${MODEL_PATH##*/}"; exit 1; fi; else ` + refresh + `fi; `
+	}
 	return downloadProgressFn +
 		`echo 'Revalidating model against upstream (RefreshPolicy=OnChange)...'; ` +
 		`remote_head=$(` + c + ` -fsSL -I "$MODEL_SOURCE" -o /dev/null -w ` + headProbeFormat + ` 2>/dev/null || echo 'CL0ET'); ` +
@@ -643,13 +665,17 @@ func remoteRevalidateScript(isHFAuth, withSHA256 bool) string {
 		`remote_size=${remote_validator#CL}; remote_size=${remote_size%%ET*}; ` +
 		`if [ -f "$MODEL_PATH" ] && [ "$(stat -c %s "$MODEL_PATH" 2>/dev/null || echo 0)" = "$remote_size" ] && [ "$remote_size" != "0" ]` + sizeHit + `; then ` +
 		unchanged +
-		`else ` +
-		validatorDeriveAndSweep() +
-		`if download_with_progress "$MODEL_PARTIAL" "$remote_size" ` + c + ` -fsSL -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" --no-progress-meter && ` + partialSizeGuard + publish + `; then ` +
-		`echo 'Model revalidated (downloaded)'; ` +
-		`elif [ -f "$MODEL_PATH" ]; then ` + keepCached +
-		`else echo 'ERROR: model missing and revalidation failed'; exit 1; fi; ` +
+		`else ` + refresh +
 		`fi`
+}
+
+// fuseKeptCachedEcho is what an OnChange serving pod on FUSE logs when it keeps
+// a cached file it may not refresh: the origin either did not answer (no size)
+// or answered with a different size, and only the second is a change. name is
+// a shell word naming the file.
+func fuseKeptCachedEcho(name string) string {
+	return `case "$remote_size" in ''|0) echo "Revalidation unreachable for ` + name + `; kept cached copy";; ` +
+		`*) echo "Upstream changed for ` + name + `; a serving pod does not stage on a FUSE cache, so it kept the cached copy";; esac; `
 }
 
 // curlCmd names the transfer command for a source: the authenticating wrapper
@@ -711,7 +737,27 @@ func hfAuthPrefix(isHFAuth bool) string {
 // so it compares equal to sha256sum output.
 const sha256HashFns = `llmkube_sha256_hash() { actual=$(sha256sum "$1" 2>/dev/null | cut -d" " -f1); if [ -z "$actual" ]; then echo "ERROR: could not compute the SHA256 of $1" >&2; return 1; fi; printf '%s' "$actual"; }; llmkube_precheck_sha256() { if [ -z "${MODEL_SHA256:-}" ]; then echo "ERROR: this downloader was built with SHA256 gates but MODEL_SHA256 is unset; refusing to transfer unchecked" >&2; return 1; fi; }; `
 
-const atomicWriteFn = `llmkube_atomic_write() { _llmkube_tmp=$(mktemp "$1.XXXXXX") || return 1; printf '%s' "$2" > "$_llmkube_tmp" && mv "$_llmkube_tmp" "$1"; }; `
+// atomicWriteFn defines llmkube_atomic_write, which writes a stamp, marker or
+// size record through a temp file and a rename so a concurrent reader never
+// sees a partial one. The temp file is named <dest>.llmkube-tmp.XXXXXX, a name
+// no artifact has, so atomicWriteDebrisSweep can find one a dead pod left; it
+// must not end in .tmp, which the resume sweeps own. A failed write removes
+// its own temp file.
+const atomicWriteFn = `llmkube_atomic_write() { _llmkube_tmp=$(mktemp "$1.llmkube-tmp.XXXXXX") || return 1; if printf '%s' "$2" > "$_llmkube_tmp" && mv "$_llmkube_tmp" "$1"; then return 0; fi; rm -f "$_llmkube_tmp"; return 1; }; `
+
+// atomicWriteDebrisSweep removes the temp files llmkube_atomic_write leaves
+// when a pod dies between its mktemp and its mv (#2255): the resume sweeps
+// delete only *.tmp, so these would otherwise stay on the claim. It also
+// takes the two unambiguous names the writer used before .llmkube-tmp
+// (<file>.llmkube-size.XXXXXX and <marker>.sha256-rejected.XXXXXX). The old
+// <file>.sha256.XXXXXX stamp temp is left alone: that pattern can match a
+// file a repository ships.
+//
+// Only files older than ten minutes go. A write takes milliseconds, and a
+// serving pod on FUSE writes stamps without the directory lock, so a young
+// match may be another pod's write in flight. The sweep is best effort and
+// never fails the start.
+const atomicWriteDebrisSweep = `find "$CACHE_DIR" -type f \( -name '*.llmkube-tmp.??????' -o -name '*.llmkube-size.??????' -o -name '*.sha256-rejected.??????' \) -mmin +10 -delete 2>/dev/null; `
 
 // sha256VerifyFns is the download-time gate set: sha256HashFns plus the
 // atomic stamp/marker writers and the verify-then-publish pair.
@@ -791,6 +837,87 @@ const cacheDirLock = `if [ -w "$CACHE_DIR" ]; then ` +
 	`flock 9 || { echo "ERROR: could not lock $CACHE_DIR/.llmkube-download.lock; the cache volume must support file locking (NFS needs a lock daemon)" >&2; exit 1; }; fi; ` +
 	`else echo "WARNING: $CACHE_DIR is not writable by uid $(id -u); skipping the download lock" >&2; fi; `
 
+// fuseSuperMagic is Linux FUSE_SUPER_MAGIC as stat -f -c %t prints it. BusyBox
+// stat reports the filesystem name as UNKNOWN, so the magic is what is
+// compared. It also covers virtiofs (including Kata Containers volumes).
+const fuseSuperMagic = "65735546"
+
+// cacheStagingPrologue opens every cache-backed downloader, single-file and
+// multi-file alike, so both decide the same way where staging may run (#2254).
+//
+// flock does not exclude across nodes on a FUSE cache (BlobFuse lists it as
+// unsupported), so cacheDirLock cannot keep two nodes' `curl -C -` writers off
+// one partial there (#2158). On FUSE only the prefetch stager may write: it
+// creates the directory and stages without the lock, and the controller runs
+// one stager at a time per cache directory and claim (activeStager, #2250). A
+// serving pod on FUSE takes no lock, creates nothing, and sweeps nothing; it
+// may use a warm cache, and llmkube_stage_allowed refuses any transfer with
+// ModelCacheLockUnsupported and the remedy for the source kind. Other
+// filesystems keep the directory lock.
+//
+// An init image whose stat has no -f cannot tell, so it stages under the lock
+// as it did before FUSE detection, with a warning, instead of failing on every
+// filesystem under a remedy (prefetch) that hits the same stat (#2253).
+//
+// LLMKUBE_PREFETCH_STAGER is set explicitly on every cache-backed downloader
+// ("false" on serving pods, "true" only by buildPrefetchJob), and explicit Env
+// wins over EnvFrom, so source credentials cannot turn a serving pod into a
+// stager.
+func cacheStagingPrologue(remedy string) string {
+	return `cache_fs=$(stat -f -c %t "$CACHE_DIR" 2>/dev/null || stat -f -c %t "$(dirname "$CACHE_DIR")") || { echo "WARNING: cannot determine the cache filesystem: this init image's stat has no -f; staging under the directory lock, which does not exclude pods on other nodes on a FUSE cache" >&2; cache_fs=unknown; }; ` +
+		`llmkube_fuse_reader() { [ "$cache_fs" = ` + fuseSuperMagic + ` ] && [ "${LLMKUBE_PREFETCH_STAGER:-false}" != true ]; }; ` +
+		`llmkube_stage_allowed() { if llmkube_fuse_reader; then echo "ERROR: ModelCacheLockUnsupported: FUSE cache cannot guarantee cross-node file locking for staging $1; ` + remedy + `" >&2; return 1; fi; }; ` +
+		`if [ "$cache_fs" != ` + fuseSuperMagic + ` ]; then mkdir -p "$CACHE_DIR" || exit 1; ` + cacheDirLock + atomicWriteDebrisSweep +
+		`elif [ "${LLMKUBE_PREFETCH_STAGER:-false}" = true ]; then mkdir -p "$CACHE_DIR" || exit 1; ` + atomicWriteDebrisSweep + `fi; `
+}
+
+// unlessFUSEReader runs cmd, a cache write that is not a transfer (a sweep),
+// in every pod except a serving pod on FUSE, and chains on with &&. It needs
+// cacheStagingPrologue.
+func unlessFUSEReader(cmd string) string {
+	return `{ llmkube_fuse_reader || ` + cmd + `; } && `
+}
+
+// The ModelCacheLockUnsupported remedies, one per source kind. The init script
+// prints the one for its source, and the transfer diagnosis takes the remedy
+// for the ModelTransferHealthy condition from that output (cacheLockRemedyIn),
+// so the pod log and the condition cannot give different instructions
+// (#2251). A remedy must not contain another as a substring.
+const (
+	cacheLockRemedyPrefetch = "set spec.modelCache.prefetch: true on every InferenceService using this claim, or use storage with cross-node flock support"
+	cacheLockRemedyS3       = "s3:// sources do not support prefetch; use storage with cross-node flock support, or pre-stage the files and use a pvc:// source"
+	cacheLockRemedyLocal    = "local sources do not support prefetch; use storage with cross-node flock support, or pre-stage the file and use a pvc:// source"
+)
+
+// cacheLockRemedies lists every remedy cacheLockRemedy can return.
+var cacheLockRemedies = []string{cacheLockRemedyPrefetch, cacheLockRemedyS3, cacheLockRemedyLocal}
+
+// cacheLockRemedyFallback is the condition's remedy when the termination
+// message does not carry one of cacheLockRemedies (a log tail cut before it).
+const cacheLockRemedyFallback = "the model-downloader log names the remedy for this source"
+
+// cacheLockRemedy returns the remedy an init script prints when it refuses to
+// stage on a FUSE cache.
+func cacheLockRemedy(isS3, isLocal bool) string {
+	switch {
+	case isS3:
+		return cacheLockRemedyS3
+	case isLocal:
+		return cacheLockRemedyLocal
+	}
+	return cacheLockRemedyPrefetch
+}
+
+// cacheLockRemedyIn returns the remedy the init script printed in msg.
+func cacheLockRemedyIn(msg string) string {
+	for _, r := range cacheLockRemedies {
+		if strings.Contains(msg, r) {
+			return r
+		}
+	}
+	return cacheLockRemedyFallback
+}
+
 // partialSizeGuard fails a resumable transfer whose partial does not match the
 // advertised Content-Length, and deletes the partial so the next start begins
 // from byte 0. It cannot catch an interleave of equal size; cacheDirLock is
@@ -812,7 +939,7 @@ const headProbeFormat = `'CL%header{content-length}ET%header{etag}\n%header{acce
 const splitHeadProbe = `remote_validator=$(printf '%s\n' "$remote_head" | sed -n 1p); ` +
 	`accept_ranges=$(printf '%s\n' "$remote_head" | sed -n 2p); `
 
-// debrisSweep is the unconditional #1435 sweep of every *.tmp in the destination
+// debrisSweepCmd is the unconditional #1435 sweep of every *.tmp in the destination
 // directory (targeted at $(dirname "$MODEL_PATH") so the emptyDir branches, whose
 // CACHE_DIR is empty, do not fail `find ""`). The OnChange path runs it before
 // the revalidation probe: when the cached file is already current the script
@@ -820,9 +947,10 @@ const splitHeadProbe = `remote_validator=$(printf '%s\n' "$remote_head" | sed -n
 // to run to keep debris from accumulating. The derive-and-sweep inside the
 // download branch then re-sweeps with a keep-one predicate once the partial is
 // known.
-func debrisSweep() string {
-	return `find "$(dirname "$MODEL_PATH")" -maxdepth 1 -name '*.tmp' -delete && `
-}
+//
+// The cached OnChange path is its only caller, which wraps it in
+// unlessFUSEReader.
+const debrisSweepCmd = `find "$(dirname "$MODEL_PATH")" -maxdepth 1 -name '*.tmp' -delete`
 
 // resumePrologue is the cached and uncached IfNotPresent resume sequence: a
 // validator probe (HEAD reading Etag + Content-Length + Accept-Ranges) that
@@ -1197,23 +1325,11 @@ func multiFileInitEnvVars(source, cacheDir string, files []string, digests map[s
 // MODEL_PATH and MODEL_SOURCE per file for those helpers; the loop runs in a
 // pipeline subshell, so the assignments do not leak.
 func buildMultiFileInitCommand(useCache, isS3, isHFAuth, withSHA256 bool, refreshPolicy string) string {
-	// Warm FUSE caches need no lock or writes. Only the prefetch stager may
-	// download there; ordinary filesystems retain the directory-wide lock.
-	// Use Linux FUSE_SUPER_MAGIC: BusyBox stat reports its name as UNKNOWN.
-	// An init image whose stat has no -f cannot tell, so it stages under the
-	// lock as it did before FUSE detection, with a warning, instead of failing
-	// on every filesystem under a remedy (prefetch) that hits the same stat
-	// (#2253).
-	remedy := "set spec.modelCache.prefetch: true on every InferenceService using this claim, or use storage with cross-node flock support"
-	if isS3 {
-		remedy = "s3:// sources do not support prefetch; use storage with cross-node flock support, or pre-stage the files and use a pvc:// source"
-	}
-	prefix := `cache_fs=$(stat -f -c %t "$CACHE_DIR" 2>/dev/null || stat -f -c %t "$(dirname "$CACHE_DIR")") || { echo "WARNING: cannot determine the cache filesystem: this init image's stat has no -f; staging under the directory lock, which does not exclude pods on other nodes on a FUSE cache" >&2; cache_fs=unknown; }; ` +
-		`if [ "$cache_fs" != 65735546 ]; then mkdir -p "$CACHE_DIR" || exit 1; ` + cacheDirLock +
-		`elif [ "${LLMKUBE_PREFETCH_STAGER:-false}" = true ]; then mkdir -p "$CACHE_DIR" || exit 1; fi; ` +
-		`llmkube_prepare_download() { if [ "$cache_fs" = 65735546 ] && [ "${LLMKUBE_PREFETCH_STAGER:-false}" != true ]; then ` +
-		`echo "ERROR: ModelCacheLockUnsupported: FUSE cache cannot guarantee cross-node file locking for staging $rel; ` + remedy + `" >&2; return 1; fi; mkdir -p "$(dirname "$dest")"; }; `
-	sweep := `if [ "$cache_fs" != 65735546 ] || [ "${LLMKUBE_PREFETCH_STAGER:-false}" = true ]; then find "$CACHE_DIR" -name '*.tmp' -delete; fi`
+	// See cacheStagingPrologue: a serving pod on FUSE only reads a warm
+	// cache, and llmkube_prepare_download refuses its transfers.
+	prefix := cacheStagingPrologue(cacheLockRemedy(isS3, false)) +
+		`llmkube_prepare_download() { llmkube_stage_allowed "$rel" || return 1; mkdir -p "$(dirname "$dest")"; }; `
+	sweep := `if ! llmkube_fuse_reader; then find "$CACHE_DIR" -name '*.tmp' -delete; fi`
 	if !useCache {
 		prefix = `mkdir -p /models && llmkube_prepare_download() { mkdir -p "$(dirname "$dest")"; }; `
 		sweep = `find /models -name '*.tmp' -delete`
@@ -1263,10 +1379,17 @@ func buildMultiFileInitCommand(useCache, isS3, isHFAuth, withSHA256 bool, refres
 	}
 	// A mutable origin's size only proves staleness, not local corruption.
 	// Preserve legacy caches without probing the origin. Backfill their local
-	// baseline under IfNotPresent, except on FUSE where readers must not write.
+	// baseline under IfNotPresent, except from a serving pod on FUSE, which
+	// must not write there. The prefetch stager is the pod that may write a
+	// FUSE cache, so it backfills one staged before size records existed;
+	// otherwise that cache would warn on every start (#2255).
 	backfill := ""
 	if refreshPolicy != RefreshPolicyOnChange {
-		backfill = `if [ "${cache_fs:-}" != 65735546 ]; then llmkube_atomic_write "$dest.llmkube-size" "$_llmkube_local_size" || echo "WARNING: could not record cached size for $rel" >&2; fi; `
+		writer := `if [ "${cache_fs:-}" != ` + fuseSuperMagic + ` ]; then `
+		if useCache {
+			writer = `if ! llmkube_fuse_reader; then `
+		}
+		backfill = writer + `llmkube_atomic_write "$dest.llmkube-size" "$_llmkube_local_size" || echo "WARNING: could not record cached size for $rel" >&2; fi; `
 	}
 	sizeCheck := `llmkube_cached_size_matches() { ` +
 		`_llmkube_local_size=$(stat -c %s "$dest" 2>/dev/null) || return 1; ` +
@@ -1275,12 +1398,22 @@ func buildMultiFileInitCommand(useCache, isS3, isHFAuth, withSHA256 bool, refres
 		`echo "WARNING: no valid size record for $rel; keeping cached copy without size validation" >&2; ` +
 		backfill + `return 0; }; `
 	prefix += sizeCheck
+	accept := `llmkube_cached_size_matches`
+	if withSHA256 {
+		accept = `{ if [ -n "${MODEL_SHA256:-}" ]; then llmkube_accept_file "$dest"; else llmkube_cached_size_matches; fi; }`
+	}
 	downloadOrCached := func(download, cachedEcho string) string {
-		accept := `llmkube_cached_size_matches`
-		if withSHA256 {
-			accept = `{ if [ -n "${MODEL_SHA256:-}" ]; then llmkube_accept_file "$dest"; else llmkube_cached_size_matches; fi; }`
-		}
 		return `if [ -f "$dest" ] && ` + accept + `; then ` + cachedEcho + `; else ` + download + `fi; `
+	}
+	// An OnChange serving pod on FUSE that cannot keep the file as it is has
+	// nothing to fall back to: it keeps a cached copy that passes the local
+	// checks and says why (the origin changed, or did not answer), or refuses.
+	// Without this it ran into llmkube_prepare_download's refusal and then
+	// logged the kept copy as an unreachable revalidation (#2255).
+	onChangeRefresh := `if `
+	if useCache {
+		onChangeRefresh = `if llmkube_fuse_reader; then if [ -f "$dest" ] && ` + accept + `; then ` + fuseKeptCachedEcho(`$rel`) +
+			`else llmkube_stage_allowed "$rel"; exit 1; fi; elif `
 	}
 
 	if isS3 {
@@ -1297,7 +1430,7 @@ func buildMultiFileInitCommand(useCache, isS3, isHFAuth, withSHA256 bool, refres
 				`if [ -f "$dest" ] && [ "$(stat -c %s "$dest" 2>/dev/null || echo 0)" = "$remote_size" ] && [ "$remote_size" != "0" ]` + sizeHit + `; then ` +
 				`echo "Model artifact $rel revalidated (unchanged, skipped download)"; ` +
 				`else ` +
-				`if llmkube_prepare_download && download_with_progress "$dest.tmp" "" s3_curl -f -L -o "$dest.tmp" "$url" --no-progress-meter && ` + publishFile("$dest.tmp") + `; then ` +
+				onChangeRefresh + `llmkube_prepare_download && download_with_progress "$dest.tmp" "" s3_curl -f -L -o "$dest.tmp" "$url" --no-progress-meter && ` + publishFile("$dest.tmp") + `; then ` +
 				`echo "Model artifact $rel revalidated (downloaded)"; ` +
 				keepCachedTail +
 				`fi; ` +
@@ -1335,7 +1468,7 @@ func buildMultiFileInitCommand(useCache, isS3, isHFAuth, withSHA256 bool, refres
 			`if [ -f "$dest" ] && [ "$(stat -c %s "$dest" 2>/dev/null || echo 0)" = "$remote_size" ] && [ "$remote_size" != "0" ]` + sizeHit + `; then ` +
 			`echo "Model artifact $rel revalidated (unchanged, skipped download)"; ` +
 			`else ` +
-			`if llmkube_prepare_download && { ` + validatorDeriveAndSweep() +
+			onChangeRefresh + `llmkube_prepare_download && { ` + validatorDeriveAndSweep() +
 			`download_with_progress "$MODEL_PARTIAL" "$remote_size" ` + curlCmd(isHFAuth) + ` -fsSL -C - -o "$MODEL_PARTIAL" "$url" --no-progress-meter && ` + partialSizeGuard + publishFile("$MODEL_PARTIAL") + `; }; then ` +
 			`echo "Model artifact $rel revalidated (downloaded)"; ` +
 			keepCachedTail +
@@ -1753,6 +1886,9 @@ func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1a
 
 	cmd := buildModelInitCommand(isLocalModelSource(model.Spec.Source), isS3Source(model.Spec.Source), true, isHFAuthSourceForEndpoint(model.Spec.Source, hfEndpoint), model.Spec.SHA256 != "", model.Spec.RefreshPolicy)
 	env := modelInitEnvVars(model.Spec.Source, cacheDir, modelPath, model.Spec.SHA256)
+	// As on the multi-file branch: explicit Env wins over EnvFrom, so source
+	// credentials cannot enable the prefetch-only FUSE bypass in a serving pod.
+	env = append(env, corev1.EnvVar{Name: "LLMKUBE_PREFETCH_STAGER", Value: "false"})
 	addCACertVolume(&volumes, &initVolumeMounts, &cmd, caCertConfigMap)
 
 	initContainers := []corev1.Container{}

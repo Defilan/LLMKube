@@ -194,6 +194,11 @@ type ModelReconciler struct {
 	metadataHTTPClient     *http.Client
 	metadataHTTPClientOnce sync.Once
 
+	// stagerStartMu makes the active-stager check and the Job create one step
+	// across this controller's workers, so two Models reconciling at once
+	// cannot both find no stager and both create one (#2250).
+	stagerStartMu sync.Mutex
+
 	// ReconcileDecorator wraps the reconciler at the point SetupWithManager
 	// hands it to the controller builder, so the wrapper is what the
 	// controller calls. cmd/main.go sets it to the reconcile deadline; nil
