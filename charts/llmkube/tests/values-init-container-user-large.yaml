@@ -1,0 +1,5 @@
+# Used by init-container-user_test.yaml: a uid large enough that Helm's
+# float64 decoding of values files would render it in exponent form.
+controllerManager:
+  initContainer:
+    user: 1000680000

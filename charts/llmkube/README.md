@@ -112,6 +112,7 @@ fit, keeping the role suffix that identifies the object.
 | `controllerManager.initContainer.registry` | Init container image registry prefix | `""` |
 | `controllerManager.initContainer.repository` | Init container image repository | `docker.io/curlimages/curl` |
 | `controllerManager.initContainer.tag` | Init container image tag | `8.18.0` |
+| `controllerManager.initContainer.user` | Numeric uid the init container image runs as; the owner `model-cache-prep` gives the cache root when `defaultFSGroup` is `0` | `101` |
 | `controllerManager.replicaCount` | Number of controller replicas | `1` |
 | `controllerManager.revisionHistoryLimit` | Old ReplicaSets kept on the controller Deployment (0 keeps none) | `3` |
 | `controllerManager.leaderElection.enabled` | Enable leader election | `true` |

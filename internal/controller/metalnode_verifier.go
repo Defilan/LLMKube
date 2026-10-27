@@ -309,7 +309,7 @@ func buildMetalNodeVerifierPod(mn *inferencev1alpha1.MetalNode, image, pin strin
 				},
 				SecurityContext: &corev1.SecurityContext{
 					RunAsNonRoot:             boolPtr(true),
-					RunAsUser:                int64Ptr(initContainerUID),
+					RunAsUser:                int64Ptr(DefaultInitContainerUser),
 					ReadOnlyRootFilesystem:   boolPtr(true),
 					AllowPrivilegeEscalation: boolPtr(false),
 					Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},

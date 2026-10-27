@@ -1440,7 +1440,7 @@ func TestInferPodSecurityContext_FSGroupChangePolicy(t *testing.T) {
 	}
 
 	// --default-fsgroup <= 0 (OpenShift): no fsGroup, so no policy. An SCC may
-	// still inject an fsGroup, and with the prep chowning the root to 100:100 the
+	// still inject an fsGroup, and with the prep chowning the root to <uid>:0 the
 	// root would never match it anyway, so the policy is left to the platform.
 	for _, disabled := range []int64{0, -1} {
 		t.Run(fmt.Sprintf("disabled default fsGroup (%d) leaves the policy unset", disabled), func(t *testing.T) {

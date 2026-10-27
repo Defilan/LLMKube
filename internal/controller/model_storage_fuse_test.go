@@ -80,7 +80,7 @@ func TestMultiFileFUSEStaging(t *testing.T) {
 					Spec:       inferencev1alpha1.ModelSpec{Source: origin.srv.URL, Format: "safetensors", Files: []string{"model.safetensors"}},
 					Status:     inferencev1alpha1.ModelStatus{CacheKey: "cache"},
 				}
-				storage := buildModelStorageConfig(model, nil, "default", true, ModelCacheModeShared, "", defaultPrefetchImage, 0, ModelCachePrepAlways, nil, "")
+				storage := buildModelStorageConfig(model, nil, "default", true, ModelCacheModeShared, "", defaultPrefetchImage, 0, ModelCachePrepAlways, DefaultInitContainerUser, nil, "")
 				containers := storage.initContainers
 				if prefetch {
 					r := &ModelReconciler{InitContainerImage: defaultPrefetchImage}

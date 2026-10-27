@@ -125,7 +125,7 @@ func TestCachePrepEmptyPolicyRendersPrep(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			model := cachePrepTripwireModel()
 			model.Spec.Files = tc.files
-			cfg := buildCachedStorageConfig(model, nil, "", "", "docker.io/curlimages/curl:8.18.0", 102, "", "")
+			cfg := buildCachedStorageConfig(model, nil, "", "", "docker.io/curlimages/curl:8.18.0", 102, "", DefaultInitContainerUser, "")
 			if len(cfg.initContainers) < 1 || cfg.initContainers[0].Name != "model-cache-prep" {
 				t.Fatalf("empty policy rendered initContainers %v, want model-cache-prep first", containerNames(cfg.initContainers))
 			}

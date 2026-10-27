@@ -20,4 +20,12 @@ controllerManager:
     # 0 disables the operator's default fsGroup so the OpenShift SCC
     # admission controller is free to inject a value from the namespace's
     # allocated supplemental-groups range.
+    #
+    # With fsGroup off, model-cache-prep (modelCache.prep: always) chowns the
+    # cache root to <initContainer.user>:0 and sets mode 770: the owner bits
+    # are for the downloader running as the init image's uid, and group 0 is
+    # the group OpenShift runs SCC-assigned arbitrary uids under. The prep
+    # runs as uid 0 with CHOWN and FOWNER added, so it is admitted only when
+    # the service account may use an SCC that allows that (restricted-v2 does
+    # not); see docs/site/guides/openshift-install.md.
     defaultFSGroup: 0

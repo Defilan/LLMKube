@@ -189,6 +189,7 @@ func main() {
 	var caCertConfigMap string
 	var initContainerImage string
 	var defaultFSGroup int64
+	var initContainerUser int64
 	var driRenderGID int64
 	var emitScrapeAnnotations bool
 	var routerProxyImage string
@@ -262,6 +263,13 @@ func main() {
 		"Name of the ConfigMap containing a custom CA certificate to trust for model downloads.")
 	flag.StringVar(&initContainerImage, "init-container-image", "docker.io/curlimages/curl:8.18.0",
 		"Container image for the model downloader init container.")
+	flag.Int64Var(&initContainerUser, "init-container-user", controller.DefaultInitContainerUser,
+		"Numeric uid that --init-container-image runs as (101 is curl_user in the default "+
+			"curlimages/curl image). With fsGroup disabled (--default-fsgroup=0) and no "+
+			"InferenceService runAsUser, model-cache-prep chowns the cache root to <uid>:0 mode 770 "+
+			"so the downloader can write; under --model-cache-prep=never it is the prefetch Job's "+
+			"runAsUser. Set it to your image's uid when you mirror a different init image. Must be "+
+			"between 1 and 2147483647 (#2204).")
 	var metalNodeAllowedCIDRs string
 	flag.StringVar(&metalNodeAllowedCIDRs, "metal-node-allowed-cidrs", controller.DefaultMetalNodeAllowedCIDRs,
 		"Comma-separated CIDRs a MetalNode's dial-back verifier pod may connect to. A candidate address a Mac "+
@@ -428,6 +436,13 @@ func main() {
 	// their cache is restricted-compliant when it is not.
 	if err := controller.ValidateModelCachePrep(modelCachePrep); err != nil {
 		setupLog.Error(err, "invalid --model-cache-prep")
+		os.Exit(1)
+	}
+	// Validate --init-container-user up front: the prep would chown the
+	// cache root to a uid no container runs as, and the restricted prefetch
+	// Job would be refused at container start.
+	if err := controller.ValidateInitContainerUser(initContainerUser); err != nil {
+		setupLog.Error(err, "invalid --init-container-user")
 		os.Exit(1)
 	}
 
@@ -668,6 +683,7 @@ func main() {
 		ModelCacheMode:       modelCacheMode,
 		ModelCachePath:       modelCachePath,
 		ModelCachePrep:       modelCachePrep,
+		InitContainerUser:    initContainerUser,
 	}
 	if reconcileTimeout > 0 {
 		modelReconciler.ReconcileDecorator = controller.WithReconcileDeadline(reconcileTimeout, ctrl.Log.WithName("model"))
@@ -688,6 +704,7 @@ func main() {
 		ModelCachePrep:        modelCachePrep,
 		CACertConfigMap:       caCertConfigMap,
 		InitContainerImage:    initContainerImage,
+		InitContainerUser:     initContainerUser,
 		DefaultFSGroup:        defaultFSGroup,
 		DRIRenderGID:          driRenderGID,
 		EmitScrapeAnnotations: emitScrapeAnnotations,

@@ -112,6 +112,14 @@ controllerManager:
     # from the namespace's allocated range and rejects pods with explicit
     # values outside that range.
     defaultFSGroup: 102
+    # Numeric uid the init image above runs as (--init-container-user). 101 is
+    # curl_user in the default curlimages/curl image; set it to your image's
+    # uid when you mirror a different one (`docker run --rm <image> id`). With
+    # defaultFSGroup 0 and no InferenceService runAsUser, model-cache-prep
+    # chowns the cache root to <user>:0 mode 770 so the downloader can write;
+    # under modelCache.prep never it is the prefetch Job's runAsUser. Must be
+    # a non-root uid (1-2147483647).
+    user: 101
 
   # GID of your GPU nodes' DRI render group: the group that owns
   # /dev/dri/renderD128. It is added to a Vulkan InferenceService pod's

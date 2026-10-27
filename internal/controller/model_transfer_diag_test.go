@@ -17,10 +17,14 @@ limitations under the License.
 package controller
 
 import (
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
@@ -214,6 +218,36 @@ func TestFindModelTransferFailure(t *testing.T) {
 		_, reason, _, found := findModelTransferFailure([]corev1.Pod{pod})
 		if !found || reason != ReasonModelCacheNotWritable {
 			t.Fatalf("found=%v reason=%q, want %q", found, reason, ReasonModelCacheNotWritable)
+		}
+	})
+
+	// The remedy lands in the condition the user reads. On the fsGroup <= 0
+	// profile the prep is already on, so a hint that names only
+	// --model-cache-prep sends them to a knob already in the right position;
+	// it must also name the uid the prep chowns to (#2204).
+	t.Run("cache permission failure condition names both the prep policy and the init user", func(t *testing.T) {
+		scheme := runtime.NewScheme()
+		if err := corev1.AddToScheme(scheme); err != nil {
+			t.Fatal(err)
+		}
+		isvc := &inferencev1alpha1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "service", Namespace: "default"}}
+		pod := initPod("node-a",
+			terminatedInit("model-downloader", 1, "mkdir: can't create directory '/models/k': Permission denied"))
+		pod.Name, pod.Namespace = "pod", "default"
+		pod.Labels = map[string]string{"app": isvc.Name, "inference.llmkube.dev/service": isvc.Name}
+		pod.Spec.Volumes = []corev1.Volume{{Name: "model-cache", VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "c"}}}}
+		r := &InferenceServiceReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(&pod).Build()}
+		r.reconcileModelTransferCondition(t.Context(), isvc)
+
+		cond := meta.FindStatusCondition(isvc.Status.Conditions, ConditionModelTransferHealthy)
+		if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != ReasonModelCacheNotWritable {
+			t.Fatalf("condition = %+v, want False/%s", cond, ReasonModelCacheNotWritable)
+		}
+		for _, want := range []string{"--model-cache-prep=never", "--default-fsgroup=0", "--init-container-user", "controllerManager.initContainer.user"} {
+			if !strings.Contains(cond.Message, want) {
+				t.Errorf("ModelCacheNotWritable message does not name %q: %s", want, cond.Message)
+			}
 		}
 	})
 

@@ -190,6 +190,47 @@ That works on a single namespace where you control every
 deployment. The operator-wide preset is preferred for multi-tenant
 or platform-team-managed clusters.
 
+## The model cache on the preset
+
+With `defaultFSGroup: 0` the operator renders no `fsGroup`, so the
+`model-cache-prep` init container (injected under the default
+`modelCache.prep: always`) cannot hand the cache root to a shared
+group. It runs:
+
+```sh
+chown <uid>:0 /models && chmod 770 /models
+```
+
+`<uid>` is the uid the model downloader runs as: the
+InferenceService's `spec.podSecurityContext.runAsUser` when set,
+otherwise `controllerManager.initContainer.user` (operator flag
+`--init-container-user`, default `101`, the user of the default
+`curlimages/curl` image). If you mirror a different init image, set
+that value to the uid the image runs as. Group `0` is the group
+OpenShift runs SCC-assigned arbitrary uids under, so the serving
+container, and a downloader whose uid the SCC picked from the
+namespace range, reach the root through the group bits. Only the
+root is changed, not what is under it.
+
+The prep itself runs as uid 0 with `CHOWN` and `FOWNER` added.
+`restricted-v2` requires a uid from the namespace range and allows
+adding only `NET_BIND_SERVICE`, so a pod carrying the prep needs a
+service account allowed to use an SCC that admits it. Where the
+storage applies the SCC-injected `fsGroup` (the usual dynamically
+provisioned class), the prep is not needed: set
+`modelCache.prep: never`. For a static PV on a driver that applies no
+`fsGroup`, either allow the prep through an SCC or pre-provision the
+root yourself, for example
+`llmkube cache prep --owner 101:0 --mode 0770 /models`. The
+`test-e2e-openshift` CI job runs with the cache disabled, so neither
+path is exercised in CI.
+
+**Upgrading:** a cache root an older operator prepared as `100:100`
+mode `770` is re-owned to `<uid>:0` mode `770` the next time the prep
+runs, and cache-backed serving pods roll once because the prep
+command changed. See the upgrade note in `docs/MODEL-CACHE.md`
+("What the prep sets the cache root to").
+
 ## ModelRouter on OpenShift
 
 The same preset covers the router-proxy pods that the

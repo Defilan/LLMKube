@@ -31,8 +31,8 @@ import (
 // into a directory the prefetch created. `docker run --rm
 // curlimages/curl:8.18.0 id` prints uid=101.
 func TestInitContainerUIDMatchesDefaultImage(t *testing.T) {
-	if initContainerUID != 101 {
-		t.Fatalf("initContainerUID = %d, want 101 (curl_user in curlimages/curl:8.18.0)", initContainerUID)
+	if DefaultInitContainerUser != 101 {
+		t.Fatalf("DefaultInitContainerUser = %d, want 101 (curl_user in curlimages/curl:8.18.0)", DefaultInitContainerUser)
 	}
 }
 
@@ -62,7 +62,7 @@ func TestValidateModelCachePrep(t *testing.T) {
 // The reported acceptance criterion: under never, a cache-backed pod has no
 // model-cache-prep container and no container running as uid 0.
 func TestCachedStorageConfigNever(t *testing.T) {
-	cfg := buildCachedStorageConfig(cachePrepTripwireModel(), cachePrepTripwireIsvc(), "", "", "docker.io/curlimages/curl:8.18.0", 102, ModelCachePrepNever, "")
+	cfg := buildCachedStorageConfig(cachePrepTripwireModel(), cachePrepTripwireIsvc(), "", "", "docker.io/curlimages/curl:8.18.0", 102, ModelCachePrepNever, DefaultInitContainerUser, "")
 	if got, want := containerNames(cfg.initContainers), []string{"model-downloader"}; !slices.Equal(got, want) {
 		t.Fatalf("initContainers = %v, want %v", got, want)
 	}
@@ -74,7 +74,7 @@ func TestCachedStorageConfigNever(t *testing.T) {
 func TestCachedStorageConfigMultiFileNever(t *testing.T) {
 	model := cachePrepTripwireModel()
 	model.Spec.Files = []string{"model.gguf", "mmproj.gguf"}
-	cfg := buildCachedStorageConfig(model, cachePrepTripwireIsvc(), "", "", "docker.io/curlimages/curl:8.18.0", 102, ModelCachePrepNever, "")
+	cfg := buildCachedStorageConfig(model, cachePrepTripwireIsvc(), "", "", "docker.io/curlimages/curl:8.18.0", 102, ModelCachePrepNever, DefaultInitContainerUser, "")
 	if slices.Contains(containerNames(cfg.initContainers), "model-cache-prep") {
 		t.Fatalf("multi-file initContainers = %v, want no model-cache-prep", containerNames(cfg.initContainers))
 	}
@@ -85,7 +85,7 @@ func TestCachedStorageConfigMultiFileNever(t *testing.T) {
 }
 
 func TestCachedStorageConfigAlwaysKeepsPrep(t *testing.T) {
-	cfg := buildCachedStorageConfig(cachePrepTripwireModel(), cachePrepTripwireIsvc(), "", "", "docker.io/curlimages/curl:8.18.0", 102, ModelCachePrepAlways, "")
+	cfg := buildCachedStorageConfig(cachePrepTripwireModel(), cachePrepTripwireIsvc(), "", "", "docker.io/curlimages/curl:8.18.0", 102, ModelCachePrepAlways, DefaultInitContainerUser, "")
 	if got, want := containerNames(cfg.initContainers), []string{"model-cache-prep", "model-downloader"}; !slices.Equal(got, want) {
 		t.Fatalf("initContainers = %v, want %v", got, want)
 	}
@@ -201,8 +201,8 @@ func TestPrefetchJobRestrictedUnderNever(t *testing.T) {
 				if sc.RunAsNonRoot == nil || !*sc.RunAsNonRoot {
 					t.Errorf("container %s runAsNonRoot = %v, want true", c.Name, sc.RunAsNonRoot)
 				}
-				if sc.RunAsUser == nil || *sc.RunAsUser != initContainerUID {
-					t.Errorf("container %s runAsUser = %v, want %d", c.Name, sc.RunAsUser, initContainerUID)
+				if sc.RunAsUser == nil || *sc.RunAsUser != DefaultInitContainerUser {
+					t.Errorf("container %s runAsUser = %v, want %d", c.Name, sc.RunAsUser, DefaultInitContainerUser)
 				}
 				if sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation {
 					t.Errorf("container %s allowPrivilegeEscalation = %v, want false", c.Name, sc.AllowPrivilegeEscalation)
@@ -252,7 +252,8 @@ func TestPrefetchJobAlwaysUnchanged(t *testing.T) {
 // directory the prefetch created (mode 0755, no group write) would get
 // Permission denied if they diverged. A custom --init-container-image still
 // leaves the serving side to the image while the prefetch stages as
-// initContainerUID; that is documented in docs/MODEL-CACHE.md.
+// --init-container-user, so the two agree only when that flag names the
+// image's uid; that is documented in docs/MODEL-CACHE.md.
 func TestPrefetchDownloaderMatchesServingDownloaderUID(t *testing.T) {
 	mr := cachePrepTripwireModelReconciler()
 	mr.ModelCachePrep = ModelCachePrepNever
@@ -298,8 +299,8 @@ func TestPrefetchDownloaderMatchesServingDownloaderUID(t *testing.T) {
 				}
 				return
 			}
-			if *tc.want != initContainerUID {
-				t.Fatalf("serving downloader uid unset (image default), prefetch uid = %d, want the image default %d", *tc.want, initContainerUID)
+			if *tc.want != DefaultInitContainerUser {
+				t.Fatalf("serving downloader uid unset (image default), prefetch uid = %d, want the image default %d", *tc.want, DefaultInitContainerUser)
 			}
 		})
 	}
