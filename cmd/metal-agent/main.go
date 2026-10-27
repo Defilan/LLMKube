@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"math"
@@ -98,6 +99,7 @@ type AgentConfig struct {
 	LegacyDirectEndpoints     bool
 	MetalNode                 string
 	MetalNodeLease            string
+	RenewServiceAccountToken  bool
 
 	// AllowModelMemoryBudgetOverride: see agent.MetalAgentConfig.
 	AllowModelMemoryBudgetOverride bool
@@ -159,6 +161,20 @@ func validateMetalNodeIngress(node string, ingressPort int, legacy bool) error {
 			ingressPort, metalnode.MinIngressPort)
 	}
 	return nil
+}
+
+// tokenFileToRenew is the token file --renew-service-account-token keeps
+// current: the kubeconfig's tokenFile, which client-go re-reads, so a renewed
+// token reaches every client without a restart. A kubeconfig with an inline
+// token, a client certificate or an exec plugin has nothing to renew.
+func tokenFileToRenew(enabled bool, cfg *restclient.Config) (string, error) {
+	if !enabled {
+		return "", nil
+	}
+	if cfg.BearerTokenFile == "" {
+		return "", errors.New("--renew-service-account-token needs a kubeconfig whose user sets tokenFile")
+	}
+	return cfg.BearerTokenFile, nil
 }
 
 // loadKubeconfig defers to controller-runtime's standard discovery chain:
@@ -555,6 +571,10 @@ func main() {
 			"MetalNode reporting.")
 	flag.StringVar(&cfg.MetalNodeLease, "metal-node-lease", "",
 		"Lease the agent renews for --metal-node. Default: the MetalNode's own name.")
+	flag.BoolVar(&cfg.RenewServiceAccountToken, "renew-service-account-token", false,
+		"Keep the ServiceAccount token in the kubeconfig's tokenFile current: at half its lifetime the agent "+
+			"requests a new one for its own ServiceAccount and replaces the file (llmkube metal join sets this up). "+
+			"The kubeconfig's user must use tokenFile.")
 	flag.StringVar(&cfg.LogLevel, "log-level", "info", "Log level (debug, info, warn, error)")
 	flag.StringVar(&cfg.HostIP, "host-ip", "", "IP address to register in Kubernetes endpoints (auto-detected if empty)")
 	flag.Float64Var(&cfg.MemoryFraction, "memory-fraction", 0,
@@ -784,6 +804,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	renewTokenFile, err := tokenFileToRenew(cfg.RenewServiceAccountToken, k8sConfig)
+	if err != nil {
+		logger.Errorw("cannot renew the ServiceAccount token", "error", err)
+		os.Exit(1)
+	}
+
 	k8sClient, err := client.New(k8sConfig, client.Options{Scheme: scheme.Scheme})
 	if err != nil {
 		logger.Errorw("failed to create Kubernetes client", "error", err)
@@ -854,6 +880,7 @@ func main() {
 		LegacyDirectEndpoints:     cfg.LegacyDirectEndpoints,
 		MetalNode:                 cfg.MetalNode,
 		MetalNodeLease:            cfg.MetalNodeLease,
+		RenewTokenFile:            renewTokenFile,
 		APIServerHost:             k8sConfig.Host,
 
 		AllowModelMemoryBudgetOverride: cfg.AllowModelMemoryBudgetOverride,

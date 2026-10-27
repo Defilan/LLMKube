@@ -271,6 +271,10 @@ type MetalAgentConfig struct {
 	// MetalNodeLease names the Lease the agent renews (--metal-node-lease);
 	// empty means the MetalNode's own name.
 	MetalNodeLease string
+	// RenewTokenFile is the kubeconfig's tokenFile, which the agent keeps
+	// current through TokenRequest (--renew-service-account-token). Empty
+	// disables renewal.
+	RenewTokenFile string
 	// APIServerHost is the kubeconfig's server URL. The route to it decides
 	// the order of the candidate addresses the agent reports.
 	APIServerHost string
@@ -738,6 +742,7 @@ func (a *MetalAgent) Start(ctx context.Context) error {
 	// Heartbeat and report through the MetalNode's Lease (--metal-node), now
 	// that the ingress pin is known and its port bound. Off by default.
 	a.startMetalNodeReporter(ctx)
+	a.startTokenRenewer(ctx)
 
 	if ingressSrv != nil {
 		go a.runIngress(ctx, ingressSrv, ingressLn, fatalErrChan)

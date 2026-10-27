@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"go.uber.org/zap/zapcore"
+	restclient "k8s.io/client-go/rest"
 
 	"github.com/defilantech/llmkube/pkg/agent"
 	"github.com/defilantech/llmkube/pkg/metalnode"
@@ -479,5 +480,31 @@ func TestValidateMetalNodeFlags(t *testing.T) {
 		case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
 			t.Errorf("validateMetalNodeFlags(%q, %q) = %v, want an error mentioning %q", tc.node, tc.lease, err, tc.wantErr)
 		}
+	}
+}
+
+// TestTokenFileToRenew: --renew-service-account-token renews the
+// kubeconfig's tokenFile, and refuses a kubeconfig without one, whose token
+// a renewal could never reach.
+func TestTokenFileToRenew(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		enabled bool
+		cfg     restclient.Config
+		want    string
+		wantErr bool
+	}{
+		{name: "off", cfg: restclient.Config{BearerToken: "inline"}},
+		{name: "tokenFile", enabled: true, cfg: restclient.Config{BearerTokenFile: "/agent/token"}, want: "/agent/token"},
+		{name: "inline token", enabled: true, cfg: restclient.Config{BearerToken: "inline"}, wantErr: true},
+		{name: "client certificate", enabled: true, wantErr: true,
+			cfg: restclient.Config{TLSClientConfig: restclient.TLSClientConfig{CertFile: "c"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := tokenFileToRenew(tc.enabled, &tc.cfg)
+			if got != tc.want || (err != nil) != tc.wantErr {
+				t.Errorf("tokenFileToRenew = %q, %v; want %q, error %t", got, err, tc.want, tc.wantErr)
+			}
+		})
 	}
 }

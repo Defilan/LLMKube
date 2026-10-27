@@ -465,6 +465,16 @@ call at all. With `--metal-node`, `--ingress-port` must be 1024 or above: the
 cluster refuses to dial a privileged port, and the agent logs why instead of
 renewing with a report the controller would reject.
 
+`--renew-service-account-token` keeps the agent's own token current. The
+kubeconfig's user must read its token from `tokenFile` (the agent refuses to
+start otherwise). At half the token's lifetime the agent requests a token with
+the same lifetime for its own ServiceAccount, through TokenRequest
+(`serviceaccounts/token` `create`, granted by the per-Mac Role below), and
+replaces the file atomically; client-go re-reads it within a minute. If the
+ServiceAccount is gone (`llmkube metal remove`) or the token has expired,
+renewal fails and the agent logs that the Mac must join again.
+`llmkube metal join` sets up the kubeconfig and the flag.
+
 The shared Role in `metal-agent-rbac.yaml` does not grant Leases, and must
 not: RBAC cannot scope a shared rule to "the caller's own Lease", so it would
 let every Mac renew every other Mac's heartbeat. Each Mac instead gets its own
