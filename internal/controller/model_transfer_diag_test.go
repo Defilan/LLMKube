@@ -143,14 +143,14 @@ func TestMatchModelTransferFailure_Signatures(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			reason, line, ok := matchModelTransferFailure(tc.msg)
+			f, ok := matchModelTransferFailure(tc.msg)
 			if !ok {
 				t.Fatalf("no diagnosis for %q", tc.msg)
 			}
-			if reason != tc.wantReason {
-				t.Errorf("reason = %q, want %q", reason, tc.wantReason)
+			if f.reason != tc.wantReason {
+				t.Errorf("reason = %q, want %q", f.reason, tc.wantReason)
 			}
-			if line == "" {
+			if f.line == "" {
 				t.Error("matched line is empty; the condition message would name no evidence")
 			}
 		})
@@ -169,8 +169,8 @@ func TestMatchModelTransferFailure_UnknownIsNotDiagnosed(t *testing.T) {
 		// genuinely invalid spec.files, which the Model's own condition names.
 		`ERROR: InvalidFileSet - model spec.files/spec.mmproj configuration is invalid. Check file paths, directory escapes, and glob patterns.`,
 	} {
-		if reason, _, ok := matchModelTransferFailure(msg); ok {
-			t.Errorf("msg %q was diagnosed as %q; unknown failures must not be labelled", msg, reason)
+		if f, ok := matchModelTransferFailure(msg); ok {
+			t.Errorf("msg %q was diagnosed as %q; unknown failures must not be labelled", msg, f.reason)
 		}
 	}
 }
@@ -197,12 +197,12 @@ func TestFindModelTransferFailure(t *testing.T) {
 		pods := []corev1.Pod{initPod("node-a",
 			terminatedInit("model-downloader", 22,
 				"curl: (60) SSL certificate problem: unable to get local issuer certificate"))}
-		node, reason, line, found := findModelTransferFailure(pods)
+		f, found := findModelTransferFailure(pods)
 		if !found {
 			t.Fatal("no failure found")
 		}
-		if node != "node-a" || reason != ReasonModelSourceUntrusted || line == "" {
-			t.Errorf("got node=%q reason=%q line=%q", node, reason, line)
+		if f.node != "node-a" || f.reason != ReasonModelSourceUntrusted || f.line == "" {
+			t.Errorf("got node=%q reason=%q line=%q", f.node, f.reason, f.line)
 		}
 	})
 
@@ -211,9 +211,9 @@ func TestFindModelTransferFailure(t *testing.T) {
 			terminatedInit("model-downloader", 1, "mkdir: can't create directory '/models/k': Permission denied"))
 		pod.Spec.Volumes = []corev1.Volume{{Name: "model-cache", VolumeSource: corev1.VolumeSource{
 			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "c"}}}}
-		_, reason, _, found := findModelTransferFailure([]corev1.Pod{pod})
-		if !found || reason != ReasonModelCacheNotWritable {
-			t.Fatalf("found=%v reason=%q, want %q", found, reason, ReasonModelCacheNotWritable)
+		f, found := findModelTransferFailure([]corev1.Pod{pod})
+		if !found || f.reason != ReasonModelCacheNotWritable {
+			t.Fatalf("found=%v reason=%q, want %q", found, f.reason, ReasonModelCacheNotWritable)
 		}
 	})
 
@@ -222,8 +222,8 @@ func TestFindModelTransferFailure(t *testing.T) {
 			terminatedInit("model-downloader", 1, "mkdir: can't create directory '/models/k': Permission denied"))
 		pod.Spec.Volumes = []corev1.Volume{{Name: "model-storage", VolumeSource: corev1.VolumeSource{
 			EmptyDir: &corev1.EmptyDirVolumeSource{}}}}
-		if _, reason, _, found := findModelTransferFailure([]corev1.Pod{pod}); found {
-			t.Errorf("emptyDir permission failure diagnosed as %q; the cache remedy does not apply", reason)
+		if f, found := findModelTransferFailure([]corev1.Pod{pod}); found {
+			t.Errorf("emptyDir permission failure diagnosed as %q; the cache remedy does not apply", f.reason)
 		}
 	})
 
@@ -240,8 +240,8 @@ func TestFindModelTransferFailure(t *testing.T) {
 		pod := initPod("node-a",
 			terminatedInit("model-verify", 1, "sha256sum: can't open '/models/k/m.gguf': Permission denied"))
 		pod.Spec.Volumes = cfg.volumes
-		if _, reason, _, found := findModelTransferFailure([]corev1.Pod{pod}); found {
-			t.Errorf("read-only prefetched pod diagnosed as %q; model-verify never writes the cache", reason)
+		if f, found := findModelTransferFailure([]corev1.Pod{pod}); found {
+			t.Errorf("read-only prefetched pod diagnosed as %q; model-verify never writes the cache", f.reason)
 		}
 	})
 
@@ -251,18 +251,18 @@ func TestFindModelTransferFailure(t *testing.T) {
 	// termination before the current one, so a pod-level fixture would test
 	// precedence between attempts, not between signatures.
 	t.Run("a specific cause wins over the cache remedy", func(t *testing.T) {
-		reason, _, ok := matchModelTransferFailure(
+		f, ok := matchModelTransferFailure(
 			"mkdir: can't create directory '/models/k': Permission denied\n" +
 				"curl: (60) SSL certificate problem: unable to get local issuer certificate")
-		if !ok || reason != ReasonModelSourceUntrusted {
-			t.Fatalf("ok=%v reason=%q, want %q", ok, reason, ReasonModelSourceUntrusted)
+		if !ok || f.reason != ReasonModelSourceUntrusted {
+			t.Fatalf("ok=%v reason=%q, want %q", ok, f.reason, ReasonModelSourceUntrusted)
 		}
 	})
 
 	t.Run("ignores a clean exit", func(t *testing.T) {
 		pods := []corev1.Pod{initPod("node-a",
 			terminatedInit("model-downloader", 0, "Model downloaded successfully"))}
-		if _, _, _, found := findModelTransferFailure(pods); found {
+		if _, found := findModelTransferFailure(pods); found {
 			t.Error("a zero exit code must never be diagnosed as a failure")
 		}
 	})
@@ -277,7 +277,7 @@ func TestFindModelTransferFailure(t *testing.T) {
 				terminatedInit("llama-server", 1, "curl: (22) The requested URL returned error: 404"),
 			}},
 		}}
-		if _, _, _, found := findModelTransferFailure(pods); found {
+		if _, found := findModelTransferFailure(pods); found {
 			t.Error("runtime-container output must not be diagnosed as a transfer failure")
 		}
 	})
@@ -288,7 +288,7 @@ func TestFindModelTransferFailure(t *testing.T) {
 		cs := terminatedInit("model-downloader", 0, "")
 		cs.Ready = true
 		pods := []corev1.Pod{initPod("node-a", cs)}
-		if _, _, _, found := findModelTransferFailure(pods); found {
+		if _, found := findModelTransferFailure(pods); found {
 			t.Error("a completed init container must not be reported as failing")
 		}
 	})
@@ -305,7 +305,7 @@ func TestFindModelTransferFailure(t *testing.T) {
 			},
 		}
 		pods := []corev1.Pod{initPod("node-a", cs)}
-		if _, _, _, found := findModelTransferFailure(pods); found {
+		if _, found := findModelTransferFailure(pods); found {
 			t.Error("a container whose current termination is success must not be diagnosed from its last termination")
 		}
 	})
@@ -327,12 +327,37 @@ func TestFindModelTransferFailure(t *testing.T) {
 			},
 		}
 		pods := []corev1.Pod{initPod("node-b", cs)}
-		node, reason, line, found := findModelTransferFailure(pods)
+		f, found := findModelTransferFailure(pods)
 		if !found {
 			t.Fatal("a crash-looping container must still be diagnosed from its last termination")
 		}
-		if node != "node-b" || reason != ReasonModelSourceUnreachable || line == "" {
-			t.Errorf("got node=%q reason=%q line=%q", node, reason, line)
+		if f.node != "node-b" || f.reason != ReasonModelSourceUnreachable || f.line == "" {
+			t.Errorf("got node=%q reason=%q line=%q", f.node, f.reason, f.line)
 		}
 	})
+}
+
+// The ModelCacheLockUnsupported remedy comes from the downloader's own message,
+// so a log tail that lost it gets a pointer back to the log rather than a
+// remedy for some other source kind (#2251).
+func TestMatchModelTransferFailure_CacheLockRemedyFromMessage(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		msg  string
+		want string
+	}{
+		{"prefetchable source", "ERROR: ModelCacheLockUnsupported: FUSE cache cannot guarantee cross-node file locking for staging a.safetensors; " + cacheLockRemedyPrefetch, cacheLockRemedyPrefetch},
+		{"s3 source", "ERROR: ModelCacheLockUnsupported: FUSE cache cannot guarantee cross-node file locking for staging a.safetensors; " + cacheLockRemedyS3, cacheLockRemedyS3},
+		{"remedy cut from the log tail", "ERROR: ModelCacheLockUnsupported: FUSE cache cannot guarantee", cacheLockRemedyFallback},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, ok := matchModelTransferFailure(tc.msg)
+			if !ok || f.reason != ReasonModelCacheLockUnsupported {
+				t.Fatalf("ok=%v reason=%q, want %q", ok, f.reason, ReasonModelCacheLockUnsupported)
+			}
+			if f.remedy != tc.want {
+				t.Errorf("remedy = %q, want %q", f.remedy, tc.want)
+			}
+		})
+	}
 }

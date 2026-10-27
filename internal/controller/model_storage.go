@@ -747,6 +747,42 @@ const cacheDirLock = `if [ -w "$CACHE_DIR" ]; then ` +
 	`flock 9 || { echo "ERROR: could not lock $CACHE_DIR/.llmkube-download.lock; the cache volume must support file locking (NFS needs a lock daemon)" >&2; exit 1; }; fi; ` +
 	`else echo "WARNING: $CACHE_DIR is not writable by uid $(id -u); skipping the download lock" >&2; fi; `
 
+// The ModelCacheLockUnsupported remedies, one per source kind. The init script
+// prints the one for its source, and the transfer diagnosis takes the remedy
+// for the ModelTransferHealthy condition from that output (cacheLockRemedyIn),
+// so the pod log and the condition cannot give different instructions
+// (#2251). A remedy must not contain another as a substring.
+const (
+	cacheLockRemedyPrefetch = "set spec.modelCache.prefetch: true on every InferenceService using this claim, or use storage with cross-node flock support"
+	cacheLockRemedyS3       = "s3:// sources do not support prefetch; use storage with cross-node flock support, or pre-stage the files and use a pvc:// source"
+)
+
+// cacheLockRemedies lists every remedy cacheLockRemedy can return.
+var cacheLockRemedies = []string{cacheLockRemedyPrefetch, cacheLockRemedyS3}
+
+// cacheLockRemedyFallback is the condition's remedy when the termination
+// message does not carry one of cacheLockRemedies (a log tail cut before it).
+const cacheLockRemedyFallback = "the model-downloader log names the remedy for this source"
+
+// cacheLockRemedy returns the remedy an init script prints when it refuses to
+// stage on a FUSE cache.
+func cacheLockRemedy(isS3 bool) string {
+	if isS3 {
+		return cacheLockRemedyS3
+	}
+	return cacheLockRemedyPrefetch
+}
+
+// cacheLockRemedyIn returns the remedy the init script printed in msg.
+func cacheLockRemedyIn(msg string) string {
+	for _, r := range cacheLockRemedies {
+		if strings.Contains(msg, r) {
+			return r
+		}
+	}
+	return cacheLockRemedyFallback
+}
+
 // partialSizeGuard fails a resumable transfer whose partial does not match the
 // advertised Content-Length, and deletes the partial so the next start begins
 // from byte 0. It cannot catch an interleave of equal size; cacheDirLock is
@@ -1154,10 +1190,7 @@ func buildMultiFileInitCommand(useCache, isS3, isHFAuth, withSHA256 bool, refres
 	// lock as it did before FUSE detection, with a warning, instead of failing
 	// on every filesystem under a remedy (prefetch) that hits the same stat
 	// (#2253).
-	remedy := "set spec.modelCache.prefetch: true on every InferenceService using this claim, or use storage with cross-node flock support"
-	if isS3 {
-		remedy = "s3:// sources do not support prefetch; use storage with cross-node flock support, or pre-stage the files and use a pvc:// source"
-	}
+	remedy := cacheLockRemedy(isS3)
 	prefix := `cache_fs=$(stat -f -c %t "$CACHE_DIR" 2>/dev/null || stat -f -c %t "$(dirname "$CACHE_DIR")") || { echo "WARNING: cannot determine the cache filesystem: this init image's stat has no -f; staging under the directory lock, which does not exclude pods on other nodes on a FUSE cache" >&2; cache_fs=unknown; }; ` +
 		`if [ "$cache_fs" != 65735546 ]; then mkdir -p "$CACHE_DIR" || exit 1; ` + cacheDirLock +
 		`elif [ "${LLMKUBE_PREFETCH_STAGER:-false}" = true ]; then mkdir -p "$CACHE_DIR" || exit 1; fi; ` +

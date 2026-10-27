@@ -130,7 +130,9 @@ It reads the magic with `stat -f`; a custom init image whose `stat` lacks
 logs a warning, which leaves a FUSE cache unprotected across nodes.
 The filesystem type alone cannot establish cross-node locking support.
 A refusal sets `ModelTransferHealthy=False` with reason
-`ModelCacheLockUnsupported` and a remedy in the condition message.
+`ModelCacheLockUnsupported`. The condition message carries the same remedy the
+downloader logs, which depends on the source kind (prefetch for HTTP/HF
+sources; storage with cross-node `flock` or a `pvc://` source for `s3://`).
 
 For HTTP/HF sources, set `spec.modelCache.prefetch: true` on every
 InferenceService using such a claim. The operator's prefetch Job is allowed

@@ -257,8 +257,23 @@ func runMultiFileFUSEWarmCacheCase(t *testing.T, realStat, policy string, s3 boo
 }
 
 // Feed the downloader's actual failure into the same condition path that
-// handles an init container's termination message on a serving pod.
+// handles an init container's termination message on a serving pod, and check
+// the condition repeats the remedy the downloader printed (#2251).
 func assertCacheLockCondition(t *testing.T, output string) {
+	t.Helper()
+	condition := cacheLockCondition(t, output)
+	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "ModelCacheLockUnsupported" {
+		t.Fatalf("FUSE staging failure has no actionable condition: %+v", condition)
+	}
+	remedy := printedCacheLockRemedy(t, output)
+	if !strings.HasSuffix(condition.Message, ". "+remedy) {
+		t.Errorf("the condition's remedy differs from the one the downloader printed:\nlog remedy: %s\ncondition:  %s", remedy, condition.Message)
+	}
+}
+
+// cacheLockCondition runs output, as a failed model-downloader's termination
+// message, through reconcileModelTransferCondition and returns the condition.
+func cacheLockCondition(t *testing.T, output string) *metav1.Condition {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
@@ -273,11 +288,97 @@ func assertCacheLockCondition(t *testing.T, output string) {
 	}
 	r := &InferenceServiceReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod).Build()}
 	r.reconcileModelTransferCondition(t.Context(), isvc)
-	condition := meta.FindStatusCondition(isvc.Status.Conditions, ConditionModelTransferHealthy)
-	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "ModelCacheLockUnsupported" {
-		t.Fatalf("FUSE staging failure has no actionable condition: %+v", condition)
+	return meta.FindStatusCondition(isvc.Status.Conditions, ConditionModelTransferHealthy)
+}
+
+// printedCacheLockRemedy returns what the downloader printed after the
+// ModelCacheLockUnsupported refusal's "<file>; ".
+func printedCacheLockRemedy(t *testing.T, output string) string {
+	t.Helper()
+	for _, line := range strings.Split(output, "\n") {
+		if _, rest, ok := strings.Cut(line, "ModelCacheLockUnsupported: "); ok {
+			if _, remedy, ok := strings.Cut(rest, "; "); ok && remedy != "" {
+				return remedy
+			}
+		}
 	}
-	if !strings.Contains(condition.Message, "pvc://") {
-		t.Errorf("cache-lock condition lacks a pre-staging remedy: %s", condition.Message)
+	t.Fatalf("the downloader printed no ModelCacheLockUnsupported remedy:\n%s", output)
+	return ""
+}
+
+// downloaderOf returns the model-downloader container of a storage config.
+func downloaderOf(t *testing.T, containers []corev1.Container) *corev1.Container {
+	t.Helper()
+	for i := range containers {
+		if containers[i].Name == "model-downloader" {
+			return &containers[i]
+		}
+	}
+	t.Fatal("missing model-downloader container")
+	return nil
+}
+
+// runDownloaderOnFS runs a generated downloader container's command under sh
+// with the container's own env, its cache directory moved to dir, and a stat
+// that answers -f as fs would (see fakeStatScript).
+func runDownloaderOnFS(t *testing.T, c *corev1.Container, dir, fs string, extraEnv ...string) (string, error) {
+	t.Helper()
+	realStat, err := exec.LookPath("stat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "stat"), []byte(fakeStatScript(fs)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sh", "-c", c.Command[2])
+	cmd.Env = os.Environ()
+	for _, env := range c.Env {
+		switch env.Name {
+		case "CACHE_DIR":
+			env.Value = dir
+		case "MODEL_PATH":
+			env.Value = filepath.Join(dir, filepath.Base(env.Value))
+		}
+		cmd.Env = append(cmd.Env, env.Name+"="+env.Value)
+	}
+	cmd.Env = append(cmd.Env, "PATH="+bin+":"+os.Getenv("PATH"), "REAL_STAT="+realStat)
+	cmd.Env = append(cmd.Env, extraEnv...)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// TestCacheLockRemedyLogMatchesCondition: a serving pod that refuses to stage
+// on a FUSE cache prints a remedy, and the ModelTransferHealthy condition the
+// operator derives from that output must give the same one, for a source that
+// can prefetch and one that cannot (#2251). The output is the real
+// downloader's, run from the container the storage builder renders.
+func TestCacheLockRemedyLogMatchesCondition(t *testing.T) {
+	requireInitShellEnvironment(t)
+	for _, tc := range []struct {
+		name   string
+		source string
+		env    []string
+		want   string
+	}{
+		{"http", "https://example.invalid/org/repo", nil, cacheLockRemedyPrefetch},
+		{"s3", "s3://bucket/prefix", s3TestEnv("http://127.0.0.1:1"), cacheLockRemedyS3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			model := &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: "weights", Namespace: "default"},
+				Spec:       inferencev1alpha1.ModelSpec{Source: tc.source, Format: "safetensors", Files: []string{"model.safetensors"}},
+				Status:     inferencev1alpha1.ModelStatus{CacheKey: "cache"},
+			}
+			storage := buildModelStorageConfig(model, nil, "default", true, ModelCacheModeShared, "", defaultPrefetchImage, 0, ModelCachePrepAlways, nil, "")
+			out, err := runDownloaderOnFS(t, downloaderOf(t, storage.initContainers), t.TempDir(), "fuse", tc.env...)
+			if err == nil {
+				t.Fatalf("a serving pod staged on FUSE: %s", out)
+			}
+			if got := printedCacheLockRemedy(t, out); got != tc.want {
+				t.Errorf("the downloader printed remedy %q, want %q", got, tc.want)
+			}
+			assertCacheLockCondition(t, out)
+		})
 	}
 }

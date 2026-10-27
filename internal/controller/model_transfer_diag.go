@@ -107,10 +107,24 @@ const (
 
 // modelTransferSignature pairs a diagnosis with the substrings that justify it.
 // Matching is case-insensitive, so entries must be lowercase.
+//
+// remedyFrom, when set, replaces remedy: it reads the remedy out of the
+// container's own message, for a failure whose generated script already
+// printed the remedy that applies to its source.
 type modelTransferSignature struct {
-	reason  string
-	remedy  string
-	matches []string
+	reason     string
+	remedy     string
+	remedyFrom func(msg string) string
+	matches    []string
+}
+
+// modelTransferFailure is a diagnosed staging failure: the node it ran on, the
+// reason, the line that justified it, and the remedy for the condition.
+type modelTransferFailure struct {
+	node   string
+	reason string
+	line   string
+	remedy string
 }
 
 // modelTransferSignatures are matched in order, so the more specific entries
@@ -119,10 +133,11 @@ type modelTransferSignature struct {
 // wrong label is worse than the bare exit code the user already has.
 var modelTransferSignatures = []modelTransferSignature{
 	{
-		reason: ReasonModelCacheLockUnsupported,
-		remedy: "for HTTP/HF sources, set spec.modelCache.prefetch: true on every service using the claim; " +
-			"s3:// sources cannot prefetch, so use storage with cross-node flock support or pre-stage files with a pvc:// source",
-		matches: []string{"modelcachelockunsupported"},
+		// The downloader printed the remedy for its own source kind; the
+		// condition repeats that one, so the two cannot disagree (#2251).
+		reason:     ReasonModelCacheLockUnsupported,
+		remedyFrom: cacheLockRemedyIn,
+		matches:    []string{"modelcachelockunsupported"},
 	},
 	{
 		// A pod rendered to consume a prefetched cache found a staged file
@@ -250,9 +265,9 @@ var modelTransferSignatures = []modelTransferSignature{
 // Reuses driver_compat.go's asciiLower and sanitizeMessageLine: the input is
 // arbitrary container output, so offsets must stay byte-stable and the result
 // must be bounded no matter what was printed.
-func matchModelTransferFailure(msg string) (reason, matchedLine string, found bool) {
+func matchModelTransferFailure(msg string) (modelTransferFailure, bool) {
 	if msg == "" {
-		return "", "", false
+		return modelTransferFailure{}, false
 	}
 	lower := asciiLower(msg)
 	for _, sig := range modelTransferSignatures {
@@ -271,10 +286,14 @@ func matchModelTransferFailure(msg string) (reason, matchedLine string, found bo
 			} else {
 				end += idx
 			}
-			return sig.reason, sanitizeMessageLine(msg[start:end]), true
+			remedy := sig.remedy
+			if sig.remedyFrom != nil {
+				remedy = sig.remedyFrom(msg)
+			}
+			return modelTransferFailure{reason: sig.reason, line: sanitizeMessageLine(msg[start:end]), remedy: remedy}, true
 		}
 	}
-	return "", "", false
+	return modelTransferFailure{}, false
 }
 
 // isGeneratedInitContainer reports whether a container name is one the operator
@@ -289,7 +308,7 @@ func isGeneratedInitContainer(name string) bool {
 // terminated non-zero with a recognisable cause. Both the current terminated
 // state (fresh failure, before backoff) and the last terminated state
 // (CrashLoopBackOff) are checked, mirroring findCudaDriverCrash.
-func findModelTransferFailure(pods []corev1.Pod) (nodeName, reason, matchedLine string, found bool) {
+func findModelTransferFailure(pods []corev1.Pod) (modelTransferFailure, bool) {
 	for i := range pods {
 		pod := &pods[i]
 		// One pod-level answer, reused per container: does anything here
@@ -314,20 +333,21 @@ func findModelTransferFailure(pods []corev1.Pod) (nodeName, reason, matchedLine 
 				if term == nil || term.ExitCode == 0 {
 					continue
 				}
-				if r, line, ok := matchModelTransferFailure(term.Message); ok {
+				if f, ok := matchModelTransferFailure(term.Message); ok {
 					// The cache remedy needs both: a container that writes
 					// the cache (model-verify only reads it) and a pod that
 					// mounts one (an emptyDir store has no cache-prep to
 					// turn on).
-					if r == ReasonModelCacheNotWritable && !(writesModelCache(cs.Name) && cacheBacked) {
+					if f.reason == ReasonModelCacheNotWritable && !(writesModelCache(cs.Name) && cacheBacked) {
 						continue
 					}
-					return pod.Spec.NodeName, r, line, true
+					f.node = pod.Spec.NodeName
+					return f, true
 				}
 			}
 		}
 	}
-	return "", "", "", false
+	return modelTransferFailure{}, false
 }
 
 // podMountsModelCache reports whether the pod mounts the model-cache PVC, the
@@ -393,7 +413,7 @@ func (r *InferenceServiceReconciler) reconcileModelTransferCondition(
 	}
 
 	now := metav1.NewTime(time.Now())
-	nodeName, reason, matchedLine, found := findModelTransferFailure(podList.Items)
+	failure, found := findModelTransferFailure(podList.Items)
 
 	if !found {
 		existing := meta.FindStatusCondition(isvc.Status.Conditions, ConditionModelTransferHealthy)
@@ -414,19 +434,13 @@ func (r *InferenceServiceReconciler) reconcileModelTransferCondition(
 		return
 	}
 
-	var remedy string
-	for _, sig := range modelTransferSignatures {
-		if sig.reason == reason {
-			remedy = sig.remedy
-			break
-		}
+	reason := failure.reason
+	message := fmt.Sprintf("Model transfer failed: %s", failure.line)
+	if failure.node != "" {
+		message += fmt.Sprintf(" (node %s)", failure.node)
 	}
-	message := fmt.Sprintf("Model transfer failed: %s", matchedLine)
-	if nodeName != "" {
-		message += fmt.Sprintf(" (node %s)", nodeName)
-	}
-	if remedy != "" {
-		message += ". " + remedy
+	if failure.remedy != "" {
+		message += ". " + failure.remedy
 	}
 
 	existing := meta.FindStatusCondition(isvc.Status.Conditions, ConditionModelTransferHealthy)
