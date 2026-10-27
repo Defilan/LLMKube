@@ -106,8 +106,7 @@ func computeSpread(values []float64) TokenSpread {
 // deployed service. No redeploy and no --catalog requirement: it measures
 // how throughput degrades as the prompt gets deeper against one running
 // deployment.
-func runPromptDepthSweep(opts *benchmarkOptions) error {
-	ctx := context.Background()
+func runPromptDepthSweep(ctx context.Context, opts *benchmarkOptions) error {
 	startTime := time.Now()
 
 	values, err := parseSweepValues(opts.promptDepthSweep)

@@ -315,6 +315,9 @@ func deployCatalogForPhase(
 
 	testOpts := *opts
 	testOpts.name = modelID
+	// The copy drops any key resolved into opts by an earlier service, but the
+	// ISVC deployed here was created by this run and carries no apiKeySecretRef,
+	// so getEndpoint has nothing to resolve for it.
 	endpoint, cleanup, err := getEndpoint(ctx, &testOpts)
 	if err != nil {
 		if opts.cleanup {

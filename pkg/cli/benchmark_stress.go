@@ -287,6 +287,9 @@ func sendBenchmarkRequestWithPrompt(
 		return result, fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if opts.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+opts.apiKey)
+	}
 
 	httpClient := &http.Client{Timeout: opts.timeout}
 	reqStartTime := time.Now()

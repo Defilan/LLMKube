@@ -111,11 +111,11 @@ func outputFormattedReport(report ComparisonReport, opts *benchmarkOptions, repo
 }
 
 func runCatalogBenchmark(opts *benchmarkOptions) error {
+	ctx := context.Background()
 	if opts.contextSweep != "" {
-		return runContextSweep(opts)
+		return runContextSweep(ctx, opts)
 	}
 
-	ctx := context.Background()
 	startTime := time.Now()
 
 	modelIDs := parseCatalogModelIDs(opts.catalog)

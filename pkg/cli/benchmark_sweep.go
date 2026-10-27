@@ -62,8 +62,7 @@ func runSweepIteration(ctx context.Context, endpoint string, opts *benchmarkOpti
 	return result
 }
 
-func runConcurrencySweep(opts *benchmarkOptions) error {
-	ctx := context.Background()
+func runConcurrencySweep(ctx context.Context, opts *benchmarkOptions) error {
 	startTime := time.Now()
 
 	values, err := parseSweepValues(opts.concurrencySweep)
@@ -152,8 +151,7 @@ func runConcurrencySweep(opts *benchmarkOptions) error {
 	return nil
 }
 
-func runTokensSweep(opts *benchmarkOptions) error {
-	ctx := context.Background()
+func runTokensSweep(ctx context.Context, opts *benchmarkOptions) error {
 	startTime := time.Now()
 
 	values, err := parseSweepValues(opts.tokensSweep)
@@ -295,12 +293,11 @@ func runContextSweepIteration(
 	return result
 }
 
-func runContextSweep(opts *benchmarkOptions) error {
+func runContextSweep(ctx context.Context, opts *benchmarkOptions) error {
 	if opts.catalog == "" {
 		return fmt.Errorf("--context-sweep requires --catalog mode (deploys with different context sizes)")
 	}
 
-	ctx := context.Background()
 	startTime := time.Now()
 
 	values, err := parseSweepValues(opts.contextSweep)

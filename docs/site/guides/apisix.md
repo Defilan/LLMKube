@@ -119,6 +119,20 @@ kubectl -n llm port-forward svc/qwen38 8000:8000 &
 curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/v1/chat/completions -d '{}'
 ```
 
+`llmkube benchmark` reads the same key from `apiKeySecretRef` through your
+kubeconfig and sends `Authorization: Bearer <key>`, so a keyed service needs no
+extra flags:
+
+```bash
+llmkube benchmark qwen38 -n llm --report-dir ./reports
+```
+
+Reading the Secret needs `get secrets` in the service's namespace. Pass
+`--api-key-file`, or set `LLMKUBE_API_KEY`, to benchmark a service whose key
+LLMKube cannot read (an `--api-key` in `spec.extraArgs`, a keyed service from
+another tool) or one you reach with `--endpoint`. The key is never printed and
+never written to the report.
+
 How LLMKube wires the key:
 
 - vLLM reads it from the `VLLM_API_KEY` environment variable. SGLang's launcher
@@ -1163,8 +1177,6 @@ LLMKube:
   that targets a keyed InferenceService reports `Loaded=False` with reason
   `APIKeyUnsupported` and never calls SGLang. Load adapters at startup instead
   (SGLang `--lora-paths` in `spec.extraArgs`), or remove the key.
-- **`llmkube benchmark` cannot send an API key yet**, so it gets 401 from a
-  keyed InferenceService.
 - **ModelRouter does not forward the key yet.** A
   [ModelRouter](../concepts/model-router) with a backend whose InferenceService
   requires an API key reports reason `BackendAPIKeyUnsupported`, naming the
