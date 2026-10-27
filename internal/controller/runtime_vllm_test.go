@@ -268,13 +268,16 @@ func TestVLLMBuildArgs(t *testing.T) {
 		},
 		{
 			model: model,
-			name:  "kvCacheCustomDtype=turbo2 emits flag (vLLM v0.20+ TurboQuant 2-bit)",
+			// Pins pass-through only. LLMKube does not validate the custom
+			// value; whether vLLM accepts it depends on the image
+			// (turboquant_3bit_nc needs v0.20.0 or later).
+			name: "kvCacheCustomDtype passes an image-specific value through (turboquant_3bit_nc)",
 			spec: &inferencev1alpha1.InferenceServiceSpec{
 				Runtime:    "vllm",
 				ModelRef:   "test-model",
-				VLLMConfig: &inferencev1alpha1.VLLMConfig{KVCacheCustomDtype: "turbo2"},
+				VLLMConfig: &inferencev1alpha1.VLLMConfig{KVCacheCustomDtype: "turboquant_3bit_nc"},
 			},
-			contains: []FlagCheck{{"--kv-cache-dtype", "turbo2"}},
+			contains: []FlagCheck{{"--kv-cache-dtype", "turboquant_3bit_nc"}},
 		},
 		{
 			model: model,
@@ -284,10 +287,10 @@ func TestVLLMBuildArgs(t *testing.T) {
 				ModelRef: "test-model",
 				VLLMConfig: &inferencev1alpha1.VLLMConfig{
 					KVCacheDtype:       ptrString("fp8_e4m3"),
-					KVCacheCustomDtype: "turbo2",
+					KVCacheCustomDtype: "turboquant_3bit_nc",
 				},
 			},
-			contains:    []FlagCheck{{"--kv-cache-dtype", "turbo2"}},
+			contains:    []FlagCheck{{"--kv-cache-dtype", "turboquant_3bit_nc"}},
 			notContains: []string{"fp8_e4m3"},
 		},
 		{
@@ -836,9 +839,9 @@ func TestResolveKVCacheDtype(t *testing.T) {
 		{name: "standard nil and custom empty returns empty", custom: "", standard: nil, want: ""},
 		{name: "standard set, custom empty returns standard", custom: "", standard: ptrString("fp8_e4m3"), want: "fp8_e4m3"},
 		{name: "standard auto, custom empty returns auto", custom: "", standard: ptrString("auto"), want: "auto"},
-		{name: "custom set, standard nil returns custom", custom: "turbo2", standard: nil, want: "turbo2"},
-		{name: "custom set, standard set returns custom (custom wins)", custom: "turbo2", standard: ptrString("fp8_e5m2"), want: "turbo2"},
-		{name: "custom set, standard auto returns custom", custom: "turbo2", standard: ptrString("auto"), want: "turbo2"},
+		{name: "custom set, standard nil returns custom", custom: "turboquant_3bit_nc", standard: nil, want: "turboquant_3bit_nc"},
+		{name: "custom set, standard set returns custom (custom wins)", custom: "turboquant_3bit_nc", standard: ptrString("fp8_e5m2"), want: "turboquant_3bit_nc"},
+		{name: "custom set, standard auto returns custom", custom: "turboquant_3bit_nc", standard: ptrString("auto"), want: "turboquant_3bit_nc"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

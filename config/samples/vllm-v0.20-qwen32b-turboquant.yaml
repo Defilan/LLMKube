@@ -1,0 +1,67 @@
+# Reference manifest for vLLM v0.20.0 with a TurboQuant KV cache.
+# vLLM v0.20.0 is the first release with TurboQuant (vLLM PR #38479). It adds
+# four --kv-cache-dtype values: turboquant_k8v4, turboquant_4bit_nc,
+# turboquant_k3v4_nc and turboquant_3bit_nc. Earlier images refuse them and
+# fail to start. LLMKube does not validate the kvCacheCustomDtype string, and
+# has not run this manifest end to end.
+#
+# Why this manifest exists: the turboquant_* values are not in the standard
+# kvCacheDtype enum (auto/fp8_e5m2/fp8_e4m3/fp8/float16/bfloat16). The
+# kvCacheCustomDtype escape hatch passes the value straight through to vLLM's
+# --kv-cache-dtype flag without LLMKube CRD validation. Mirrors the
+# llama.cpp-side cacheTypeCustomK/V pattern.
+#
+# Apply:
+#   kubectl apply -f config/samples/vllm-v0.20-qwen32b-turboquant.yaml
+#
+# Verify the spawned vLLM process picked up the flag:
+#   kubectl get pod -l app.kubernetes.io/instance=vllm-qwen32b-turboquant \
+#     -o jsonpath='{.items[0].spec.containers[0].args}' | tr ' ' '\n' | grep -A1 cache-dtype
+---
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: Model
+metadata:
+  name: qwen32b-instruct
+  namespace: default
+spec:
+  source: "Qwen/Qwen2.5-32B-Instruct"
+  format: safetensors
+  hardware:
+    accelerator: cuda
+    gpu:
+      enabled: true
+      count: 2
+      vendor: nvidia
+---
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: InferenceService
+metadata:
+  name: vllm-qwen32b-turboquant
+  namespace: default
+spec:
+  modelRef: qwen32b-instruct
+  runtime: vllm
+  image: vllm/vllm-openai:v0.20.0
+  skipModelInit: true
+  vllmConfig:
+    tensorParallelSize: 2
+    maxModelLen: 131072
+    dtype: bfloat16
+    # turboquant_3bit_nc: 3-bit keys and values, the most compression of the
+    # four (about 4.9x vs a 16-bit cache in vLLM PR #38479's table).
+    # turboquant_k8v4 keeps fp8 keys and costs less accuracy (about 2.6x).
+    # Compare with llama.cpp's turbo3/turbo4 on the Metal side (see
+    # docs/contributors/turboquant.md for cross-runtime context).
+    kvCacheCustomDtype: turboquant_3bit_nc
+    enablePrefixCaching: true
+    enableChunkedPrefill: true
+    hfTokenSecretRef:
+      name: hf-token
+      key: HF_TOKEN
+  endpoint:
+    port: 8000
+    type: ClusterIP
+  resources:
+    gpu: 2
+    cpu: "4"
+    memory: "16Gi"
