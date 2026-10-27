@@ -111,13 +111,25 @@ func SetupInferenceServiceQuotaWebhookWithManager(mgr ctrl.Manager, opts Inferen
 // ValidateCreate validates an InferenceService on creation.
 func (v *InferenceServiceQuotaValidator) ValidateCreate(ctx context.Context, isvc *inferencev1alpha1.InferenceService) (admission.Warnings, error) {
 	log.FromContext(ctx).V(1).Info("validating InferenceService create against GPUQuota", "name", isvc.Name, "namespace", isvc.Namespace)
-	return nil, v.validate(ctx, isvc)
+	return multiNodeAutoscalingWarnings(isvc), v.validate(ctx, isvc)
 }
 
 // ValidateUpdate validates an InferenceService on update.
 func (v *InferenceServiceQuotaValidator) ValidateUpdate(ctx context.Context, oldISvc, isvc *inferencev1alpha1.InferenceService) (admission.Warnings, error) {
 	log.FromContext(ctx).V(1).Info("validating InferenceService update against GPUQuota", "name", isvc.Name, "namespace", isvc.Namespace)
-	return nil, v.validate(ctx, isvc)
+	return multiNodeAutoscalingWarnings(isvc), v.validate(ctx, isvc)
+}
+
+// multiNodeAutoscalingWarnings warns, without rejecting, when spec.autoscaling
+// is set on a spec.multiNode service: the reconciler creates no HPA for it
+// (#2094). A rejection would strand existing objects that already carry both
+// fields, since every later update would fail admission. Pure (isvc.Spec only).
+func multiNodeAutoscalingWarnings(isvc *inferencev1alpha1.InferenceService) admission.Warnings {
+	if isvc.Spec.MultiNode == nil || isvc.Spec.Autoscaling == nil {
+		return nil
+	}
+	return admission.Warnings{"spec.autoscaling has no effect with spec.multiNode: no HorizontalPodAutoscaler is created for a " +
+		"multiNode group, and the AutoscalingReady condition reports UnsupportedForMultiNode; remove spec.autoscaling"}
 }
 
 // ValidateDelete is a no-op: deleting an InferenceService is always allowed.

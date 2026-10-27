@@ -52,8 +52,10 @@ const (
 	// it stops the sequence before reconcileHPA runs),
 	// False/DeploymentNameTaken (the Deployment-name refusal removed or
 	// cannot provision the HPA), False/HPAStateUnknown (the HPA could not be
-	// read), and absent when there is no HPA to report on (autoscaling not
-	// configured, the service suspended, or a Metal workload).
+	// read), False/UnsupportedForMultiNode (spec.autoscaling on a
+	// spec.multiNode service, suspended or not), and absent when there is no
+	// HPA to report on (autoscaling not configured, the service suspended, or
+	// a Metal workload).
 	ConditionAutoscalingReady = "AutoscalingReady"
 
 	// ReasonHPAManaged is set when AutoscalingReady=True: the HPA was created
@@ -70,6 +72,11 @@ const (
 	// name-taken Deployment), so the previous state cannot be verified or
 	// corrected on this pass. The bounded requeue retries the read.
 	ReasonHPAStateUnknown = "HPAStateUnknown"
+
+	// ReasonUnsupportedForMultiNode is set when AutoscalingReady=False
+	// because spec.autoscaling is set on a spec.multiNode service: the
+	// reconciler creates no HPA for it and deletes one it created earlier.
+	ReasonUnsupportedForMultiNode = "UnsupportedForMultiNode"
 )
 
 // hpaNameTakenError reports an HPA whose generated name is held by an
@@ -172,9 +179,66 @@ func (r *InferenceServiceReconciler) reportHPANameTaken(isvc *inferencev1alpha1.
 	}
 }
 
+// multiNodeAutoscalingUnsupportedMessage is the AutoscalingReady message and
+// the Warning event for spec.autoscaling on a spec.multiNode service.
+const multiNodeAutoscalingUnsupportedMessage = "spec.autoscaling is not supported with spec.multiNode: the group is one fixed set of member pods " +
+	"with no Deployment to scale, so no HorizontalPodAutoscaler is created and one this service created earlier is deleted; " +
+	"remove spec.autoscaling to clear this condition"
+
+// reconcileMultiNodeHPA is the HPA step for a spec.multiNode service, in
+// place of reconcileHPA. Autoscaling is unsupported there: the HPA
+// reconcileHPA builds targets apps/v1 Deployment <name>, which a multiNode
+// service never runs, so the target is either missing or a foreign
+// Deployment holding the name, which the HPA would then scale (#2094). No HPA
+// is created; one this service controls (left from a single-node spec, or
+// created by an operator without this gate) is deleted; one it does not
+// control is never touched, since a multiNode service never wants the name.
+//
+// It runs at the top of the multiNode path, before the group's early
+// returns, so none of them can leave a stale HPA in place, and reconcileHPA
+// returns early for multiNode, so no later step recreates what this one
+// deleted. The decision depends only on the spec, so there is no requeue:
+// editing spec.multiNode or spec.autoscaling is itself the event that
+// reconciles again.
+func (r *InferenceServiceReconciler) reconcileMultiNodeHPA(ctx context.Context, isvc *inferencev1alpha1.InferenceService) error {
+	existing := &autoscalingv2.HorizontalPodAutoscaler{}
+	err := r.Get(ctx, types.NamespacedName{Name: isvc.Name, Namespace: isvc.Namespace}, existing)
+	switch {
+	case apierrors.IsNotFound(err):
+	case err != nil:
+		return fmt.Errorf("failed to get HPA: %w", err)
+	case metav1.IsControlledBy(existing, isvc):
+		logf.FromContext(ctx).Info("multiNode: deleting the HPA this service owns; autoscaling is not supported for multiNode", "name", existing.Name)
+		if err := r.Delete(ctx, existing); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete HPA: %w", err)
+		}
+	}
+
+	if isvc.Spec.Autoscaling == nil {
+		removeAutoscalingReadyCondition(isvc)
+		return nil
+	}
+	prev := meta.FindStatusCondition(isvc.Status.Conditions, ConditionAutoscalingReady)
+	transitioned := prev == nil || prev.Reason != ReasonUnsupportedForMultiNode
+	meta.SetStatusCondition(&isvc.Status.Conditions, metav1.Condition{
+		Type:               ConditionAutoscalingReady,
+		Status:             metav1.ConditionFalse,
+		ObservedGeneration: isvc.Generation,
+		Reason:             ReasonUnsupportedForMultiNode,
+		Message:            multiNodeAutoscalingUnsupportedMessage,
+	})
+	// The event fires before the status write, so "once per episode" assumes
+	// that write persisted, the same caveat as the name-taken refusals.
+	if transitioned && r.Recorder != nil {
+		r.Recorder.Eventf(isvc, nil, corev1.EventTypeWarning, ReasonUnsupportedForMultiNode, "Reconcile", "%s", multiNodeAutoscalingUnsupportedMessage)
+	}
+	return nil
+}
+
 // HorizontalPodAutoscaler lifecycle. Runs as part of the main reconcile when
 // spec.autoscaling is set; removes the HPA when it is cleared. Metal
 // accelerator workloads skip HPA entirely since they run outside a Deployment.
+// A multiNode service is handled by reconcileMultiNodeHPA instead.
 // Metric selection falls through to the configured runtime's DefaultHPAMetric
 // when the CRD does not supply an explicit metrics list.
 
@@ -189,6 +253,12 @@ func (r *InferenceServiceReconciler) reconcileHPA(
 	deploymentName string,
 	isMetal bool,
 ) (time.Duration, error) {
+	// reconcileMultiNodeHPA owns the HPA of a multiNode service, earlier in
+	// the pass; acting here too would recreate what it deleted (#2094).
+	if isvc.Spec.MultiNode != nil {
+		return 0, nil
+	}
+
 	logger := logf.FromContext(ctx)
 	hpaName := types.NamespacedName{
 		Name:      isvc.Name,

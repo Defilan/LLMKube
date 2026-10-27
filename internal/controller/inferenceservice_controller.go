@@ -724,8 +724,8 @@ func clearDeploymentNameTaken(isvc *inferencev1alpha1.InferenceService) {
 // HPAs at this name operator-owned or refused, never adopted) and report the
 // removal on AutoscalingReady=False; a foreign HPA is left alone and reported
 // as HPANameTaken, since reconcileHPA cannot report it itself. The multiNode
-// path never reaches this helper (it runs no Deployment); its own HPA-target
-// gap is tracked in #2094.
+// path never reaches this helper (it runs no Deployment) and gets no HPA at
+// all: reconcileMultiNodeHPA deletes one it owns (#2094).
 func (r *InferenceServiceReconciler) refuseDeploymentNameTaken(ctx context.Context, isvc *inferencev1alpha1.InferenceService, nameTakenPreviously bool, modelReady bool, desiredReplicas int32, taken error) (*ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 	// The event fires before the status write, so "once per episode" assumes
@@ -1801,6 +1801,14 @@ func (r *InferenceServiceReconciler) reconcileWorkload(
 	// example to CUDA) the "<isvc>-relay" Deployment would otherwise linger.
 	if !isMetal {
 		if err := r.teardownRelay(ctx, isvc); err != nil {
+			return nil, replicaCounts{}, nil, nil, err
+		}
+	}
+	// A multiNode service gets no HPA (#2094). Settled before the prefetch
+	// hold and the group's own early returns, so no stop in the sequence
+	// leaves an owned HPA free to scale whatever holds the Deployment name.
+	if isvc.Spec.MultiNode != nil {
+		if err := r.reconcileMultiNodeHPA(ctx, isvc); err != nil {
 			return nil, replicaCounts{}, nil, nil, err
 		}
 	}

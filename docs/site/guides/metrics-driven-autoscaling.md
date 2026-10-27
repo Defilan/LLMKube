@@ -84,6 +84,7 @@ The managed HPA has the same name as the `InferenceService`
 | `False` | `HPANameTaken` | An HPA the controller did not create already has that name. The controller leaves it alone (no overwrite, no delete), emits a Warning event once, and rechecks about every 2 minutes. This reason also appears while a foreign Deployment refusal is in flight, because the stopped sequence cannot let the HPA reconciler report it itself. See [the pitfall below](#an-hpa-with-the-services-name-already-exists). |
 | `False` | `DeploymentNameTaken` | A foreign Deployment holds the generated name, so the controller refused to provision the service's workload and removed the HPA it owns so the HPA cannot scale the foreign object (also while the service is suspended, where the HPA would have been removed anyway). The HPA (and this condition back to `True`) return when the name is free. See [the name-taken runbook](https://github.com/defilantech/LLMKube/blob/main/docs/operations/runbooks/inferenceservice-name-taken-deployment.md). |
 | `False` | `HPAStateUnknown` | The controller could not read the HPA while refusing a foreign Deployment at the generated name; the reconcile retries in about 2 minutes. |
+| `False` | `UnsupportedForMultiNode` | The service sets `spec.multiNode`, which autoscaling does not support (suspended or not). The controller creates no HPA, deletes one it created earlier (for example before the service switched to `multiNode`), and leaves an HPA it did not create alone. It emits a Warning event once and does not recheck on a timer; remove `spec.autoscaling` to clear the condition. See [multiNode services](#multinode-services-are-not-autoscaled). |
 | absent | | Nothing to report: `spec.autoscaling` is not set, the service is suspended, or it is a Metal workload, and no Deployment-name refusal is in flight. |
 
 ```bash
@@ -663,6 +664,19 @@ This is the HPA-side refusal. A Deployment holding the generated name is
 a separate refusal (`DeploymentNameTaken`) that stops the workload
 provisioning itself; it is covered in
 [the name-taken runbook](https://github.com/defilantech/LLMKube/blob/main/docs/operations/runbooks/inferenceservice-name-taken-deployment.md).
+
+### multiNode services are not autoscaled
+
+A `spec.multiNode` service runs one fixed group of member pods and no
+Deployment, so there is nothing for an HPA to scale, and `replicas` must be
+1 or unset. If `spec.autoscaling` is also set, the controller ignores it:
+it creates no HPA, deletes the HPA it created for the service earlier, and
+reports `AutoscalingReady=False` with reason `UnsupportedForMultiNode`. The
+service itself still reconciles and serves; the condition never changes its
+phase. An HPA at the service's name that the controller did not create is
+left alone. When the GPUQuota admission webhook is enabled
+(`multitenancy.enabled`), `kubectl apply` of such a spec also prints a
+warning. Remove `spec.autoscaling` from multiNode services.
 
 ### HPA cannot read the metric
 

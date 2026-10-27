@@ -495,6 +495,8 @@ type InferenceServiceSpec struct {
 	// inference Deployment. Requires Prometheus Adapter for custom metrics.
 	// Mutually exclusive with manual replica management: when autoscaling is enabled,
 	// the Replicas field serves as the initial replica count only.
+	// Not supported with multiNode: a multiNode service gets no HPA, and the
+	// AutoscalingReady condition reports UnsupportedForMultiNode.
 	// +optional
 	Autoscaling *AutoscalingSpec `json:"autoscaling,omitempty"`
 
