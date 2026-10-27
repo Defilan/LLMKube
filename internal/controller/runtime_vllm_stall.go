@@ -63,7 +63,10 @@ var vllmStallSignals = stallSignals{
 // /metrics server. The template must contain no bare % byte, so fmt.Sprintf
 // stays safe. The LLMKUBE_STALL_STATE_FILE env var lets the tests point the
 // state file at a temp dir; production probes use the /tmp default baked
-// into the script.
+// into the script. LLMKUBE_STALL_NOW likewise pins the clock (epoch seconds)
+// for the tests, so a verdict about the window never depends on how long a
+// probe took to start; production probes read the wall clock, and so does a
+// probe whose override is not a finite number (#2262).
 //
 // Behavior:
 //   - metrics unreachable: exit 1. This probe replaced the /health liveness,
@@ -93,7 +96,7 @@ var vllmStallSignals = stallSignals{
 // The parser mirrors parsePrometheusGaugeSum exactly, NaN included:
 // float("nan") parses and every comparison against it is false, so a NaN
 // value reads as flat.
-const stallScript = `import json, os, sys, tempfile, time, urllib.request
+const stallScript = `import json, math, os, sys, tempfile, time, urllib.request
 
 METRICS_URL = "http://%[1]s:%[2]d/metrics"
 WINDOW = %[3]d
@@ -179,6 +182,12 @@ if missing:
     sys.exit(0)
 
 now = time.time()
+try:
+    pinned = float(os.environ.get("LLMKUBE_STALL_NOW", ""))
+    if math.isfinite(pinned):
+        now = pinned
+except ValueError:
+    pass
 current = {name: values[name] for name in COUNTERS + GAUGES if found[name]}
 if not any(found[name] and values[name] > 0 for name in BUSY):
     write_state(current, now)

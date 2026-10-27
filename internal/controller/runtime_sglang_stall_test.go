@@ -60,7 +60,7 @@ func TestSGLangStallProbeIdleNeverFails(t *testing.T) {
 	if code := runSGLangStallProbe(t, port, dir); code != 0 {
 		t.Fatalf("first idle probe = exit %d, want 0", code)
 	}
-	time.Sleep(2 * time.Second)
+	advanceStallClock(t, dir, 2*time.Second)
 	if code := runSGLangStallProbe(t, port, dir); code != 0 {
 		t.Fatalf("idle probe after a long quiet period = exit %d, want 0", code)
 	}
@@ -77,7 +77,7 @@ func TestSGLangStallProbeLongPrefillDoesNotFail(t *testing.T) {
 		t.Fatalf("first probe = exit %d, want 0", code)
 	}
 	for i := 1; i <= 5; i++ {
-		time.Sleep(450 * time.Millisecond)
+		advanceStallClock(t, dir, 450*time.Millisecond)
 		set(sglangMetricsBody(0, float64(32768+16384*i), float64(16384*(i+1)), 10, 4000))
 		if code := runSGLangStallProbe(t, port, dir); code != 0 {
 			t.Fatalf("probe during a long prefill (chunk %d) = exit %d, want 0", i, code)
@@ -95,7 +95,7 @@ func TestSGLangStallProbeHeartbeatAloneKeepsGreen(t *testing.T) {
 		t.Fatalf("first probe = exit %d, want 0", code)
 	}
 	for i := 1; i <= 5; i++ {
-		time.Sleep(450 * time.Millisecond)
+		advanceStallClock(t, dir, 450*time.Millisecond)
 		set(sglangMetricsBody(1, 40000, float64(100+120*i), 10, 4000))
 		if code := runSGLangStallProbe(t, port, dir); code != 0 {
 			t.Fatalf("probe with only the heartbeat advancing = exit %d, want 0", code)
@@ -112,7 +112,7 @@ func TestSGLangStallProbeWedgeMidPrefillFails(t *testing.T) {
 	if code := runSGLangStallProbe(t, port, dir); code != 0 {
 		t.Fatalf("first probe = exit %d, want 0", code)
 	}
-	time.Sleep(2 * time.Second)
+	advanceStallClock(t, dir, 2*time.Second)
 	if code := runSGLangStallProbe(t, port, dir); code == 0 {
 		t.Fatalf("probe with KV in use and every signal flat past the window = exit 0, want non-zero (wedge mid-prefill)")
 	}
@@ -126,11 +126,11 @@ func TestSGLangStallProbeWedgeMidDecodeFails(t *testing.T) {
 	if code := runSGLangStallProbe(t, port, dir); code != 0 {
 		t.Fatalf("first probe = exit %d, want 0", code)
 	}
-	time.Sleep(400 * time.Millisecond)
+	advanceStallClock(t, dir, 400*time.Millisecond)
 	if code := runSGLangStallProbe(t, port, dir); code != 0 {
 		t.Fatalf("frozen probe inside the window = exit %d, want 0", code)
 	}
-	time.Sleep(2 * time.Second)
+	advanceStallClock(t, dir, 2*time.Second)
 	if code := runSGLangStallProbe(t, port, dir); code == 0 {
 		t.Fatalf("frozen probe past the window = exit 0, want non-zero")
 	}
@@ -146,7 +146,7 @@ func TestSGLangStallProbeMissingHeartbeatFailsOpen(t *testing.T) {
 	if code := runSGLangStallProbe(t, port, dir); code != 0 {
 		t.Fatalf("first probe = exit %d, want 0", code)
 	}
-	time.Sleep(2 * time.Second)
+	advanceStallClock(t, dir, 2*time.Second)
 	if code := runSGLangStallProbe(t, port, dir); code != 0 {
 		t.Fatalf("frozen probe without the heartbeat = exit %d, want 0 (fail open)", code)
 	}

@@ -36,12 +36,47 @@ import (
 // assertion below pins that the script still reads this exact name.
 const stallStateFileEnv = "LLMKUBE_STALL_STATE_FILE"
 
+// stallNowEnv is the env var that pins the script's clock. The detector
+// tests run every probe at a fake time kept beside the state file, so "inside"
+// and "past" the window are exact offsets rather than sleeps that a loaded
+// machine can stretch (#2262).
+const stallNowEnv = "LLMKUBE_STALL_NOW"
+
+// stallClockStart is the fake clock's first reading, in epoch seconds.
+const stallClockStart = 1_800_000_000.0
+
+func stallClockPath(stateDir string) string { return stateDir + "/clock" }
+
+func readStallClock(t *testing.T, stateDir string) float64 {
+	t.Helper()
+	raw, err := os.ReadFile(stallClockPath(stateDir))
+	if os.IsNotExist(err) {
+		return stallClockStart
+	}
+	if err != nil {
+		t.Fatalf("read the fake stall clock: %v", err)
+	}
+	now, err := strconv.ParseFloat(string(raw), 64)
+	if err != nil {
+		t.Fatalf("parse the fake stall clock %q: %v", raw, err)
+	}
+	return now
+}
+
+// advanceStallClock moves the fake clock the next probe in stateDir runs at.
+func advanceStallClock(t *testing.T, stateDir string, d time.Duration) {
+	t.Helper()
+	now := readStallClock(t, stateDir) + d.Seconds()
+	if err := os.WriteFile(stallClockPath(stateDir), []byte(strconv.FormatFloat(now, 'f', -1, 64)), 0o600); err != nil {
+		t.Fatalf("advance the fake stall clock: %v", err)
+	}
+}
+
 // runStallProbe executes the exact bytes the stall-detecting liveness probe
 // would run (stallProbeCommand) against the given port, with the state file
 // pointed inside stateDir. It returns the process exit code. The window is
-// pinned to 1s so the timing scenarios stay fast; sub-window sleeps sit well
-// under it and the frozen-case sleeps double it, so CI jitter cannot flip a
-// verdict.
+// pinned to 1s, and the scenarios move the fake clock past it or keep it
+// inside it.
 func runStallProbe(t *testing.T, port int32, stateDir string) int {
 	t.Helper()
 	return runStallProbeCmd(t, stallProbeCommand(port, 1), stateDir)
@@ -55,7 +90,8 @@ func runStallProbeCmd(t *testing.T, cmdParts []string, stateDir string) int {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, cmdParts[0], cmdParts[1:]...)
 	cmd.Env = append(os.Environ(),
-		stallStateFileEnv+"="+stateDir+"/state.json")
+		stallStateFileEnv+"="+stateDir+"/state.json",
+		stallNowEnv+"="+strconv.FormatFloat(readStallClock(t, stateDir), 'f', -1, 64))
 
 	err := cmd.Run()
 	code := 0
@@ -132,7 +168,7 @@ func TestStallProbeIdleNeverFails(t *testing.T) {
 	if code := runStallProbe(t, port, stateDir); code != 0 {
 		t.Fatalf("first idle probe = exit %d, want 0", code)
 	}
-	time.Sleep(1500 * time.Millisecond)
+	advanceStallClock(t, stateDir, 1500*time.Millisecond)
 	if code := runStallProbe(t, port, stateDir); code != 0 {
 		t.Fatalf("idle probe after a long quiet period = exit %d, want 0", code)
 	}
@@ -155,7 +191,7 @@ func TestStallProbeSteadyProgressNeverFails(t *testing.T) {
 	}
 	set(progress)
 
-	time.Sleep(2 * time.Second)
+	advanceStallClock(t, stateDir, 2*time.Second)
 	if code := runStallProbe(t, port, stateDir); code != 0 {
 		t.Fatalf("probe with advancing generation = exit %d, want 0", code)
 	}
@@ -181,11 +217,11 @@ func TestStallProbeFrozenRunningFailsAfterWindow(t *testing.T) {
 	}
 	// Still flat but inside the window: the engine must not be declared
 	// stalled yet.
-	time.Sleep(200 * time.Millisecond)
+	advanceStallClock(t, stateDir, 200*time.Millisecond)
 	if code := runStallProbe(t, port, stateDir); code != 0 {
 		t.Fatalf("frozen probe inside the window = exit %d, want 0", code)
 	}
-	time.Sleep(2 * time.Second)
+	advanceStallClock(t, stateDir, 2*time.Second)
 	if code := runStallProbe(t, port, stateDir); code == 0 {
 		t.Fatal("frozen probe after the window = exit 0, want non-zero")
 	}
@@ -207,7 +243,7 @@ func TestStallProbeLongPrefillDoesNotFail(t *testing.T) {
 		`vllm:kv_cache_usage_perc{model_name="q"} 0.013`,
 		`vllm:kv_cache_usage_perc{model_name="q"} 0.057`, 1))
 
-	time.Sleep(2 * time.Second)
+	advanceStallClock(t, stateDir, 2*time.Second)
 	if code := runStallProbe(t, port, stateDir); code != 0 {
 		t.Fatalf("probe during a long prefill (kv climbing, counters flat) = exit %d, want 0", code)
 	}
@@ -228,7 +264,7 @@ func TestStallProbeKvDropCountsAsProgress(t *testing.T) {
 	}
 	set(stallProbeKvBody)
 
-	time.Sleep(2 * time.Second)
+	advanceStallClock(t, stateDir, 2*time.Second)
 	if code := runStallProbe(t, port, stateDir); code != 0 {
 		t.Fatalf("probe with kv usage dropping = exit %d, want 0", code)
 	}
@@ -245,11 +281,11 @@ func TestStallProbeFrozenKvFailsAfterWindow(t *testing.T) {
 	if code := runStallProbe(t, port, stateDir); code != 0 {
 		t.Fatalf("first frozen probe with kv = exit %d, want 0 (baseline write)", code)
 	}
-	time.Sleep(200 * time.Millisecond)
+	advanceStallClock(t, stateDir, 200*time.Millisecond)
 	if code := runStallProbe(t, port, stateDir); code != 0 {
 		t.Fatalf("frozen probe with kv inside the window = exit %d, want 0", code)
 	}
-	time.Sleep(2 * time.Second)
+	advanceStallClock(t, stateDir, 2*time.Second)
 	if code := runStallProbe(t, port, stateDir); code == 0 {
 		t.Fatal("frozen probe with kv after the window = exit 0, want non-zero")
 	}
@@ -271,11 +307,11 @@ func TestStallProbeCounterResetRestartsTheWindow(t *testing.T) {
 		`vllm:generation_tokens_total{model_name="q"} 100.0`,
 		`vllm:generation_tokens_total{model_name="q"} 5.0`, 1))
 
-	time.Sleep(2 * time.Second)
+	advanceStallClock(t, stateDir, 2*time.Second)
 	if code := runStallProbe(t, port, stateDir); code != 0 {
 		t.Fatalf("probe right after a counter reset = exit %d, want 0 (fresh baseline)", code)
 	}
-	time.Sleep(2 * time.Second)
+	advanceStallClock(t, stateDir, 2*time.Second)
 	if code := runStallProbe(t, port, stateDir); code == 0 {
 		t.Fatal("probe after the reset with everything flat = exit 0, want non-zero (reset must not disable the detector)")
 	}
@@ -330,7 +366,7 @@ func TestStallProbeMissingMetricsFailsOpen(t *testing.T) {
 		if code := runStallProbe(t, port, stateDir); code != 0 {
 			t.Fatalf("partial-metrics baseline probe = exit %d, want 0", code)
 		}
-		time.Sleep(2 * time.Second)
+		advanceStallClock(t, stateDir, 2*time.Second)
 		if code := runStallProbe(t, port, stateDir); code != 0 {
 			t.Fatalf("probe with a running engine and a missing counter = exit %d, want 0 (fail open)", code)
 		}
@@ -359,7 +395,7 @@ func TestStallProbeSumsLabeledSeries(t *testing.T) {
 		`vllm:generation_tokens_total{model_name="b"} 20.0`,
 		`vllm:generation_tokens_total{model_name="b"} 21.0`, 1))
 
-	time.Sleep(2 * time.Second)
+	advanceStallClock(t, stateDir, 2*time.Second)
 	if code := runStallProbe(t, port, stateDir); code != 0 {
 		t.Fatalf("probe with progress on the second labeled series = exit %d, want 0 (summed counters must be tracked)", code)
 	}
@@ -380,5 +416,55 @@ func TestStallProbeRenderedScriptIsSprintfSafe(t *testing.T) {
 	}
 	if !strings.Contains(rendered, stallStateFileEnv) {
 		t.Errorf("stall script no longer reads %s; the detector tests would silently share one state file", stallStateFileEnv)
+	}
+	if !strings.Contains(rendered, stallNowEnv) {
+		t.Errorf("stall script no longer reads %s; the detector tests would run on the wall clock again", stallNowEnv)
+	}
+}
+
+// TestStallProbeDefaultsToTheWallClock: production probes set no clock
+// override, so the baseline they record must be the wall clock in epoch
+// seconds. Each probe exec is a fresh process, so anything else (a monotonic
+// clock, zero) would make the window meaningless between probes.
+// An override that is not a finite number falls back to the wall clock too:
+// garbage must not crash every probe into a restart loop, and nan or inf must
+// not switch the window off.
+func TestStallProbeDefaultsToTheWallClock(t *testing.T) {
+	for _, override := range []string{"", "garbage", "nan", "inf"} {
+		t.Run("override="+override, func(t *testing.T) {
+			assertStallBaselineIsWallClock(t, override)
+		})
+	}
+}
+
+func assertStallBaselineIsWallClock(t *testing.T, override string) {
+	t.Helper()
+	port, _ := metricsStub(t, stallProbeIdleBody)
+	stateDir := t.TempDir()
+	cmdParts := stallProbeCommand(port, 1)
+	cmd := exec.Command(cmdParts[0], cmdParts[1:]...)
+	cmd.Env = append(os.Environ(), stallStateFileEnv+"="+stateDir+"/state.json")
+	if override != "" {
+		cmd.Env = append(cmd.Env, stallNowEnv+"="+override)
+	}
+	before := time.Now()
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("idle probe with clock override %q: %v\n%s", override, err, out)
+	}
+	after := time.Now()
+
+	raw, err := os.ReadFile(stateDir + "/state.json")
+	if err != nil {
+		t.Fatalf("idle probe wrote no baseline: %v", err)
+	}
+	var state struct {
+		TS float64 `json:"ts"`
+	}
+	if err := json.Unmarshal(raw, &state); err != nil {
+		t.Fatalf("parse the baseline %q: %v", raw, err)
+	}
+	recorded := time.UnixMicro(int64(state.TS * 1e6))
+	if recorded.Before(before.Add(-time.Second)) || recorded.After(after.Add(time.Second)) {
+		t.Fatalf("baseline timestamp = %v, want the wall clock between %v and %v", recorded, before, after)
 	}
 }
