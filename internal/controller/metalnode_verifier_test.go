@@ -255,14 +255,14 @@ func checkVerifierContainerSecurity(t *testing.T, sc *corev1.SecurityContext) {
 	t.Helper()
 	want := &corev1.SecurityContext{
 		RunAsNonRoot:             boolPtr(true),
-		RunAsUser:                int64Ptr(initContainerUID),
+		RunAsUser:                int64Ptr(DefaultInitContainerUser),
 		ReadOnlyRootFilesystem:   boolPtr(true),
 		AllowPrivilegeEscalation: boolPtr(false),
 		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 	}
 	if !reflect.DeepEqual(sc, want) {
 		t.Errorf("container securityContext %+v, want non-root uid %d, read-only root, no escalation, drop ALL and nothing else",
-			sc, initContainerUID)
+			sc, DefaultInitContainerUser)
 	}
 }
 

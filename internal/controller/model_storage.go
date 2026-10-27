@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"strings"
 
@@ -90,6 +91,49 @@ func ValidateModelCachePrep(prep string) error {
 		return nil
 	}
 	return fmt.Errorf("unknown cache prep policy %q: must be %q or %q", prep, ModelCachePrepAlways, ModelCachePrepNever)
+}
+
+// DefaultInitContainerUser is the numeric uid under which the default init
+// image runs: curlimages/curl:8.18.0 declares the named user curl_user, uid
+// 101, gid 102 (`docker run --rm curlimages/curl:8.18.0 id`). It is the default
+// of --init-container-user, which an operator mirroring a different
+// --init-container-image sets to that image's uid. The operator cannot read an
+// image's user without a registry call, so the fact is a flag, not a guess
+// (#2204).
+const DefaultInitContainerUser int64 = 101
+
+// ValidateInitContainerUser rejects a uid the downloader cannot run as. The
+// range is the one the API server accepts for runAsUser. 0 is rejected too: the
+// value is also the runAsUser of the prefetch Job's containers under
+// --model-cache-prep=never, next to runAsNonRoot, where uid 0 is refused by
+// the kubelet at container start; and a downloader that runs as root needs no
+// prep chown to write a root-owned cache root in the first place.
+func ValidateInitContainerUser(uid int64) error {
+	if uid < 1 || uid > math.MaxInt32 {
+		return fmt.Errorf("init container user %d out of range: must be a non-root uid between 1 and %d", uid, math.MaxInt32)
+	}
+	return nil
+}
+
+// resolveInitContainerUser maps an unset reconciler field to
+// DefaultInitContainerUser, so a reconciler built without it (a test literal,
+// or any embedding that constructs one by hand) renders the flag's default.
+func resolveInitContainerUser(uid int64) int64 {
+	if uid <= 0 {
+		return DefaultInitContainerUser
+	}
+	return uid
+}
+
+// downloaderUID is the uid the model-downloader in isvc's pod runs as: the
+// runAsUser initContainerSecurityContext copies from the InferenceService's
+// podSecurityContext when it sets one, otherwise the init image's own user
+// (--init-container-user), since the downloader sets none of its own.
+func downloaderUID(isvc *inferencev1alpha1.InferenceService, initContainerUser int64) int64 {
+	if sc := initContainerSecurityContext(isvc); sc.RunAsUser != nil {
+		return *sc.RunAsUser
+	}
+	return initContainerUser
 }
 
 // cachePrepIncluded reports whether the prep container belongs in a cache-backed
@@ -1031,11 +1075,17 @@ func modelStagingErrorInitContainer(err error, model *inferencev1alpha1.Model, i
 //
 // When resolvedFSGroup > 0 the prep chowns to 0:<fsGroup> and grants group
 // rw on existing and future files/dirs (g+rwX). When resolvedFSGroup <= 0
-// (fsGroup disabled, e.g. OpenShift) the prep chowns to 100:100 and sets 770,
-// so only a uid-100 downloader can write: the default image runs as uid 101,
-// so on that profile the cache root is not writable by it. Left as it is
-// here because changing the owner is a behavior change with an upgrade
-// consequence (files already owned 100:100) and is tracked separately.
+// (fsGroup disabled, e.g. the OpenShift preset) there is no group the pod is
+// known to share, so the prep chowns to <ownerUID>:0 and sets 770, where
+// ownerUID is the uid the downloader actually runs as (downloaderUID). The
+// owner bits let that downloader write. Group 0 is the group OpenShift runs
+// arbitrary uids under: a container whose uid the SCC assigns from the
+// namespace range has primary gid 0, so the group bits keep the root
+// reachable for such a downloader or serving container without the operator
+// knowing the uid. 770 keeps the mode the old 100:100 prep set, so an upgrade
+// changes only the owner of an existing cache root, and nothing outside the
+// owner and group 0 gains access. The chown is not recursive: what the
+// downloader already wrote under the root keeps its owner (#2204).
 //
 // Security: the prep runs as root (uid 0) with ALL capabilities dropped and
 // only CHOWN+FOWNER added, and is NOT privileged. Root is required, not
@@ -1053,12 +1103,12 @@ func modelStagingErrorInitContainer(err error, model *inferencev1alpha1.Model, i
 //
 // The prep reuses the configurable initContainerImage (no hardcoded busybox)
 // so air-gapped clusters that mirror initContainerImage are covered.
-func cachePrepInitContainer(initImage string, resolvedFSGroup int64) corev1.Container {
+func cachePrepInitContainer(initImage string, resolvedFSGroup, ownerUID int64) corev1.Container {
 	var cmd string
 	if resolvedFSGroup > 0 {
 		cmd = fmt.Sprintf("chown 0:%d /models && chmod g+rwX /models", resolvedFSGroup)
 	} else {
-		cmd = "chown 100:100 /models && chmod 770 /models"
+		cmd = fmt.Sprintf("chown %d:0 /models && chmod 770 /models", ownerUID)
 	}
 	return corev1.Container{
 		Name:    "model-cache-prep",
@@ -1336,7 +1386,7 @@ func applyInitContainerDiagnostics(containers []corev1.Container) {
 	}
 }
 
-func buildModelStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, namespace string, useCache bool, cacheMode string, caCertConfigMap string, initContainerImage string, defaultFSGroup int64, prep string, allowedHostPathRoots []string, hfEndpoint string) (cfg modelStorageConfig) {
+func buildModelStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, namespace string, useCache bool, cacheMode string, caCertConfigMap string, initContainerImage string, defaultFSGroup int64, prep string, initContainerUser int64, allowedHostPathRoots []string, hfEndpoint string) (cfg modelStorageConfig) {
 	// Stamp crash diagnostics on whatever the branches below return. Done
 	// once here rather than at each construction site so a future storage
 	// path cannot be added without it (#1437).
@@ -1360,7 +1410,7 @@ func buildModelStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1al
 		return buildOCIStorageConfig(model, initContainerImage)
 	}
 	if useCache {
-		return buildCachedStorageConfig(model, isvc, cacheMode, caCertConfigMap, initContainerImage, defaultFSGroup, prep, hfEndpoint)
+		return buildCachedStorageConfig(model, isvc, cacheMode, caCertConfigMap, initContainerImage, defaultFSGroup, prep, initContainerUser, hfEndpoint)
 	}
 	return buildEmptyDirStorageConfig(model, isvc, namespace, caCertConfigMap, initContainerImage, hfEndpoint)
 }
@@ -1577,7 +1627,7 @@ func invalidFileSetStorageConfig(initImage string) modelStorageConfig {
 	}
 }
 
-func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, cacheMode string, caCertConfigMap string, initContainerImage string, defaultFSGroup int64, prep string, hfEndpoint string) modelStorageConfig {
+func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, cacheMode string, caCertConfigMap string, initContainerImage string, defaultFSGroup int64, prep string, initContainerUser int64, hfEndpoint string) modelStorageConfig {
 	cacheDir := fmt.Sprintf("/models/%s", effectiveModelCacheKey(model))
 
 	// Resolve the fsGroup that the CSI will actually apply to the volume.
@@ -1585,11 +1635,12 @@ func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1a
 	// operator default (see inferPodSecurityContext in deployment_builder.go);
 	// chown'ing to the wrong GID would leave the downloader unable to write.
 	// A value <= 0 means the operator disabled fsGroup (e.g. OpenShift), so
-	// the prep must chown to the downloader's own UID instead.
+	// the prep must chown to the downloader's own UID instead (prepOwner).
 	resolvedFSGroup := defaultFSGroup
 	if isvc != nil && isvc.Spec.PodSecurityContext != nil && isvc.Spec.PodSecurityContext.FSGroup != nil {
 		resolvedFSGroup = *isvc.Spec.PodSecurityContext.FSGroup
 	}
+	prepOwner := downloaderUID(isvc, initContainerUser)
 
 	// Multi-file staging branch: when spec.files or spec.mmproj are set, use
 	// the staging plan to download all artifacts. Returns early.
@@ -1642,7 +1693,7 @@ func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1a
 
 		initContainers := []corev1.Container{}
 		if cachePrepIncluded(prep) {
-			initContainers = append(initContainers, cachePrepInitContainer(initContainerImage, resolvedFSGroup))
+			initContainers = append(initContainers, cachePrepInitContainer(initContainerImage, resolvedFSGroup, prepOwner))
 		}
 		initContainers = append(initContainers, corev1.Container{
 			Name:            "model-downloader",
@@ -1706,7 +1757,7 @@ func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1a
 
 	initContainers := []corev1.Container{}
 	if cachePrepIncluded(prep) {
-		initContainers = append(initContainers, cachePrepInitContainer(initContainerImage, resolvedFSGroup))
+		initContainers = append(initContainers, cachePrepInitContainer(initContainerImage, resolvedFSGroup, prepOwner))
 	}
 	initContainers = append(initContainers, corev1.Container{
 		Name:            "model-downloader",

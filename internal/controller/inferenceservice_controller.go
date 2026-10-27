@@ -72,6 +72,12 @@ type InferenceServiceReconciler struct {
 	// every cache-backed pod, ModelCachePrepNever omits it for storage that
 	// applies the pod fsGroup itself. Set via --model-cache-prep.
 	ModelCachePrep string
+	// InitContainerUser is the uid InitContainerImage runs as
+	// (--init-container-user, default DefaultInitContainerUser). When fsGroup
+	// is disabled and the InferenceService sets no runAsUser, the prep chowns
+	// the cache root to it, since that is the uid the downloader writes as
+	// (#2204). Zero means the default.
+	InitContainerUser int64
 	// AllowedHostPathRoots is the operator-configured allowlist of absolute
 	// path prefixes under which local (/abs and file://) model sources — and
 	// therefore the HostPathVolumeSource they generate — are permitted. Empty
@@ -159,7 +165,8 @@ func int64Ptr(v int64) *int64 { return &v }
 // FSGroup on the pod (see inferPodSecurityContext) is sufficient for the
 // standard curlimages/curl init image; explicit RunAsUser is only needed if
 // the operator overrides --init-container-image with one whose default user
-// differs from curl_user.
+// differs from curl_user. The uid this leaves the downloader running as is
+// what downloaderUID reports, and the prep chowns to it when fsGroup is off.
 func initContainerSecurityContext(isvc *inferencev1alpha1.InferenceService) *corev1.SecurityContext {
 	sc := &corev1.SecurityContext{
 		AllowPrivilegeEscalation: boolPtr(false),

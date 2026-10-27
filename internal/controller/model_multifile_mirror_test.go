@@ -106,7 +106,7 @@ func TestMultiFileInitContainer_HFMirrorRepoBase(t *testing.T) {
 		Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: "glm", Runtime: "vllm"},
 	}
 
-	cfg := buildModelStorageConfig(model, isvc, "default", true, "", "", defaultPrefetchImage, 0, ModelCachePrepAlways, nil, multiFileMirror)
+	cfg := buildModelStorageConfig(model, isvc, "default", true, "", "", defaultPrefetchImage, 0, ModelCachePrepAlways, DefaultInitContainerUser, nil, multiFileMirror)
 
 	var downloader *corev1.Container
 	for i := range cfg.initContainers {

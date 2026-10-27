@@ -442,7 +442,7 @@ func (r *InferenceServiceReconciler) servingStorage(
 		}
 		storageConfig = buildPrefetchedStorageConfig(model, effectiveCacheService(isvc, model), r.ModelCacheMode, r.InitContainerImage, staged)
 	} else {
-		storageConfig = buildModelStorageConfig(model, isvc, isvc.Namespace, useCache, r.ModelCacheMode, r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.ModelCachePrep, r.AllowedHostPathRoots, hfEndpoint)
+		storageConfig = buildModelStorageConfig(model, isvc, isvc.Namespace, useCache, r.ModelCacheMode, r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.ModelCachePrep, resolveInitContainerUser(r.InitContainerUser), r.AllowedHostPathRoots, hfEndpoint)
 	}
 	modelPath = servedModelPath(isvc, model, storageConfig)
 
@@ -454,7 +454,7 @@ func (r *InferenceServiceReconciler) servingStorage(
 	if draftModel != nil {
 		draftUseCache := modelWantsCacheVolume(draftModel, isvc, r.ModelCachePath)
 		draftStorage := buildModelStorageConfig(draftModel, isvc, isvc.Namespace, draftUseCache,
-			r.ModelCacheMode, r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.ModelCachePrep, r.AllowedHostPathRoots, draftHFEndpoint)
+			r.ModelCacheMode, r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.ModelCachePrep, resolveInitContainerUser(r.InitContainerUser), r.AllowedHostPathRoots, draftHFEndpoint)
 		// The path comes from the merge's rewritten draft config, not from
 		// draftStorage: the merge may have remounted the draft's volume to
 		// clear a collision with the target's, and -md must follow it.

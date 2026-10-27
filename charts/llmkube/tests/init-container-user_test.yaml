@@ -1,0 +1,64 @@
+suite: init-container-user operator flag
+templates:
+  - deployment.yaml
+
+tests:
+  # The default is the default init image's uid (curl_user in
+  # curlimages/curl), which is what the operator's own flag default is. With
+  # defaultFSGroup 0 the model-cache-prep chowns the cache root to it (#2204).
+  - it: renders the default init image's uid
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --init-container-user=101
+
+  - it: renders a configured uid for a mirrored init image
+    set:
+      controllerManager.initContainer.user: 1000680000
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --init-container-user=1000680000
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --init-container-user=101
+
+  # A values file decodes numbers as float64; without the int64 cast an
+  # OpenShift-range uid renders as 1.00068e+09 and the operator's flag parse
+  # fails at startup.
+  - it: renders a large uid from a values file as an integer
+    values:
+      - ./values-init-container-user-large.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --init-container-user=1000680000
+
+  # The OpenShift preset disables the default fsGroup, which is exactly where
+  # the prep uses this uid; it must still reach the operator next to it.
+  - it: renders the uid next to the OpenShift preset's disabled fsGroup
+    values:
+      - ../values-openshift.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --default-fsgroup=0
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --init-container-user=101
+
+  # The operator refuses root and negative uids at startup; the schema
+  # refuses them at install time so the release does not crash-loop.
+  - it: rejects uid 0
+    set:
+      controllerManager.initContainer.user: 0
+    asserts:
+      - failedTemplate:
+          errorPattern: "/controllerManager/initContainer/user': minimum: got 0"
+
+  - it: rejects a negative uid
+    set:
+      controllerManager.initContainer.user: -1
+    asserts:
+      - failedTemplate:
+          errorPattern: "/controllerManager/initContainer/user': minimum: got -1"

@@ -175,6 +175,12 @@ type ModelReconciler struct {
 	// policy, so the prefetch Job stages into the cache with the same
 	// ownership handling the serving pods expect (#2057).
 	ModelCachePrep string
+	// InitContainerUser is the InferenceService reconciler's
+	// --init-container-user, the uid the init image runs as: the owner the
+	// prep gives the cache root when fsGroup is disabled, and the runAsUser of
+	// the Job's containers under ModelCachePrepNever (#2204). Zero means the
+	// flag default, DefaultInitContainerUser.
+	InitContainerUser int64
 
 	// Recorder emits Warning events on the Model (a prefetch held on a
 	// missing CA ConfigMap, a prefetch skipped on an unstageable source).

@@ -118,6 +118,9 @@ spec:
         - --allowed-remote-hosts={{ join "," . }}
         {{- end }}
         - --init-container-image={{ include "llmkube.initContainerImage" . }}
+        # int64: Helm decodes values-file numbers as float64, which would render
+        # an OpenShift-range uid such as 1000680000 as 1.00068e+09.
+        - --init-container-user={{ int64 .Values.controllerManager.initContainer.user }}
         # The default value is set in values.yaml. We do NOT use `| default 102`
         # here because Go template's default treats 0 as missing, which would
         # re-replace the OpenShift preset's deliberate 0 with 102 and break

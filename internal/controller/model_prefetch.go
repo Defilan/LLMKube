@@ -77,14 +77,6 @@ import (
 // the field (tests); production wiring always sets InitContainerImage.
 const defaultPrefetchImage = "docker.io/curlimages/curl:8.18.0"
 
-// initContainerUID is the numeric uid under which the default init image runs:
-// curlimages/curl:8.18.0 declares the named user curl_user, uid 101, gid 102.
-// Under --model-cache-prep=never the prefetch containers set runAsNonRoot with
-// this uid explicitly, because the kubelet refuses runAsNonRoot on an image
-// whose USER is a name it cannot resolve
-// (pkg/kubelet/kuberuntime/security_context_others.go, verifyRunAsNonRoot).
-const initContainerUID = 101
-
 // Annotations the prefetch Job carries so a later reconcile can tell whether
 // it was built for the current spec and target.
 const (
@@ -1260,7 +1252,7 @@ func (r *ModelReconciler) buildPrefetchJob(ctx context.Context, model *inference
 		}
 	}
 	storage := buildModelStorageConfig(model, target, model.Namespace, true, ModelCacheModeShared,
-		r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.ModelCachePrep, r.AllowedHostPathRoots, hfEndpointFromSecret(ctx, r.Client, model))
+		r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.ModelCachePrep, resolveInitContainerUser(r.InitContainerUser), r.AllowedHostPathRoots, hfEndpointFromSecret(ctx, r.Client, model))
 	if len(storage.initContainers) == 0 {
 		return nil, fmt.Errorf("prefetch: source %q produced no downloader containers", model.Spec.Source)
 	}
@@ -1296,10 +1288,11 @@ func (r *ModelReconciler) buildPrefetchJob(ctx context.Context, model *inference
 			podSecurity = &corev1.PodSecurityContext{}
 		}
 		podSecurity.SeccompProfile = &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}
+		uid := resolveInitContainerUser(r.InitContainerUser)
 		for i := range initContainers {
-			initContainers[i].SecurityContext = restrictedPrefetchSecurityContext()
+			initContainers[i].SecurityContext = restrictedPrefetchSecurityContext(uid)
 		}
-		doneSecurity = restrictedPrefetchSecurityContext()
+		doneSecurity = restrictedPrefetchSecurityContext(uid)
 	}
 
 	image := r.InitContainerImage
@@ -1367,11 +1360,15 @@ func (r *ModelReconciler) buildPrefetchJob(ctx context.Context, model *inference
 // with it.
 //
 // RunAsUser is set explicitly because the default init image declares a named
-// user, and the kubelet refuses runAsNonRoot on one (verifyRunAsNonRoot).
-func restrictedPrefetchSecurityContext() *corev1.SecurityContext {
+// user, and the kubelet refuses runAsNonRoot on one whose USER is a name it
+// cannot resolve (pkg/kubelet/kuberuntime/security_context_others.go,
+// verifyRunAsNonRoot). It is the init image's own uid (--init-container-user),
+// so the Job writes the cache as the same user the serving pods' downloader
+// does, and a later serving pod can write into a directory the prefetch made.
+func restrictedPrefetchSecurityContext(uid int64) *corev1.SecurityContext {
 	return &corev1.SecurityContext{
 		RunAsNonRoot:             boolPtr(true),
-		RunAsUser:                int64Ptr(initContainerUID),
+		RunAsUser:                int64Ptr(uid),
 		AllowPrivilegeEscalation: boolPtr(false),
 		Capabilities: &corev1.Capabilities{
 			Drop: []corev1.Capability{"ALL"},

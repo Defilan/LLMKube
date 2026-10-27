@@ -1036,6 +1036,25 @@ The automatic shared-model-cache workflow is a first-class supported path, **inc
 
 The prep is the **compatibility implementation** for these backends, and the operator adds it on every cache-backed pod and prefetch Job by default (`modelCache.prep: always`). On a `File` driver kubelet has already applied the ownership and the prep only re-asserts it, so it is redundant there: set `modelCache.prep: never` to drop it (see below). It runs as **non-privileged root (uid 0)** with `ALL` capabilities dropped and only `CHOWN`+`FOWNER` added (no privilege escalation, read-only rootfs, seccomp `RuntimeDefault`). Root here is a backend-driven requirement, not an avoidable misconfiguration: chowning a root-owned mount needs `CAP_CHOWN`, the prep shells out to `chown`, and a non-root process loses its capabilities across `execve` (Kubernetes has no ambient-capability field), so the exec'd `chown` would fail `EPERM`. Root retains its capabilities across exec. (Running the prep non-root broke the shared cache on these backends in 0.8.20; reverted in 0.8.21. A future change may move the chown into a small dedicated helper that performs the syscall in its own entrypoint, which would let the prep run non-root again without the exec capability loss.)
 
+### What the prep sets the cache root to
+
+The prep changes only the mount root (`/models`), never recursively. What it sets depends on whether the pod has an `fsGroup`, resolved as the InferenceService's own `spec.podSecurityContext.fsGroup` when set, otherwise `--default-fsgroup`:
+
+| fsGroup | Prep command | Who can write the root |
+|---------|--------------|------------------------|
+| `> 0` (default `102`) | `chown 0:<fsGroup> /models && chmod g+rwX /models` | every container in the pod, through the `fsGroup` supplementary group |
+| `<= 0` (the OpenShift preset, `--default-fsgroup=0`) | `chown <uid>:0 /models && chmod 770 /models` | the downloader, as owner, and any container whose group is `0` |
+
+`<uid>` is the uid the model downloader actually runs as: the InferenceService's `spec.podSecurityContext.runAsUser` when it sets one (the downloader inherits it), otherwise `--init-container-user` (chart value `controllerManager.initContainer.user`, default `101`, `curl_user` in the default `curlimages/curl` image). The operator cannot read an image's user without a registry call, so if you mirror a different `--init-container-image`, set `--init-container-user` to the uid that image runs as (`docker run --rm <image> id`). The flag refuses `0` and negative values. Group `0` is the group OpenShift runs SCC-assigned arbitrary uids under, so a container whose uid comes from the namespace range still reaches the root through the group bits. Mode `770` grants nothing to other users.
+
+#### Upgrade note: caches prepared as `100:100` (#2204)
+
+Before this change the `fsGroup <= 0` branch ran `chown 100:100 /models && chmod 770 /models`, but the default init image runs as uid 101, so on storage that does not apply an `fsGroup` the downloader could not write the root it had just been given. On upgrade, with `fsGroup <= 0` and `modelCache.prep: always`:
+
+- A cache root previously prepared as `100:100` mode `770` is re-owned to `<uid>:0` (default `101:0`), mode `770`, on the next prep run: the next start of a cache-backed serving pod or prefetch Job. Nothing on the cache is migrated or deleted, and files and directories under the root keep their current owners.
+- Cache-backed serving pods on that profile roll once, because the prep command is part of the pod template. Installs with `fsGroup > 0` render the same pods as before and do not roll.
+- After the re-own, uid 100 and group 100 have no access to the root. Anything that relied on that owner (a pre-provisioned volume or a custom image running as uid 100) must reach the cache another way. Setting `--init-container-user=100` keeps uid 100 as the owner, with group `0` instead of `100`. On storage that applies an `fsGroup`, a container that relied only on the `fsGroup` group also has no access after the prep sets the root's group to `0`, exactly as it had none under `100:100`.
+
 ### Turning the prep off (`modelCache.prep`)
 
 `modelCache.prep` (controller flag `--model-cache-prep`) selects whether the prep is injected:
@@ -1047,7 +1066,7 @@ The prep is the **compatibility implementation** for these backends, and the ope
 
 Use `never` only when you know the cache's ownership is right without the prep: a CSI driver with `fsGroupPolicy: File` and a pod that sets `fsGroup` (kubelet applies only the pod's fsGroup), or a claim you pre-provisioned with the downloader's ownership. A supplied `spec.podSecurityContext` replaces the operator's default entirely, so `fsGroup` must be restated there. Then the cache-backed pods contain no root container at all, which is what a `restricted` namespace needs, and the prefetch Job additionally carries `runAsNonRoot` with a numeric uid, `allowPrivilegeEscalation: false`, `ALL` dropped, and a pod-level `seccompProfile: RuntimeDefault`.
 
-Changing the value rolls every cache-backed serving pod once, because the pod template changes. A prefetch Job whose pod has already started finishes under the setting it started with. One that has not started a pod yet keeps the template it was created with, so under `restricted` its pods are refused until the Job is deleted and rebuilt (or its `ttlSecondsAfterFinished` expires). Under `never` the prefetch Job's containers run as uid 101, the default `curlimages/curl` user, whatever `--init-container-image` is set to.
+Changing the value rolls every cache-backed serving pod once, because the pod template changes. A prefetch Job whose pod has already started finishes under the setting it started with. One that has not started a pod yet keeps the template it was created with, so under `restricted` its pods are refused until the Job is deleted and rebuilt (or its `ttlSecondsAfterFinished` expires). Under `never` the prefetch Job's containers run as `--init-container-user` (default 101, the default `curlimages/curl` user), so set that flag to your image's uid when you change `--init-container-image`; otherwise the prefetch writes as a different user from the serving downloader.
 
 `auto` (resolve the storage class and skip the prep only when the driver applies `fsGroup` itself) is a planned follow-up; the flag and the chart schema reject it today.
 
