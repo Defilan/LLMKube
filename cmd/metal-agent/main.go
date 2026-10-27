@@ -46,6 +46,7 @@ import (
 	"github.com/defilantech/llmkube/internal/platform"
 	"github.com/defilantech/llmkube/pkg/agent"
 	"github.com/defilantech/llmkube/pkg/agent/policy"
+	"github.com/defilantech/llmkube/pkg/metaljoin"
 	"github.com/defilantech/llmkube/pkg/metalnode"
 )
 
@@ -526,6 +527,9 @@ func resolveOptionalRuntimeBins(cfg *AgentConfig, logger *zap.SugaredLogger) {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == metaljoin.StopEnginesCommand {
+		os.Exit(runStopEnginesCommand(os.Args[2:]))
+	}
 	cfg := &AgentConfig{}
 
 	// Parse command-line flags

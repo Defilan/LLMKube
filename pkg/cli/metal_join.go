@@ -82,6 +82,9 @@ type metalHost struct {
 	llamaServerPaths []string
 	// executable is this llmkube binary's path.
 	executable func() (string, error)
+	// runAgent runs the Metal agent binary bin with args, streaming its
+	// output to stdout and stderr.
+	runAgent func(ctx context.Context, bin string, args []string, stdout, stderr io.Writer) error
 }
 
 var newMetalHost = func() (metalHost, error) {
@@ -103,6 +106,11 @@ var newMetalHost = func() (metalHost, error) {
 		lookPath:         exec.LookPath,
 		llamaServerPaths: defaultLlamaServerPaths,
 		executable:       os.Executable,
+		runAgent: func(ctx context.Context, bin string, args []string, stdout, stderr io.Writer) error {
+			c := exec.CommandContext(ctx, bin, args...)
+			c.Stdout, c.Stderr = stdout, stderr
+			return c.Run()
+		},
 	}, nil
 }
 
@@ -528,7 +536,7 @@ func installMetalAgent(ctx context.Context, host metalHost, paths metalAgentPath
 	// Not loaded yet is the usual case for bootout; anything else surfaces
 	// when bootstrap fails.
 	_ = host.launchctl(ctx, "bootout", domain+"/"+metalAgentLabel)
-	waitMetalAgentUnloaded(ctx, host, domain+"/"+metalAgentLabel)
+	_ = waitMetalAgentUnloaded(ctx, host, domain+"/"+metalAgentLabel)
 	// Truncated to the Lease's renewTime precision, so a renewal in the
 	// same microsecond still counts as the new agent's.
 	started := time.Now().Truncate(time.Microsecond)
@@ -548,19 +556,24 @@ var metalAgentUnloadTimeout = 30 * time.Second
 
 const metalAgentUnloadPoll = 100 * time.Millisecond
 
-// waitMetalAgentUnloaded waits until launchd no longer knows service. bootout
-// returns while a running agent is still stopping, and a bootstrap then fails
-// with "Bootstrap failed: 5: Input/output error". Past the timeout it returns
-// anyway, and the bootstrap error says how to start the agent.
-func waitMetalAgentUnloaded(ctx context.Context, host metalHost, service string) {
+// waitMetalAgentUnloaded waits until launchd no longer knows service, and
+// reports whether it got there. bootout returns while a running agent is still
+// stopping, and a bootstrap then fails with "Bootstrap failed: 5: Input/output
+// error". Past the timeout it returns false; join bootstraps anyway, and the
+// bootstrap error says how to start the agent.
+func waitMetalAgentUnloaded(ctx context.Context, host metalHost, service string) bool {
 	deadline := time.Now().Add(metalAgentUnloadTimeout)
-	for host.launchctl(ctx, "print", service) == nil && time.Now().Before(deadline) {
+	for host.launchctl(ctx, "print", service) == nil {
+		if !time.Now().Before(deadline) {
+			return false
+		}
 		select {
 		case <-ctx.Done():
-			return
+			return false
 		case <-time.After(metalAgentUnloadPoll):
 		}
 	}
+	return true
 }
 
 // renderMetalAgentPlist renders the LaunchAgent, matching
@@ -736,9 +749,12 @@ func newMetalLeaveCommand() *cobra.Command {
 		Use:   "leave",
 		Short: "Stop the Metal agent on this Mac and remove what join set up",
 		Long: `Stop the com.llmkube.metal-agent LaunchAgent and remove its plist and the
-agent's kubeconfig and token that 'llmkube metal join' wrote. The agent's
-ingress identity and model store stay. A LaunchAgent join did not write
-(make install-metal-agent, a playbook) is left running.
+agent's kubeconfig and token that 'llmkube metal join' wrote. Engines outlive
+the agent, so once it has exited, leave runs the agent's stop-engines to stop
+the engines it started and withdraw their endpoints. If that fails, nothing is
+removed; run leave again. The agent's ingress identity and model store stay. A
+LaunchAgent join did not write (make install-metal-agent, a playbook) is left
+running, and its engines with it.
 
 This only cleans up the Mac: the agent's token stays valid until it expires.
 To revoke it and delete the Mac's objects in the cluster, an admin runs
@@ -757,6 +773,11 @@ func runMetalLeave(cmd *cobra.Command) error {
 	}
 	if host.goos != "darwin" {
 		return fmt.Errorf("llmkube metal leave runs on the Mac, not on %s", host.goos)
+	}
+	if host.uid == 0 {
+		// leave runs the agent binary its LaunchAgent names, a path the user
+		// can write; as root that would run it with root's privileges.
+		return errors.New("run llmkube metal leave as the user the agent runs as, not as root or with sudo")
 	}
 	ctx := cmd.Context()
 	if ctx == nil {
@@ -782,8 +803,12 @@ func runMetalLeave(cmd *cobra.Command) error {
 	domain := "gui/" + strconv.Itoa(host.uid)
 	switch {
 	case joined:
-		if err := host.launchctl(ctx, "bootout", domain+"/"+metalAgentLabel); err != nil {
+		service := domain + "/" + metalAgentLabel
+		if err := host.launchctl(ctx, "bootout", service); err != nil {
 			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "the agent was not running (%v)\n", err)
+		}
+		if err := stopMetalEngines(ctx, host, paths, service, out, cmd.ErrOrStderr()); err != nil {
+			return err
 		}
 		files = append([]string{paths.Plist}, files...)
 	case exists:
@@ -811,6 +836,105 @@ func runMetalLeave(cmd *cobra.Command) error {
 			paths.PlistBackup, paths.Plist, domain, paths.Plist)
 	}
 	return nil
+}
+
+// stopMetalEngines runs the joined agent's stop-engines: its engines outlive
+// it (#2079), so leaving would otherwise keep every model loaded and its
+// endpoints registered. It waits for the agent to exit first, since a running
+// agent can start an engine after stop-engines has read the records, and runs
+// before the kubeconfig goes, which stop-engines withdraws endpoints with.
+// Nothing is removed when it fails, so leave can be run again.
+func stopMetalEngines(ctx context.Context, host metalHost, paths metalAgentPaths, service string,
+	out, errOut io.Writer) error {
+	if !waitMetalAgentUnloaded(ctx, host, service) {
+		return fmt.Errorf("the agent is still running %s after launchctl bootout, so its engines were not stopped "+
+			"and nothing was removed; run llmkube metal leave again once launchctl print %s no longer finds it",
+			metalAgentUnloadTimeout, service)
+	}
+	raw, err := os.ReadFile(paths.Plist)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", paths.Plist, err)
+	}
+	args, err := metalAgentPlistArgs(raw)
+	if err == nil && len(args) == 0 {
+		err = errors.New("ProgramArguments is empty")
+	}
+	if err != nil {
+		return fmt.Errorf("read the agent's command line from %s: %w", paths.Plist, err)
+	}
+	bin := args[0]
+	supported, err := agentHasStopEngines(bin)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		_, _ = fmt.Fprintf(errOut, "WARNING: the agent binary %s is gone, so the engines it started were not stopped; "+
+			"check for engines still running (their records are under %s)\n", bin, filepath.Join(paths.Dir, "engines"))
+		return nil
+	case err != nil:
+		return fmt.Errorf("read the agent binary %s: %w", bin, err)
+	case !supported:
+		// It would read stop-engines as a stray argument and start as an
+		// agent. An agent that old stops its engines when it exits.
+		_, _ = fmt.Fprintf(out, "%s has no stop-engines; an agent that old stops its engines when it exits\n", bin)
+		return nil
+	}
+	stopArgs := metaljoin.StopEnginesArgs(args[1:], paths.Kubeconfig)
+	_, _ = fmt.Fprintf(out, "stopping the engines the agent started: %s %s\n", bin, strings.Join(stopArgs, " "))
+	if err := host.runAgent(ctx, bin, stopArgs, out, errOut); err != nil {
+		return fmt.Errorf("%s stop-engines: %w; an engine may still be running, so nothing was removed. "+
+			"Check its output above, then run llmkube metal leave again", bin, err)
+	}
+	return nil
+}
+
+// agentHasStopEngines reports whether the agent binary at path has the
+// stop-engines subcommand, without running it: an agent from before it parses
+// the word as a stray argument and starts serving.
+func agentHasStopEngines(path string) (bool, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+	return bytes.Contains(raw, []byte(metaljoin.StopEnginesCommand)), nil
+}
+
+// metalAgentPlistArgs returns the ProgramArguments of a LaunchAgent plist.
+func metalAgentPlistArgs(raw []byte) ([]string, error) {
+	dec := xml.NewDecoder(bytes.NewReader(raw))
+	var (
+		key, text      string
+		inArgs, inText bool
+		args           []string
+	)
+	for {
+		tok, err := dec.Token()
+		if errors.Is(err, io.EOF) {
+			return nil, errors.New("no ProgramArguments")
+		}
+		if err != nil {
+			return nil, err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			inText, text = true, ""
+			if t.Name.Local == "array" && key == "ProgramArguments" {
+				inArgs = true
+			}
+		case xml.CharData:
+			if inText {
+				text += string(t)
+			}
+		case xml.EndElement:
+			inText = false
+			switch {
+			case t.Name.Local == "key":
+				key = text
+			case inArgs && t.Name.Local == "string":
+				args = append(args, text)
+			case inArgs && t.Name.Local == "array":
+				return args, nil
+			}
+		}
+	}
 }
 
 // writeFileAtomic replaces path with data through a temporary file in the

@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"flag"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	restclient "k8s.io/client-go/rest"
 
 	"github.com/defilantech/llmkube/pkg/agent"
+	"github.com/defilantech/llmkube/pkg/metaljoin"
 	"github.com/defilantech/llmkube/pkg/metalnode"
 )
 
@@ -506,5 +508,49 @@ func TestTokenFileToRenew(t *testing.T) {
 				t.Errorf("tokenFileToRenew = %q, %v; want %q, error %t", got, err, tc.want, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestStopEnginesSubcommandParsesItsFlags(t *testing.T) {
+	opts, err := parseStopEnginesArgs([]string{"--state-dir", "/x", "--namespace", "ns", "--ollama-port", "1234"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.StateDir != "/x" || opts.Namespace != "ns" || opts.OllamaPort != 1234 {
+		t.Fatalf("unexpected options %+v", opts)
+	}
+	if _, err := parseStopEnginesArgs([]string{"--no-such-flag"}); err == nil {
+		t.Fatal("an unknown flag must error")
+	}
+	if _, err := parseStopEnginesArgs([]string{"stray"}); err == nil {
+		t.Fatal("a stray argument must error")
+	}
+}
+
+// TestStopEnginesParsesWhatLeaveSends: llmkube metal leave builds its
+// stop-engines command line with metaljoin.StopEnginesArgs from the agent's
+// LaunchAgent arguments, and dispatches on its first word. This parser must
+// read that line back to the same kubeconfig, namespace and state directory.
+func TestStopEnginesParsesWhatLeaveSends(t *testing.T) {
+	kc := flag.Lookup("kubeconfig")
+	if kc == nil {
+		t.Fatal("no --kubeconfig flag registered; stop-engines could not take the one leave sends")
+	}
+	prev := kc.Value.String()
+	t.Cleanup(func() { _ = kc.Value.Set(prev) })
+
+	agentArgs := []string{"--kubeconfig", "/Users/a/kc", "--namespace", "team", "--metal-node", "mac-a",
+		"--renew-service-account-token", "--state-dir", "/Users/a/state", "--llama-server", "/opt/llama-server"}
+	args := metaljoin.StopEnginesArgs(agentArgs, "/unused")
+	if args[0] != metaljoin.StopEnginesCommand {
+		t.Fatalf("leave sends %q first, want the subcommand main dispatches on", args[0])
+	}
+	opts, err := parseStopEnginesArgs(args[1:])
+	if err != nil {
+		t.Fatalf("parseStopEnginesArgs(%q): %v", args[1:], err)
+	}
+	if opts.Namespace != "team" || opts.StateDir != "/Users/a/state" || kc.Value.String() != "/Users/a/kc" {
+		t.Fatalf("parsed namespace %q, state dir %q, kubeconfig %q from %q; want team, /Users/a/state, /Users/a/kc",
+			opts.Namespace, opts.StateDir, kc.Value.String(), args[1:])
 	}
 }

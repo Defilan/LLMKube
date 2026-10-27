@@ -173,6 +173,15 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.llmkube.metal-agent.
 `make install-metal-agent` rewrites this plist from the repo's
 template, so re-add your flags after a reinstall.
 
+Restarting the agent does not stop the engines it started: the new agent
+adopts them with the same PID and no model reload (oMLX services still
+reload). Engines keep the flags they started with. To stop them, run
+`llmkube-metal-agent stop-engines` once the agent has exited after the
+`bootout` (`launchctl print` no longer finds it). Before rolling the
+agent back to a release that predates adoption, do the same with the current
+binary, or the older agent loads a second copy of every model. See the
+[macOS deployment README](https://github.com/defilantech/LLMKube/blob/main/deployment/macos/README.md#agent-restarts-upgrades-and-stopping-engines).
+
 Without `--host-ip` the agent auto-detects an address: a Tailscale
 address (100.64.0.0/10) if the Mac has one, otherwise the first other
 routable IPv4 address (skipping loopback, link-local, and Docker or VM
@@ -888,9 +897,14 @@ the token's lifetime cannot renew it: run `token create` and `join`
 again. Running `join` again on a Mac replaces its setup.
 
 `llmkube metal leave` undoes `join` on the Mac: it stops the
-LaunchAgent and removes its plist, the kubeconfig and the token. The
-ingress identity and the model store stay. A LaunchAgent `join` did
-not write is left running. If `join --force` replaced one, `leave`
+LaunchAgent and removes its plist, the kubeconfig and the token. Engines
+outlive the agent, so once the agent has exited, `leave` runs its
+`stop-engines` first, which stops the engines the agent started and
+withdraws their endpoints. If `stop-engines` fails, `leave` removes
+nothing; check its output and run `leave` again. An agent binary from
+before `stop-engines` stops its engines when it exits, so `leave` skips
+the step for it. The ingress identity and the model store stay. A
+LaunchAgent `join` did not write is left running, with its engines. If `join --force` replaced one, `leave`
 prints the commands that put it back. It does not revoke
 anything; the token stays valid until it expires, so also run
 `llmkube metal remove` where you have cluster access.
