@@ -45,8 +45,8 @@ spec:
   vllmConfig:
     maxModelLen: 4096
     dtype: float16
-    # Default kvCacheDtype: auto. Smoke test exercises the default path; the
-    # turbo2 / fp8 variants live in benchmarks/turboquant/manifests/.
+    # Default kvCacheDtype: auto. Smoke test exercises the default path; for a
+    # TurboQuant KV cache see vllm-v0.20-qwen32b-turboquant.yaml.
     hfTokenSecretRef:
       name: hf-token
       key: HF_TOKEN

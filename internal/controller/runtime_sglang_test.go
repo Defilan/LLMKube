@@ -366,10 +366,10 @@ func TestSGLangBuildArgs(t *testing.T) {
 				Runtime: "sglang",
 				SGLangConfig: &inferencev1alpha1.SGLangConfig{
 					KVCacheDtype:       ptrString("fp8_e4m3"),
-					KVCacheCustomDtype: "turbo2",
+					KVCacheCustomDtype: "fp4_e2m1",
 				},
 			},
-			contains:    []FlagCheck{{"--kv-cache-dtype", "turbo2"}},
+			contains:    []FlagCheck{{"--kv-cache-dtype", "fp4_e2m1"}},
 			notContains: []string{"fp8_e4m3"},
 		},
 		{

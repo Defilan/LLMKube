@@ -18,7 +18,8 @@ Long-context inference is bandwidth-bound on the KV cache, not the weights. At f
 | vLLM | fp8_e5m2 | 8 | ~16 GB | Same scale, different exponent bias |
 | vLLM | float16 | 16 | ~32 GB | Explicit 16-bit cache |
 | vLLM | bfloat16 | 16 | ~32 GB | Opt-out for a model whose cache defaults to fp8 |
-| vLLM | turbo2 (v0.20+) | 2 | ~4 GB | Maximum context per VRAM |
+| vLLM | turboquant_k8v4 (v0.20+) | ~6 | ~12 GB | TurboQuant with the smallest accuracy cost |
+| vLLM | turboquant_3bit_nc (v0.20+) | ~3.25 | ~6.5 GB | Maximum context per VRAM |
 
 ## Two runtimes, two fields each
 
@@ -44,8 +45,8 @@ K and V are independent. Asymmetric `cacheTypeK: q8_0` + `cacheTypeCustomV: turb
 spec:
   vllmConfig:
     kvCacheDtype: fp8              # enum: auto, fp8_e5m2, fp8_e4m3, fp8, float16, bfloat16
-    # Or the custom escape hatch (turbo2 from vLLM v0.20+, future variants)
-    kvCacheCustomDtype: turbo2
+    # Or the custom escape hatch (the turboquant_* types from vLLM v0.20+, future variants)
+    kvCacheCustomDtype: turboquant_3bit_nc
 ```
 
 vLLM does not split K and V into separate flags — `--kv-cache-dtype` controls both.
@@ -74,9 +75,8 @@ These numbers are approximate. Real measurements depend on the model's attention
 | llama.cpp | Metal (M5 Max) | turbo4 | 0.266 |
 | llama.cpp | Metal (M5 Max) | turbo3 | 0.203 |
 | vLLM | CUDA (RTX 5060 Ti) | fp8_e4m3 | 0.500 |
-| vLLM | CUDA (RTX 5060 Ti) | turbo2 | 0.125 |
 
-The Metal-side numbers come from the [TurboQuant on M5 Max bench](https://llmkube.com/blog/turboquant-m5-max-long-context). The vLLM-side `turbo2` row will be backed by the ShadowStack bench tracked under issue #354.
+The Metal-side numbers come from the [TurboQuant on M5 Max bench](https://llmkube.com/blog/turboquant-m5-max-long-context). LLMKube has not measured vLLM's `turboquant_*` types; the vLLM rows in the first table derive from the compression ratios in [vLLM PR #38479](https://github.com/vllm-project/vllm/pull/38479).
 
 ## Required runtime images
 
@@ -86,14 +86,14 @@ For non-enum types, the runtime image must include the implementation:
 |---|---|---|
 | Metal (Apple Silicon) | turbo3, turbo4 | [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant) `feature/turboquant-kv-cache` |
 | CUDA (NVIDIA) | tbqp3 | [spiritbuun/llama-cpp-turboquant-cuda](https://github.com/spiritbuun/llama-cpp-turboquant-cuda) |
-| vLLM | turbo2 | `vllm/vllm-openai:v0.20.0` and later |
+| vLLM | turboquant_k8v4, turboquant_4bit_nc, turboquant_k3v4_nc, turboquant_3bit_nc | `vllm/vllm-openai:v0.20.0` and later |
 
-For Metal, point the metal-agent at the fork via the `--llama-server` flag in your launchd plist (see `docs/turboquant.md`).
+For Metal, point the metal-agent at the fork via the `--llama-server` flag in your launchd plist (see [docs/contributors/turboquant.md](./contributors/turboquant.md)).
 
 ## References
 
 - llama.cpp KV cache discussion: <https://github.com/ggml-org/llama.cpp/discussions/20969>
-- vLLM TurboQuant 2-bit PR: <https://github.com/vllm-project/vllm/pull/38479>
+- vLLM TurboQuant PR: <https://github.com/vllm-project/vllm/pull/38479>
 - vLLM v0.20.0 release notes: <https://github.com/vllm-project/vllm/releases/tag/v0.20.0>
-- Llama.cpp-side details: [docs/turboquant.md](./turboquant.md)
+- Llama.cpp-side details: [docs/contributors/turboquant.md](./contributors/turboquant.md)
 - Cross-architecture bench: <https://llmkube.com/blog/turboquant-m5-max-long-context>

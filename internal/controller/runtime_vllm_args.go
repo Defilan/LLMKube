@@ -101,8 +101,8 @@ func appendGPUMemoryUtilization(args []string, gpuMemoryUtilization *float64, gp
 
 // resolveKVCacheDtype returns the custom vLLM KV cache type when set,
 // otherwise the enum-validated standard value (dereferenced; nil → ""). Lets
-// users opt into vLLM image-specific cache formats (TurboQuant turbo2 from
-// v0.20+, future variants) without expanding the CRD enum on every release,
+// users opt into vLLM image-specific cache formats (the turboquant_* types
+// from v0.20+, future variants) without expanding the CRD enum on every release,
 // while keeping the standard field discoverable for the common case. Mirrors
 // resolveCacheType on the llama.cpp side.
 func resolveKVCacheDtype(custom string, standard *string) string {
