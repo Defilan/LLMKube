@@ -173,13 +173,21 @@ func (p *Proxy) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // every backend in the config under its published id (DisplayName, else
 // Name), the id BackendNameMatch resolves. A cloud backend's upstream
 // Model is not listed: a client that sent it would not reach that backend
-// (#2256).
+// (#2256). A backend's ModelInfo adds context_length and an OpenRouter-style
+// architecture block, which clients read to decide what to send.
 func (p *Proxy) handleModels(w http.ResponseWriter, _ *http.Request) {
+	type architecture struct {
+		Modality         string   `json:"modality"`
+		InputModalities  []string `json:"input_modalities"`
+		OutputModalities []string `json:"output_modalities"`
+	}
 	type model struct {
-		ID      string `json:"id"`
-		Object  string `json:"object"`
-		Created int64  `json:"created"`
-		OwnedBy string `json:"owned_by"`
+		ID            string        `json:"id"`
+		Object        string        `json:"object"`
+		Created       int64         `json:"created"`
+		OwnedBy       string        `json:"owned_by"`
+		ContextLength int64         `json:"context_length,omitempty"`
+		Architecture  *architecture `json:"architecture,omitempty"`
 	}
 	now := time.Now().Unix()
 	models := make([]model, 0, len(p.cfg.Backends))
@@ -189,7 +197,18 @@ func (p *Proxy) handleModels(w http.ResponseWriter, _ *http.Request) {
 		if b.Provider != "" {
 			owned = b.Provider
 		}
-		models = append(models, model{ID: publishedID(b), Object: "model", Created: now, OwnedBy: owned})
+		m := model{ID: publishedID(b), Object: "model", Created: now, OwnedBy: owned}
+		if info := b.ModelInfo; info != nil {
+			m.ContextLength = info.ContextLength
+			if in, out := info.InputModalities, info.OutputModalities; len(in) > 0 && len(out) > 0 {
+				m.Architecture = &architecture{
+					Modality:         strings.Join(in, "+") + "->" + strings.Join(out, "+"),
+					InputModalities:  in,
+					OutputModalities: out,
+				}
+			}
+		}
+		models = append(models, m)
 	}
 	body, _ := json.Marshal(map[string]any{"object": "list", "data": models})
 	w.Header().Set("Content-Type", "application/json")

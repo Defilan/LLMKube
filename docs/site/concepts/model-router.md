@@ -177,6 +177,28 @@ Point any OpenAI-compatible client at that URL and it just works. The proxy serv
 
 The two Anthropic routes are placed, balanced and session-bound exactly like chat completions, and headers such as `anthropic-version` and `anthropic-beta` pass through. The backend must serve them itself: vLLM does natively; a backend that does not returns its own `404`, which reaches the client unchanged and does not count against the backend. Token budgets charge Anthropic responses from their own usage fields (cached input included), and errors the router itself returns on these routes use the Anthropic error shape.
 
+`GET /v1/models` lists each backend under its `displayName`, else its `name`. Coding clients, and services that generate client config, read this list to decide whether a model takes images and how much context it holds. A backend publishes both when it declares `modelInfo`:
+
+```yaml
+  backends:
+    - name: glm-5-3-flash
+      inferenceServiceRef: {name: glm-5-3-flash}
+      capabilities: [vision]
+      modelInfo: {}
+```
+
+That backend's entry then carries `"context_length"` and an OpenRouter-style `architecture` block, `{"modality": "text+image->text", "input_modalities": ["text", "image"], "output_modalities": ["text"]}`. Fields you leave unset are filled in:
+
+| Field | When unset |
+|---|---|
+| `inputModalities` | `[text, image]` if the backend's `capabilities` include `vision`, else `[text]` |
+| `outputModalities` | `[text]` |
+| `contextLength` | vLLM: `vllmConfig.maxModelLen`, or `--max-model-len` in `extraArgs`. llama.cpp: `contextSize`, divided across `parallelSlots` when they are set, because llama-server then splits the context between slots. An unset `runtime` counts as llama.cpp except on a Metal Model, where the metal-agent picks the runtime. Other runtimes, and llama.cpp `extraArgs` that set `--ctx-size`, `--parallel` or `--kv-unified`, publish no context length. |
+
+A value you set wins. If `inputModalities` leaves out `image` while `capabilities` lists `vision`, the controller records a `ModelInfoMismatch` warning event, and `/v1/models` publishes `inputModalities`. A backend without `modelInfo` publishes the bare entry, as before.
+
+The router doesn't enforce `modelInfo`, so keep it in step with what the backend serves: a vLLM backend started with `--limit-mm-per-prompt '{"image":0}'` rejects images whatever the list says. `modelInfo` applies to the Proxy data plane only. The Gateway and AgentGateway data planes ignore it, and AgentGateway answers `/v1/models` itself.
+
 Headers that change routing:
 
 | Header | Effect |

@@ -192,11 +192,29 @@ func (r *ModelRouterReconciler) resolveBackend(
 		wire.Timeout = b.Timeout.Duration
 	}
 	wire.CostPerMillionTokens = translateTokenCost(b.CostPerMillionTokens)
+	var isvc *inferencev1alpha1.InferenceService
+	if b.InferenceServiceRef != nil {
+		obj := &inferencev1alpha1.InferenceService{}
+		err := r.Get(ctx, types.NamespacedName{Name: b.InferenceServiceRef.Name, Namespace: mr.Namespace}, obj)
+		switch {
+		case err == nil:
+			isvc = obj
+		case !errors.IsNotFound(err) && b.ModelInfo != nil:
+			// Only modelInfo fails the compile on a lookup error, as
+			// compileBalancing does; without it the backend compiles as before.
+			return wire, status, fmt.Errorf("get InferenceService %s for backend %q modelInfo: %w", b.InferenceServiceRef.Name, b.Name, err)
+		}
+	}
+	info, err := r.compileModelInfo(ctx, mr, b, isvc)
+	if err != nil {
+		return wire, status, err
+	}
+	wire.ModelInfo = info
 
 	switch {
 	case b.InferenceServiceRef != nil:
 		wire.InferenceService = b.InferenceServiceRef.Name
-		wire.ServedModel = r.localBackendServedModel(ctx, mr.Namespace, b.InferenceServiceRef.Name)
+		wire.ServedModel = r.localBackendServedModel(ctx, mr.Namespace, isvc)
 		if wire.Tier == "" {
 			wire.Tier = backendTierLocal
 			status.Tier = backendTierLocal
@@ -342,10 +360,10 @@ func (r *ModelRouterReconciler) resolveInferenceServiceAddress(
 // the address path already reports the backend unhealthy.
 func (r *ModelRouterReconciler) localBackendServedModel(
 	ctx context.Context,
-	namespace, name string,
+	namespace string,
+	isvc *inferencev1alpha1.InferenceService,
 ) string {
-	isvc := &inferencev1alpha1.InferenceService{}
-	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, isvc); err != nil {
+	if isvc == nil {
 		return ""
 	}
 	switch runtimeNameLabel(isvc) {
@@ -605,6 +623,140 @@ func translateTokenCost(c *inferencev1alpha1.TokenCost) *router.TokenCost {
 		PromptUSD:     parseUSD(c.PromptUSD),
 		CompletionUSD: parseUSD(c.CompletionUSD),
 	}
+}
+
+// modelRouterReasonModelInfoMismatch is the event reason for a backend whose
+// capabilities list vision while its modelInfo.inputModalities leave out image.
+const modelRouterReasonModelInfoMismatch = "ModelInfoMismatch"
+
+// compileModelInfo translates a backend's modelInfo for /v1/models (#2248).
+// Only a backend that declares modelInfo publishes anything, so a router
+// without it keeps its config hash and its proxy does not roll. Fields left
+// unset come from what the controller already knows: a "vision" capability
+// means text and image input, other modalities default to text, and the
+// context length comes from the InferenceService (nil when the backend has
+// none or it is not found). A lookup error other than NotFound is returned,
+// as in compileBalancing, so a transient failure cannot change the hash twice.
+func (r *ModelRouterReconciler) compileModelInfo(
+	ctx context.Context,
+	mr *inferencev1alpha1.ModelRouter,
+	b *inferencev1alpha1.RouterBackend,
+	isvc *inferencev1alpha1.InferenceService,
+) (*router.ModelInfo, error) {
+	m := b.ModelInfo
+	if m == nil {
+		return nil, nil
+	}
+	out := &router.ModelInfo{
+		InputModalities:  append([]string(nil), m.InputModalities...),
+		OutputModalities: append([]string(nil), m.OutputModalities...),
+	}
+	if m.ContextLength != nil {
+		out.ContextLength = *m.ContextLength
+	}
+	if slices.Contains(b.Capabilities, backendCapabilityVision) {
+		if len(out.InputModalities) == 0 {
+			out.InputModalities = []string{"text", "image"}
+		} else if !slices.Contains(out.InputModalities, "image") && r.Recorder != nil {
+			r.Recorder.Eventf(mr, nil, corev1.EventTypeWarning, modelRouterReasonModelInfoMismatch, "Reconcile",
+				"backend %q lists the vision capability but modelInfo.inputModalities leaves out image; /v1/models publishes modelInfo.inputModalities",
+				b.Name)
+		}
+	}
+	if len(out.InputModalities) == 0 {
+		out.InputModalities = []string{"text"}
+	}
+	if len(out.OutputModalities) == 0 {
+		out.OutputModalities = []string{"text"}
+	}
+	if out.ContextLength == 0 && isvc != nil {
+		agent, err := r.runtimeSetByMetalAgent(ctx, isvc)
+		if err != nil {
+			return nil, fmt.Errorf("backend %q modelInfo: %w", b.Name, err)
+		}
+		if !agent {
+			out.ContextLength = servedContextLength(isvc)
+		}
+	}
+	return out, nil
+}
+
+// runtimeSetByMetalAgent reports whether an unset runtime is left to the
+// metal-agent's --runtime flag, which may not be llama.cpp. A missing Model
+// also reports true, so its context length is not guessed.
+func (r *ModelRouterReconciler) runtimeSetByMetalAgent(
+	ctx context.Context,
+	isvc *inferencev1alpha1.InferenceService,
+) (bool, error) {
+	if isvc.Spec.Runtime != "" {
+		return false, nil
+	}
+	if isvc.Spec.ModelRef == "" {
+		return true, nil
+	}
+	model := &inferencev1alpha1.Model{}
+	err := r.Get(ctx, types.NamespacedName{Name: isvc.Spec.ModelRef, Namespace: isvc.Namespace}, model)
+	switch {
+	case err == nil:
+		return isMetalModel(model), nil
+	case errors.IsNotFound(err):
+		return true, nil
+	default:
+		return false, fmt.Errorf("get Model %s: %w", isvc.Spec.ModelRef, err)
+	}
+}
+
+// backendCapabilityVision is the RouterBackend capability that marks a
+// backend as taking image input.
+const backendCapabilityVision = "vision"
+
+// servedContextLength is the context window one request gets, read from the
+// spec fields the controller renders onto the runtime's command line. It is
+// zero when that can't be known: a runtime without a known flag, or extraArgs
+// that set the flags themselves.
+func servedContextLength(isvc *inferencev1alpha1.InferenceService) int64 {
+	args := isvc.Spec.ExtraArgs
+	switch isvc.Spec.Runtime {
+	case RuntimeVLLM:
+		// extraArgs follow the rendered flags, so vLLM keeps their value.
+		if values, ok := extraArgValues(args, "max-model-len"); ok {
+			if len(values) == 0 {
+				return 0
+			}
+			n, err := strconv.ParseInt(values[len(values)-1], 10, 64)
+			if err != nil || n < 1 {
+				return 0
+			}
+			return n
+		}
+		if cfg := isvc.Spec.VLLMConfig; cfg != nil && cfg.MaxModelLen != nil {
+			return int64(*cfg.MaxModelLen)
+		}
+	case "", "llamacpp":
+		if hasMatchingExtraArgAny(args, "ctx-size", "-c", "parallel", "-np",
+			"kv-unified", "-kvu", "no-kv-unified", "-no-kvu", "kv-unified-per-slot") {
+			return 0
+		}
+		if isvc.Spec.ContextSize == nil {
+			return 0
+		}
+		// llama-server keeps one shared KV pool when --parallel is left on
+		// auto, but an explicit --parallel splits --ctx-size evenly across
+		// the slots, each rounded up to 256 tokens (llama.cpp b11854,
+		// llama_context: n_ctx_seq = n_ctx / n_seq_max).
+		n := padTo256(int64(*isvc.Spec.ContextSize))
+		if p := isvc.Spec.ParallelSlots; p != nil && *p > 1 {
+			n = padTo256(n / int64(*p))
+		}
+		return n
+	}
+	// llamacpp-router loads models on demand, each with its own context, so
+	// there is no single length to publish.
+	return 0
+}
+
+func padTo256(n int64) int64 {
+	return (n + 255) / 256 * 256
 }
 
 // parseUSD parses a validated non-negative decimal string. Malformed input

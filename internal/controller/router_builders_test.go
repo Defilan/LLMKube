@@ -28,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -1091,6 +1092,202 @@ func TestCompileRouterConfigCopiesDisplayName(t *testing.T) {
 	}
 	if cfg.Backends[0].DisplayName != "" {
 		t.Errorf("backend without displayName = %q, want empty", cfg.Backends[0].DisplayName)
+	}
+}
+
+// TestCompileRouterConfigModelInfo pins how a backend's modelInfo reaches
+// the proxy wire config (#2248): set fields are copied and win, unset ones
+// are filled from capabilities and the InferenceService, and a backend
+// without modelInfo compiles to nil even when it lists vision, so routers
+// that don't opt in keep their config hash.
+func TestCompileRouterConfigModelInfo(t *testing.T) {
+	i32 := func(v int32) *int32 { return &v }
+	i64 := func(v int64) *int64 { return &v }
+	vllm := func(maxModelLen int32, extraArgs ...string) *inferencev1alpha1.InferenceServiceSpec {
+		return &inferencev1alpha1.InferenceServiceSpec{
+			Runtime:    RuntimeVLLM,
+			VLLMConfig: &inferencev1alpha1.VLLMConfig{MaxModelLen: i32(maxModelLen)},
+			ExtraArgs:  extraArgs,
+		}
+	}
+	tests := []struct {
+		name         string
+		capabilities []string
+		info         *inferencev1alpha1.RouterBackendModelInfo
+		isvc         *inferencev1alpha1.InferenceServiceSpec
+		accelerator  string // seeds the referenced Model when set
+		want         *router.ModelInfo
+	}{
+		{
+			name: "set fields are copied",
+			info: &inferencev1alpha1.RouterBackendModelInfo{
+				InputModalities:  []string{"text", "image"},
+				OutputModalities: []string{"text"},
+				ContextLength:    i64(262144),
+			},
+			want: &router.ModelInfo{InputModalities: []string{"text", "image"}, OutputModalities: []string{"text"}, ContextLength: 262144},
+		},
+		{
+			name:         "vision capability and vLLM maxModelLen fill an empty modelInfo",
+			capabilities: []string{"vision"},
+			info:         &inferencev1alpha1.RouterBackendModelInfo{},
+			isvc:         vllm(524288),
+			want:         &router.ModelInfo{InputModalities: []string{"text", "image"}, OutputModalities: []string{"text"}, ContextLength: 524288},
+		},
+		{
+			name: "without vision both modalities default to text",
+			info: &inferencev1alpha1.RouterBackendModelInfo{},
+			want: &router.ModelInfo{InputModalities: []string{"text"}, OutputModalities: []string{"text"}},
+		},
+		{
+			name:         "set inputModalities win over the vision capability",
+			capabilities: []string{"vision"},
+			info:         &inferencev1alpha1.RouterBackendModelInfo{InputModalities: []string{"text"}},
+			want:         &router.ModelInfo{InputModalities: []string{"text"}, OutputModalities: []string{"text"}},
+		},
+		{
+			name: "set contextLength wins over the InferenceService",
+			info: &inferencev1alpha1.RouterBackendModelInfo{ContextLength: i64(65536)},
+			isvc: vllm(524288),
+			want: &router.ModelInfo{InputModalities: []string{"text"}, OutputModalities: []string{"text"}, ContextLength: 65536},
+		},
+		{
+			name: "--max-model-len in extraArgs wins over vllmConfig",
+			info: &inferencev1alpha1.RouterBackendModelInfo{},
+			isvc: vllm(524288, "--max-model-len=131072"),
+			want: &router.ModelInfo{InputModalities: []string{"text"}, OutputModalities: []string{"text"}, ContextLength: 131072},
+		},
+		{
+			name:        "llama.cpp splits contextSize across explicit parallelSlots",
+			info:        &inferencev1alpha1.RouterBackendModelInfo{},
+			isvc:        &inferencev1alpha1.InferenceServiceSpec{ContextSize: i32(32768), ParallelSlots: i32(4)},
+			accelerator: "cuda",
+			want:        &router.ModelInfo{InputModalities: []string{"text"}, OutputModalities: []string{"text"}, ContextLength: 8192},
+		},
+		{
+			name:        "an unset runtime on a Metal model publishes no context length",
+			info:        &inferencev1alpha1.RouterBackendModelInfo{},
+			isvc:        &inferencev1alpha1.InferenceServiceSpec{ContextSize: i32(32768), ParallelSlots: i32(4)},
+			accelerator: "metal",
+			want:        &router.ModelInfo{InputModalities: []string{"text"}, OutputModalities: []string{"text"}},
+		},
+		{
+			name:        "an explicit llamacpp runtime on a Metal model splits contextSize",
+			info:        &inferencev1alpha1.RouterBackendModelInfo{},
+			isvc:        &inferencev1alpha1.InferenceServiceSpec{Runtime: "llamacpp", ContextSize: i32(32768), ParallelSlots: i32(4)},
+			accelerator: "metal",
+			want:        &router.ModelInfo{InputModalities: []string{"text"}, OutputModalities: []string{"text"}, ContextLength: 8192},
+		},
+		{
+			name: "an unset runtime with no Model found publishes no context length",
+			info: &inferencev1alpha1.RouterBackendModelInfo{},
+			isvc: &inferencev1alpha1.InferenceServiceSpec{ModelRef: "missing", ContextSize: i32(32768)},
+			want: &router.ModelInfo{InputModalities: []string{"text"}, OutputModalities: []string{"text"}},
+		},
+		{
+			name: "llama.cpp with parallelSlots on auto keeps the whole contextSize",
+			info: &inferencev1alpha1.RouterBackendModelInfo{},
+			isvc: &inferencev1alpha1.InferenceServiceSpec{Runtime: "llamacpp", ContextSize: i32(32768)},
+			want: &router.ModelInfo{InputModalities: []string{"text"}, OutputModalities: []string{"text"}, ContextLength: 32768},
+		},
+		{
+			name:        "llama.cpp extraArgs that set the slot flags publish no context length",
+			info:        &inferencev1alpha1.RouterBackendModelInfo{},
+			isvc:        &inferencev1alpha1.InferenceServiceSpec{ContextSize: i32(32768), ExtraArgs: []string{"-np", "4", "--kv-unified"}},
+			accelerator: "cuda",
+			want:        &router.ModelInfo{InputModalities: []string{"text"}, OutputModalities: []string{"text"}},
+		},
+		{
+			name: "a runtime without a known flag publishes no context length",
+			info: &inferencev1alpha1.RouterBackendModelInfo{},
+			isvc: &inferencev1alpha1.InferenceServiceSpec{Runtime: "sglang", ContextSize: i32(32768)},
+			want: &router.ModelInfo{InputModalities: []string{"text"}, OutputModalities: []string{"text"}},
+		},
+		{
+			name:         "no modelInfo compiles to nil even with vision",
+			capabilities: []string{"vision"},
+			isvc:         vllm(524288),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mr := canonicalModelRouter()
+			mr.Spec.Backends[0].Capabilities = tt.capabilities
+			mr.Spec.Backends[0].ModelInfo = tt.info
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: "qwen3-coder", Namespace: testBuilderNs},
+			}
+			if tt.isvc != nil {
+				isvc.Spec = *tt.isvc
+			}
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "anthropic-key", Namespace: testBuilderNs},
+				Data:       map[string][]byte{"ANTHROPIC_API_KEY": []byte("test")},
+			}
+			objs := []client.Object{isvc, secret}
+			if tt.accelerator != "" {
+				isvc.Spec.ModelRef = "qwen3-coder-model"
+				objs = append(objs, &inferencev1alpha1.Model{
+					ObjectMeta: metav1.ObjectMeta{Name: "qwen3-coder-model", Namespace: testBuilderNs},
+					Spec:       inferencev1alpha1.ModelSpec{Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: tt.accelerator}},
+				})
+			}
+			r := newRouterReconcilerForTest(t, mr, objs...)
+			compiled, err := r.compileRouterConfig(context.Background(), mr)
+			if err != nil {
+				t.Fatalf("compileRouterConfig: %v", err)
+			}
+			var cfg router.Config
+			if err := json.Unmarshal(compiled.JSON, &cfg); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if !reflect.DeepEqual(cfg.Backends[0].ModelInfo, tt.want) {
+				t.Errorf("backend modelInfo = %+v, want %+v", cfg.Backends[0].ModelInfo, tt.want)
+			}
+			// The cloud backend lists vision but declares no modelInfo.
+			if cfg.Backends[1].ModelInfo != nil {
+				t.Errorf("backend without modelInfo = %+v, want nil", cfg.Backends[1].ModelInfo)
+			}
+		})
+	}
+}
+
+// TestCompileRouterConfigModelInfoMismatchWarns pins the ModelInfoMismatch
+// event for a backend whose vision capability and inputModalities disagree.
+func TestCompileRouterConfigModelInfoMismatchWarns(t *testing.T) {
+	mr := canonicalModelRouter()
+	mr.Spec.Backends[0].Capabilities = []string{"vision"}
+	mr.Spec.Backends[0].ModelInfo = &inferencev1alpha1.RouterBackendModelInfo{InputModalities: []string{"text"}}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "anthropic-key", Namespace: testBuilderNs},
+		Data:       map[string][]byte{"ANTHROPIC_API_KEY": []byte("test")},
+	}
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "qwen3-coder", Namespace: testBuilderNs},
+	}
+	r := newRouterReconcilerForTest(t, mr, isvc, secret)
+	recorder := events.NewFakeRecorder(10)
+	r.Recorder = recorder
+	compiled, err := r.compileRouterConfig(context.Background(), mr)
+	if err != nil {
+		t.Fatalf("compileRouterConfig: %v", err)
+	}
+	var cfg router.Config
+	if err := json.Unmarshal(compiled.JSON, &cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got := cfg.Backends[0].ModelInfo; got == nil || !reflect.DeepEqual(got.InputModalities, []string{"text"}) {
+		t.Errorf("backend modelInfo = %+v, want inputModalities [text]", got)
+	}
+	var seen []string
+	warned := false
+	for len(recorder.Events) > 0 {
+		e := <-recorder.Events
+		seen = append(seen, e)
+		warned = warned || (strings.Contains(e, modelRouterReasonModelInfoMismatch) && strings.Contains(e, `"local-qwen"`))
+	}
+	if !warned {
+		t.Errorf("events = %q, want a %s warning for local-qwen", seen, modelRouterReasonModelInfoMismatch)
 	}
 }
 

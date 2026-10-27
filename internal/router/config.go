@@ -80,6 +80,10 @@ type Backend struct {
 	// When empty, Name is used for both purposes (current behavior).
 	DisplayName string `json:"displayName,omitempty"`
 
+	// ModelInfo is published on this backend's /v1/models entry. Nil
+	// publishes the bare entry.
+	ModelInfo *ModelInfo `json:"modelInfo,omitempty"`
+
 	// Tier is "local" or "cloud". Used by the fail-closed gate: sensitive-
 	// data rules cannot route to cloud-tier backends.
 	Tier string `json:"tier"`
@@ -240,6 +244,15 @@ type TokenCost struct {
 
 	// CompletionUSD is the cost per million completion (output) tokens.
 	CompletionUSD float64 `json:"completionUSD,omitempty"`
+}
+
+// ModelInfo is client-facing model metadata, compiled from
+// ModelRouter.spec.backends[].modelInfo. The controller fills both modality
+// lists, so the proxy publishes them as they are.
+type ModelInfo struct {
+	InputModalities  []string `json:"inputModalities,omitempty"`
+	OutputModalities []string `json:"outputModalities,omitempty"`
+	ContextLength    int64    `json:"contextLength,omitempty"`
 }
 
 // BackendPool carries the ModelPool membership a pooled backend belongs to.

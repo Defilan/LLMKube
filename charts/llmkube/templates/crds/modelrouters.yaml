@@ -410,6 +410,56 @@ spec:
                           type: string
                       type: object
                       x-kubernetes-map-type: atomic
+                    modelInfo:
+                      description: |-
+                        ModelInfo describes what this backend's model accepts and how much
+                        context it holds. The proxy publishes it on the backend's /v1/models
+                        entry, where clients decide whether to send images and how to size
+                        their context. Informational only: the proxy does not enforce it.
+                        Unset, the entry carries only the model id. Applies to the Proxy data
+                        plane only; the Gateway and AgentGateway data planes ignore it.
+                      properties:
+                        contextLength:
+                          description: |-
+                            ContextLength is the context window one request gets, in tokens. When
+                            unset, the controller fills it from the InferenceService:
+                            vllmConfig.maxModelLen (or --max-model-len in extraArgs) for vLLM, and
+                            contextSize divided across parallelSlots for llama.cpp. Other runtimes,
+                            and llama.cpp extraArgs that set those flags, publish none.
+                          format: int64
+                          minimum: 1
+                          type: integer
+                        inputModalities:
+                          description: |-
+                            InputModalities the model accepts. When unset, a backend whose
+                            capabilities include "vision" publishes ["text", "image"], and any
+                            other backend ["text"]. When set, it wins over capabilities.
+                          items:
+                            enum:
+                            - text
+                            - image
+                            - audio
+                            - video
+                            - file
+                            type: string
+                          maxItems: 5
+                          type: array
+                          x-kubernetes-list-type: set
+                        outputModalities:
+                          description: OutputModalities the model produces. Defaults
+                            to ["text"].
+                          items:
+                            enum:
+                            - text
+                            - image
+                            - audio
+                            - video
+                            - file
+                            type: string
+                          maxItems: 5
+                          type: array
+                          x-kubernetes-list-type: set
+                      type: object
                     name:
                       description: |-
                         Name is the stable identifier used by rules and observability labels.

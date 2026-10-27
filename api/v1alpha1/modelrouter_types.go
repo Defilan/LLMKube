@@ -217,6 +217,15 @@ type RouterBackend struct {
 	// +optional
 	DisplayName string `json:"displayName,omitempty"`
 
+	// ModelInfo describes what this backend's model accepts and how much
+	// context it holds. The proxy publishes it on the backend's /v1/models
+	// entry, where clients decide whether to send images and how to size
+	// their context. Informational only: the proxy does not enforce it.
+	// Unset, the entry carries only the model id. Applies to the Proxy data
+	// plane only; the Gateway and AgentGateway data planes ignore it.
+	// +optional
+	ModelInfo *RouterBackendModelInfo `json:"modelInfo,omitempty"`
+
 	// InferenceServiceRef references an in-cluster InferenceService.
 	// Mutually exclusive with External.
 	// +optional
@@ -297,6 +306,35 @@ type RouterBackend struct {
 	// P99 envelopes (in-cluster vLLM vs Anthropic global LB).
 	// +optional
 	Timeout *metav1.Duration `json:"timeout,omitempty"`
+}
+
+// RouterBackendModelInfo is the client-facing model metadata a backend
+// publishes on /v1/models.
+type RouterBackendModelInfo struct {
+	// InputModalities the model accepts. When unset, a backend whose
+	// capabilities include "vision" publishes ["text", "image"], and any
+	// other backend ["text"]. When set, it wins over capabilities.
+	// +kubebuilder:validation:MaxItems=5
+	// +kubebuilder:validation:items:Enum=text;image;audio;video;file
+	// +listType=set
+	// +optional
+	InputModalities []string `json:"inputModalities,omitempty"`
+
+	// OutputModalities the model produces. Defaults to ["text"].
+	// +kubebuilder:validation:MaxItems=5
+	// +kubebuilder:validation:items:Enum=text;image;audio;video;file
+	// +listType=set
+	// +optional
+	OutputModalities []string `json:"outputModalities,omitempty"`
+
+	// ContextLength is the context window one request gets, in tokens. When
+	// unset, the controller fills it from the InferenceService:
+	// vllmConfig.maxModelLen (or --max-model-len in extraArgs) for vLLM, and
+	// contextSize divided across parallelSlots for llama.cpp. Other runtimes,
+	// and llama.cpp extraArgs that set those flags, publish none.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	ContextLength *int64 `json:"contextLength,omitempty"`
 }
 
 // ExternalProvider describes an upstream LLM API outside the cluster.

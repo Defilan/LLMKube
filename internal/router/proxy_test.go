@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -418,6 +419,55 @@ func TestProxyModelsListedIDsRoute(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestProxyModelsModelInfo pins the /v1/models shape clients read to decide
+// whether to send images (#2248): a backend with ModelInfo publishes
+// context_length and an architecture block, a missing side of the modality
+// pair defaults to text, and a backend without ModelInfo keeps the bare entry.
+func TestProxyModelsModelInfo(t *testing.T) {
+	h := newProxyHarness(t)
+	h.cfg.Backends[0].ModelInfo = &ModelInfo{
+		InputModalities:  []string{"text", "image"},
+		OutputModalities: []string{"text"},
+		ContextLength:    524288,
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	rec := httptest.NewRecorder()
+	h.handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/v1/models = %d, want 200", rec.Code)
+	}
+	var got struct {
+		Data []map[string]json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode /v1/models: %v", err)
+	}
+	if len(got.Data) != 2 {
+		t.Fatalf("expected 2 models, got %d", len(got.Data))
+	}
+	first := got.Data[0]
+	if string(first["context_length"]) != "524288" {
+		t.Errorf("context_length = %s, want 524288", first["context_length"])
+	}
+	var arch struct {
+		Modality         string   `json:"modality"`
+		InputModalities  []string `json:"input_modalities"`
+		OutputModalities []string `json:"output_modalities"`
+	}
+	if err := json.Unmarshal(first["architecture"], &arch); err != nil {
+		t.Fatalf("decode architecture %s: %v", first["architecture"], err)
+	}
+	if arch.Modality != "text+image->text" || !slices.Equal(arch.InputModalities, []string{"text", "image"}) ||
+		!slices.Equal(arch.OutputModalities, []string{"text"}) {
+		t.Errorf("architecture = %+v, want text+image->text, input [text image], output [text]", arch)
+	}
+	for _, k := range []string{"context_length", "architecture"} {
+		if _, ok := got.Data[1][k]; ok {
+			t.Errorf("backend without ModelInfo published %q", k)
+		}
 	}
 }
 
