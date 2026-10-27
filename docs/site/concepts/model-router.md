@@ -524,6 +524,23 @@ The per-request audit-log line records `latencyMs`, `status`,
 stream-duration breakdown. "Why did this 8-minute agent loop run
 slow?" needs upstream metrics, not the proxy log.
 
+`outcome` says how a dispatched request ended:
+
+- `ok` or `ok_stream`: the response was relayed in full.
+- `client_cancelled`: the client disconnected. If no backend had
+  answered yet, the line records status `499` and no fallback is tried.
+- `upstream_error`: the backend broke off mid-response.
+- `timeout`: the backend missed the header deadline (on a rule that is
+  not fail-closed, the client gets a `504`), or a stream went silent past
+  `streamIdleTimeout`.
+- `all_backends_failed`: every backend errored or returned a 5xx (`502`).
+
+The failure outcomes carry the underlying `error`. For a response the
+proxy relayed, the same value labels `llmkube_router_requests_total`.
+The proxy cancels the upstream request when its own request ends, so a
+`cancel task` line in llama.cpp's log usually pairs with a
+`client_cancelled` or `timeout` line here.
+
 Per-request token/byte accounting and a proxy-emitted Prometheus
 histogram are planned for Phase 2 (issue [#433](https://github.com/defilantech/LLMKube/issues/433)).
 

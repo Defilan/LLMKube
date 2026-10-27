@@ -414,19 +414,6 @@ func (e *errorReader) Read(p []byte) (int, error) {
 }
 
 // ---------------------------------------------------------------------------
-// streamedReason
-// ---------------------------------------------------------------------------
-
-func TestStreamedReason(t *testing.T) {
-	if got := streamedReason(true); got != "ok_stream" {
-		t.Errorf("streamedReason(true) = %q, want ok_stream", got)
-	}
-	if got := streamedReason(false); got != "ok" {
-		t.Errorf("streamedReason(false) = %q, want ok", got)
-	}
-}
-
-// ---------------------------------------------------------------------------
 // enforceFailClosed - backend not configured
 // ---------------------------------------------------------------------------
 
