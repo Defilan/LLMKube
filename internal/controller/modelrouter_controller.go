@@ -96,6 +96,12 @@ type ModelRouterReconciler struct {
 	// means "no default — the user must specify URL explicitly".
 	DefaultLiteLLMURL string
 
+	// EmitScrapeAnnotations, when true, adds the prometheus.io/scrape, /path
+	// and /port annotations to router-proxy pods, pointing at the proxy's
+	// metrics listener, as InferenceServiceReconciler does for inference pods.
+	// Set via --emit-scrape-annotations; default false.
+	EmitScrapeAnnotations bool
+
 	// BudgetStatusURL overrides how the reconciler derives the proxy's budget
 	// admin URL from a ModelRouter. Nil means routerProxyBudgetEndpoint, the
 	// in-cluster Service address. Tests inject it to point at a stub proxy.

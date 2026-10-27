@@ -226,7 +226,8 @@ func main() {
 	flag.BoolVar(&emitScrapeAnnotations, "emit-scrape-annotations", false,
 		"Add prometheus.io/scrape,path,port annotations (port = resolved endpoint port) to every "+
 			"inference Pod so annotation-based scrapers discover /metrics without a per-InferenceService "+
-			"podAnnotations block or a PodMonitor. User-set podAnnotations win. Default false.")
+			"podAnnotations block or a PodMonitor. User-set podAnnotations win. Router-proxy Pods get "+
+			"them too, pointing at the proxy's metrics port (9090). Default false.")
 	flag.StringVar(&gpuSharingSharedPoolSelector, "gpu-sharing-shared-pool-selector", "",
 		"Node selector (key=value[,key=value]) for the shared-GPU pool that gpuSharing mode "+
 			"shared schedules onto. Empty (default) means no shared pool exists and mode shared "+
@@ -712,11 +713,12 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.ModelRouterReconciler{
-		Client:            mgr.GetClient(),
-		Scheme:            mgr.GetScheme(),
-		RouterProxyImage:  routerProxyImage,
-		DefaultLiteLLMURL: defaultLiteLLMURL,
-		Recorder:          mgr.GetEventRecorder("modelrouter-controller"),
+		Client:                mgr.GetClient(),
+		Scheme:                mgr.GetScheme(),
+		RouterProxyImage:      routerProxyImage,
+		DefaultLiteLLMURL:     defaultLiteLLMURL,
+		EmitScrapeAnnotations: emitScrapeAnnotations,
+		Recorder:              mgr.GetEventRecorder("modelrouter-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ModelRouter")
 		os.Exit(1)

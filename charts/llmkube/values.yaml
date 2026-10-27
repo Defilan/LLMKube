@@ -206,12 +206,15 @@ metrics:
   # default) to every inference Pod so annotation-based scrapers (e.g. Grafana
   # Alloy) discover the runtime's /metrics without a per-InferenceService
   # podAnnotations block or a PodMonitor. A user-set spec.podAnnotations value
-  # always wins. Default off.
+  # always wins. The router-proxy Pods a ModelRouter creates get the same three
+  # annotations, pointing at the proxy's metrics port (9090). Default off.
   #
   # This is an ALTERNATIVE to a PodMonitor/ServiceMonitor, not a companion: if
   # one already scrapes these pods, do NOT also enable this against the same
   # Prometheus, or every target is scraped twice (duplicated series and
-  # samples). Pick one discovery mechanism per Prometheus.
+  # samples). Pick one discovery mechanism per Prometheus. That covers
+  # inferencePodMonitor for inference pods and routerPodMonitor for router-proxy
+  # pods.
   emitScrapeAnnotations: false
   # Serve metrics over HTTPS with authn/authz (true) or plain HTTP (false).
   # Set to false when scraping from outside the cluster without a ServiceAccount token.
