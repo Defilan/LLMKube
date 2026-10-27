@@ -232,7 +232,7 @@ func ownedPrefetchJob(ctx context.Context, c client.Reader, model *inferencev1al
 // is already gone is not an error.
 func deletePrefetchJob(ctx context.Context, c client.Client, job *batchv1.Job) error {
 	propagation := metav1.DeletePropagationBackground
-	if job.Spec.PodReplacementPolicy != nil && *job.Spec.PodReplacementPolicy == batchv1.Failed {
+	if prefetchJobIsStager(job) {
 		// These stagers may bypass flock on FUSE. Keep the Job's name
 		// occupied until its pods are gone, including on spec replacement.
 		propagation = metav1.DeletePropagationForeground
@@ -241,6 +241,23 @@ func deletePrefetchJob(ctx context.Context, c client.Client, job *batchv1.Job) e
 		return err
 	}
 	return nil
+}
+
+// prefetchJobIsStager reports whether a prefetch Job is a stager, one whose
+// downloader may write a FUSE cache without flock. It reads the switch
+// buildPrefetchJob sets in the pod template, not spec.podReplacementPolicy:
+// the API server drops that field when the JobPodReplacementPolicy feature
+// gate is off, and a stager read back without it must still be deleted in
+// the foreground (#2252).
+func prefetchJobIsStager(job *batchv1.Job) bool {
+	for _, c := range job.Spec.Template.Spec.InitContainers {
+		for _, env := range c.Env {
+			if env.Name == "LLMKUBE_PREFETCH_STAGER" && env.Value == "true" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // serviceReportsPrefetchedFilesMissing reports whether a service's pods found

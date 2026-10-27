@@ -136,8 +136,11 @@ For HTTP/HF sources, set `spec.modelCache.prefetch: true` on every
 InferenceService using such a claim. The operator's prefetch Job is allowed
 to stage on FUSE without relying on `flock`. It waits for a failed pod before
 creating a replacement, so a terminating writer is not overlapped by its
-retry. Operator-driven Job replacement also waits for the old Job's pods to
-be deleted. If an old pod is stuck on a NotReady node, recover the node or
+retry. That wait uses the Job's `podReplacementPolicy`, which needs the
+`JobPodReplacementPolicy` feature gate (on by default from Kubernetes 1.29);
+with the gate off, the API server drops the field and a retry can start while
+the failed pod is still terminating. Operator-driven Job replacement waits for
+the old Job's pods to be deleted either way. If an old pod is stuck on a NotReady node, recover the node or
 ensure its writer has stopped before force-deleting that pod to unblock
 replacement. Serving pods wait for successful staging into their claim,
 then mount the cache read-only. See
