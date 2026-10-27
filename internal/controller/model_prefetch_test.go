@@ -77,6 +77,7 @@ var _ = Describe("Model Prefetch", func() {
 			Expect(client.IgnoreAlreadyExists(err)).To(Succeed())
 		}
 	})
+	AfterEach(func() { collectPrefetchJobs(ctx, ns) })
 
 	Describe("prefetchEligible", func() {
 		It("is false when the field is unset", func() {

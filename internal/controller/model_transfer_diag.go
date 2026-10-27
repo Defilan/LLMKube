@@ -353,12 +353,7 @@ func findModelTransferFailure(pods []corev1.Pod) (modelTransferFailure, bool) {
 // podMountsModelCache reports whether the pod mounts the model-cache PVC, the
 // only mount a cache-prep init container ever prepared.
 func podMountsModelCache(pod *corev1.Pod) bool {
-	for i := range pod.Spec.Volumes {
-		if pod.Spec.Volumes[i].Name == "model-cache" && pod.Spec.Volumes[i].PersistentVolumeClaim != nil {
-			return true
-		}
-	}
-	return false
+	return cacheClaimName(&pod.Spec) != ""
 }
 
 // writesModelCache reports whether a generated init container writes the model

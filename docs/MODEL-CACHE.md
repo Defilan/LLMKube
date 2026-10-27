@@ -167,9 +167,12 @@ then mount the cache read-only. See
 [Letting the service require a prefetch](#letting-the-service-require-a-prefetch).
 
 `s3://` and local sources do not support prefetch. Use storage with cross-node
-`flock` support, or stage the files separately and use a `pvc://` source. Avoid
-other writers (including separate Models sharing the same cache key) while a
-prefetch Job stages its directory. Other filesystems still use `flock`;
+`flock` support, or stage the files separately and use a `pvc://` source. The
+operator runs one prefetch stager at a time per cache directory and claim, so
+separate Models sharing a cache key take turns (see
+[Prefetch](#prefetch-eager-download)); avoid writers it does not manage, such
+as a hand-run Job mounting the claim, while a prefetch Job stages its
+directory. Other filesystems still use `flock`;
 their cross-node lock semantics must be supported by the storage provider.
 
 ## Integrity Verification (spec.sha256)
@@ -307,6 +310,16 @@ one entry per claim with the Job name, the phase (`Pending`, `Running`,
 that alters the files (the source, `files`, a revision, `fileSha256`) runs
 a new prefetch; one that does not (placement, tolerations) only refreshes
 the entry. Deleting a finished Job retries it.
+
+Prefetch stagers run one at a time per cache directory and claim. The cache
+directory is keyed on the source alone, so two Models on one source share it,
+and on a FUSE claim a stager writes without `flock`. While another prefetch Job
+(or a pod left from one) for the same directory and claim is still active, the
+operator does not create the next one: that Model's entry stays `Pending`,
+`PrefetchWaiting=True` (reason `PrefetchWaitingForStager`) names the Job and
+the Model it waits for, and the Model checks again every 15 seconds. Once the
+first Job has finished, the second starts and finds the files it already
+staged.
 
 Two conditions report what the field could not do:
 

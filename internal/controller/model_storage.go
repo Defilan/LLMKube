@@ -804,9 +804,10 @@ const fuseSuperMagic = "65735546"
 // flock does not exclude across nodes on a FUSE cache (BlobFuse lists it as
 // unsupported), so cacheDirLock cannot keep two nodes' `curl -C -` writers off
 // one partial there (#2158). On FUSE only the prefetch stager may write: it
-// creates the directory and stages without the lock. A serving pod on FUSE
-// takes no lock, creates nothing, and sweeps nothing; it may use a warm cache,
-// and llmkube_stage_allowed refuses any transfer with
+// creates the directory and stages without the lock, and the controller runs
+// one stager at a time per cache directory and claim (activeStager, #2250). A
+// serving pod on FUSE takes no lock, creates nothing, and sweeps nothing; it
+// may use a warm cache, and llmkube_stage_allowed refuses any transfer with
 // ModelCacheLockUnsupported and the remedy for the source kind. Other
 // filesystems keep the directory lock.
 //

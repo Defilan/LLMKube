@@ -205,6 +205,30 @@ func finishJobDeletion(ctx context.Context, key types.NamespacedName) {
 	Expect(client.IgnoreNotFound(k8sClient.Update(ctx, job))).To(Succeed())
 }
 
+// collectPrefetchJobs stands in for the garbage collector after a spec: the
+// Models it created are deleted, but envtest never removes the prefetch Jobs
+// they own, and a Job left running holds every later prefetch of the same
+// cache directory and claim (#2250). It removes every prefetch Job and pod in
+// ns, finalizers included.
+func collectPrefetchJobs(ctx context.Context, ns string) {
+	selector := client.MatchingLabels{"app.kubernetes.io/component": "model-prefetch"}
+	jobs := &batchv1.JobList{}
+	Expect(k8sClient.List(ctx, jobs, client.InNamespace(ns), selector)).To(Succeed())
+	for i := range jobs.Items {
+		job := &jobs.Items[i]
+		if len(job.Finalizers) > 0 {
+			job.Finalizers = nil
+			Expect(client.IgnoreNotFound(k8sClient.Update(ctx, job))).To(Succeed())
+		}
+		Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)))).To(Succeed())
+	}
+	pods := &corev1.PodList{}
+	Expect(k8sClient.List(ctx, pods, client.InNamespace(ns), selector)).To(Succeed())
+	for i := range pods.Items {
+		Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, &pods.Items[i], client.GracePeriodSeconds(0)))).To(Succeed())
+	}
+}
+
 // cacheClaimOf returns the PersistentVolumeClaim the pod's model-cache volume
 // mounts, or "".
 func cacheClaimOf(spec *corev1.PodSpec) string {
@@ -329,6 +353,7 @@ var _ = Describe("InferenceService modelCache.prefetch (#2136)", func() {
 		nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
 		Expect(client.IgnoreAlreadyExists(k8sClient.Create(ctx, nsObj))).To(Succeed())
 	})
+	AfterEach(func() { collectPrefetchJobs(ctx, ns) })
 
 	It("holds the first rollout until the prefetch into its claim succeeds, then mounts the cache read-only with no downloader, and holds later rollouts the same way", func() {
 		createCachePVC(ctx, ns, "svc-cache")

@@ -155,7 +155,8 @@ service can also require that its weights were staged before it starts, with
 into its claim succeeds, and its pods mount the claim read-only with no
 downloader. See the Prefetch section of `docs/MODEL-CACHE.md` for the full
 contract, including the `PrefetchTargetMismatch` and `PrefetchSkipped`
-conditions.
+conditions, and `PrefetchWaiting`, which a Model reports while its prefetch
+waits for another Model's prefetch of the same source into the same claim.
 
 Pair `modelCache.prefetch` with `spec.hubOffline: true` on the service: the Job
 stages the checkpoint, and the serving container gets `HF_HUB_OFFLINE=1` and
