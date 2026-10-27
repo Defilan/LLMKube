@@ -58,8 +58,27 @@ The `llmkube-metal-agent` binary in a release archive
 (`LLMKube-metal-agent_<version>_darwin_<arch>.tar.gz`) can replace the build
 step: from the directory you extracted the archive into, copy
 `llmkube-metal-agent` instead of `bin/llmkube-metal-agent`. The archive carries
-`deployment/macos/` but not the Makefile. The release binary is not notarized;
-if macOS refuses to run it, build from source.
+`deployment/macos/` but not the Makefile.
+
+Release binaries carry an embedded Info.plist (bundle identifier
+`dev.llmkube.metal-agent`, a display name and the Local Network usage
+description) and a code signature bound to it. A release built with the project's signing
+secrets is signed with a Developer ID certificate and notarized by Apple; check
+a binary with:
+
+```bash
+codesign -dv --verbose=4 llmkube-metal-agent   # Identifier=dev.llmkube.metal-agent, Info.plist entries=9
+spctl --assess --type install -vv llmkube-metal-agent   # accepted, source=Notarized Developer ID
+```
+
+A bare executable cannot carry a stapled notarization ticket, so Gatekeeper
+checks it online the first time a downloaded copy runs. A release built
+without the secrets is ad-hoc signed: it runs once copied into place, but if
+macOS refuses a downloaded copy, build from source. A binary from
+`make build-metal-agent` has no Info.plist and only the Go linker's ad-hoc
+signature. If an agent already running under launchd fails to start after you
+replace its binary with a differently signed one, reload it as in "Applying a
+plist change" below.
 
 ## Usage
 

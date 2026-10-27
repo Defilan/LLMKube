@@ -100,10 +100,16 @@ sed 's|__HOME__|'"$HOME"'|g' deployment/macos/com.llmkube.metal-agent.plist \
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
 ```
 
-The release binary is not notarized. If macOS refuses to run it, install from
-source instead. For an archive install, a kubeconfig other than
-`~/.kube/config` goes in the plist's `ProgramArguments` as
-`--kubeconfig <file>`.
+When the release was built with the project's signing secrets, the binary is
+signed with a Developer ID certificate and notarized by Apple
+(`spctl --assess --type install -vv llmkube-metal-agent` reports
+`source=Notarized Developer ID`); otherwise it is ad-hoc signed, and if macOS
+refuses to run it, install from source instead. Either way it embeds an
+Info.plist with the bundle identifier `dev.llmkube.metal-agent` and the
+description of why it needs local network access.
+
+For an archive install, a kubeconfig other than `~/.kube/config` goes in the
+plist's `ProgramArguments` as `--kubeconfig <file>`.
 
 Whichever way you installed it, if macOS asks whether `llmkube-metal-agent` may
 accept incoming connections, allow it: the in-cluster relay connects to the

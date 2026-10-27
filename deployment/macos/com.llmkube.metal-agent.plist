@@ -5,6 +5,15 @@
     <key>Label</key>
     <string>com.llmkube.metal-agent</string>
 
+    <!-- The bundle identifier the release binary is signed with (its
+         embedded Info.plist), so macOS attributes this background item to
+         it. Apple TN3179 asks launchd agents not installed through
+         SMAppService to set this. -->
+    <key>AssociatedBundleIdentifiers</key>
+    <array>
+        <string>dev.llmkube.metal-agent</string>
+    </array>
+
     <key>ProgramArguments</key>
     <array>
         <string>/usr/local/bin/llmkube-metal-agent</string>

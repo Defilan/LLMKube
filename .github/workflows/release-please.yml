@@ -79,6 +79,29 @@ jobs:
         env:
           VERSION: ${{ needs.release-please.outputs.version || github.sha }}
 
+      - name: Install rcodesign
+        # hack/macos-sign.sh, the GoReleaser post-build hook for the darwin
+        # binaries, signs them with rcodesign, which runs on Linux (#2084).
+        # Pinned by version and SHA-256 in hack/install-rcodesign.sh: a
+        # mismatch fails the release, while a failed download only warns
+        # (the hook then fails if signing is configured).
+        if: ${{ github.event_name == 'push' }}
+        run: |
+          ./hack/install-rcodesign.sh "$RUNNER_TEMP/rcodesign"
+          echo "$RUNNER_TEMP/rcodesign" >> "$GITHUB_PATH"
+
+      - name: Check macOS signing and notarization settings
+        # The notarize-macos job runs after the release is published, so a
+        # notary misconfiguration has to fail here, before anything is.
+        if: ${{ github.event_name == 'push' }}
+        env:
+          MACOS_SIGNING_REQUIRED: ${{ vars.MACOS_SIGNING_REQUIRED }}
+          MACOS_SIGN_P12_SET: ${{ secrets.MACOS_SIGN_P12 != '' }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: ./hack/macos-notarize.sh --preflight >/dev/null
+
       - name: Run GoReleaser
         if: ${{ github.event_name == 'push' }}
         uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
@@ -89,6 +112,15 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          # Read by hack/macos-sign.sh (docs/contributing/macos-signing.md).
+          # Unset: the darwin binaries are ad-hoc signed. A .p12 without its
+          # password fails the release, and so does a missing .p12 once the
+          # repository variable MACOS_SIGNING_REQUIRED is true. The notary
+          # key is not needed here: the notarize-macos job submits the
+          # binaries after the release.
+          MACOS_SIGNING_REQUIRED: ${{ vars.MACOS_SIGNING_REQUIRED }}
+          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
 
       - name: Publish Homebrew formula
         # GoReleaser no longer manages the tap (its cask replacement is
@@ -307,6 +339,58 @@ jobs:
           cosign verify "${img}@${digest}" \
             --certificate-identity-regexp "$id_re" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+  notarize-macos:
+    # Submits every darwin binary of the release to Apple's notary service in
+    # one submission (hack/macos-notarize.sh, #2084). It runs after the
+    # release is published because notarization does not change the
+    # binaries: the published assets become notarized when Apple accepts
+    # them. A slow queue or a transient failure fails only this job, and
+    # "Re-run failed jobs" resubmits without rebuilding anything.
+    needs: [release-please, goreleaser]
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    env:
+      MACOS_SIGNING_REQUIRED: ${{ vars.MACOS_SIGNING_REQUIRED }}
+      MACOS_SIGN_P12_SET: ${{ secrets.MACOS_SIGN_P12 != '' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check whether to notarize
+        id: check
+        env:
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        # An assignment, not echo "$(...)", so a failed check fails the step.
+        run: |
+          notarize="$(./hack/macos-notarize.sh --preflight)"
+          echo "notarize=${notarize}" >> "$GITHUB_OUTPUT"
+
+      - name: Download the release's binaries
+        if: ${{ steps.check.outputs.notarize == 'true' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-artifacts
+          path: dist
+
+      - name: Install rcodesign
+        if: ${{ steps.check.outputs.notarize == 'true' }}
+        run: |
+          ./hack/install-rcodesign.sh "$RUNNER_TEMP/rcodesign"
+          echo "$RUNNER_TEMP/rcodesign" >> "$GITHUB_PATH"
+
+      - name: Notarize the darwin binaries
+        if: ${{ steps.check.outputs.notarize == 'true' }}
+        env:
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: ./hack/macos-notarize.sh dist/artifacts.json
 
   release-helm:
     needs: release-please
