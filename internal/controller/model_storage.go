@@ -1320,12 +1320,22 @@ func buildMultiFileInitCommand(useCache, isS3, isHFAuth, withSHA256 bool, refres
 		`echo "WARNING: no valid size record for $rel; keeping cached copy without size validation" >&2; ` +
 		backfill + `return 0; }; `
 	prefix += sizeCheck
+	accept := `llmkube_cached_size_matches`
+	if withSHA256 {
+		accept = `{ if [ -n "${MODEL_SHA256:-}" ]; then llmkube_accept_file "$dest"; else llmkube_cached_size_matches; fi; }`
+	}
 	downloadOrCached := func(download, cachedEcho string) string {
-		accept := `llmkube_cached_size_matches`
-		if withSHA256 {
-			accept = `{ if [ -n "${MODEL_SHA256:-}" ]; then llmkube_accept_file "$dest"; else llmkube_cached_size_matches; fi; }`
-		}
 		return `if [ -f "$dest" ] && ` + accept + `; then ` + cachedEcho + `; else ` + download + `fi; `
+	}
+	// An OnChange serving pod on FUSE that cannot keep the file as it is has
+	// nothing to fall back to: it keeps a cached copy that passes the local
+	// checks and says why (the origin changed, or did not answer), or refuses.
+	// Without this it ran into llmkube_prepare_download's refusal and then
+	// logged the kept copy as an unreachable revalidation (#2255).
+	onChangeRefresh := `if `
+	if useCache {
+		onChangeRefresh = `if llmkube_fuse_reader; then if [ -f "$dest" ] && ` + accept + `; then ` + fuseKeptCachedEcho(`$rel`) +
+			`else llmkube_stage_allowed "$rel"; exit 1; fi; elif `
 	}
 
 	if isS3 {
@@ -1342,7 +1352,7 @@ func buildMultiFileInitCommand(useCache, isS3, isHFAuth, withSHA256 bool, refres
 				`if [ -f "$dest" ] && [ "$(stat -c %s "$dest" 2>/dev/null || echo 0)" = "$remote_size" ] && [ "$remote_size" != "0" ]` + sizeHit + `; then ` +
 				`echo "Model artifact $rel revalidated (unchanged, skipped download)"; ` +
 				`else ` +
-				`if llmkube_prepare_download && download_with_progress "$dest.tmp" "" s3_curl -f -L -o "$dest.tmp" "$url" --no-progress-meter && ` + publishFile("$dest.tmp") + `; then ` +
+				onChangeRefresh + `llmkube_prepare_download && download_with_progress "$dest.tmp" "" s3_curl -f -L -o "$dest.tmp" "$url" --no-progress-meter && ` + publishFile("$dest.tmp") + `; then ` +
 				`echo "Model artifact $rel revalidated (downloaded)"; ` +
 				keepCachedTail +
 				`fi; ` +
@@ -1380,7 +1390,7 @@ func buildMultiFileInitCommand(useCache, isS3, isHFAuth, withSHA256 bool, refres
 			`if [ -f "$dest" ] && [ "$(stat -c %s "$dest" 2>/dev/null || echo 0)" = "$remote_size" ] && [ "$remote_size" != "0" ]` + sizeHit + `; then ` +
 			`echo "Model artifact $rel revalidated (unchanged, skipped download)"; ` +
 			`else ` +
-			`if llmkube_prepare_download && { ` + validatorDeriveAndSweep() +
+			onChangeRefresh + `llmkube_prepare_download && { ` + validatorDeriveAndSweep() +
 			`download_with_progress "$MODEL_PARTIAL" "$remote_size" ` + curlCmd(isHFAuth) + ` -fsSL -C - -o "$MODEL_PARTIAL" "$url" --no-progress-meter && ` + partialSizeGuard + publishFile("$MODEL_PARTIAL") + `; }; then ` +
 			`echo "Model artifact $rel revalidated (downloaded)"; ` +
 			keepCachedTail +

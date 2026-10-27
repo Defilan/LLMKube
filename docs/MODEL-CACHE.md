@@ -124,7 +124,11 @@ Concurrent staging requires filesystem locks that work across writer nodes.
 artifacts on FUSE mounts, for single-file models as well as multi-file ones
 (single-file models since #2254). Warm caches remain usable, including when the
 origin is offline; the serving downloader does not sweep temporary files or
-create a lock file on these mounts. Detection uses the Linux FUSE magic value,
+create a lock file on these mounts. Under `RefreshPolicy: OnChange`, a serving
+pod that finds the upstream changed keeps a cached copy that passes its local
+checks and logs `Upstream changed for <file>; a serving pod does not stage on a
+FUSE cache, so it kept the cached copy`; it serves the old revision until a
+prefetch stager refreshes the cache. Detection uses the Linux FUSE magic value,
 which also covers virtiofs (including Kata Containers volumes).
 It reads the magic with `stat -f`; a custom init image whose `stat` lacks
 `-f` cannot detect FUSE, so it stages under the directory lock as before and

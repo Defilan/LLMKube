@@ -234,6 +234,8 @@ func runMultiFileFUSEWarmCacheCase(t *testing.T, realStat, policy string, s3 boo
 		}
 	} else if err != nil {
 		t.Fatalf("warm FUSE cache failed: %v\n%s", err, out)
+	} else {
+		assertFUSEWarmCacheLog(t, out, policy, state)
 	}
 	if gets.Load() != 0 {
 		t.Errorf("serving pod attempted %d downloads on FUSE", gets.Load())
@@ -253,6 +255,31 @@ func runMultiFileFUSEWarmCacheCase(t *testing.T, realStat, policy string, s3 boo
 		}
 	} else if _, err := os.Stat(dest + ".llmkube-size"); !os.IsNotExist(err) {
 		t.Error("serving pod wrote a size record on FUSE")
+	}
+}
+
+// assertFUSEWarmCacheLog checks a warm FUSE start says what happened to the
+// copy it kept: neither a refusal nor an unreachable origin when the origin
+// answered (#2255).
+func assertFUSEWarmCacheLog(t *testing.T, out, policy, state string) {
+	t.Helper()
+	if strings.Contains(out, "ModelCacheLockUnsupported") {
+		t.Errorf("a warm FUSE cache start logged a refusal:\n%s", out)
+	}
+	if policy != RefreshPolicyOnChange {
+		return
+	}
+	want := map[string]string{
+		"offline":          "Revalidation unreachable for model.safetensors; kept cached copy",
+		"matching":         "Model artifact model.safetensors revalidated (unchanged, skipped download)",
+		"changed":          "Upstream changed for model.safetensors; a serving pod does not stage on a FUSE cache, so it kept the cached copy",
+		"changed-recorded": "Upstream changed for model.safetensors; a serving pod does not stage on a FUSE cache, so it kept the cached copy",
+	}[state]
+	if !strings.Contains(out, want) {
+		t.Errorf("log does not say %q:\n%s", want, out)
+	}
+	if state != "offline" && strings.Contains(out, "unreachable") {
+		t.Errorf("the origin answered, but the log calls it unreachable:\n%s", out)
 	}
 }
 
