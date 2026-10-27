@@ -135,7 +135,10 @@ member (two to eight minutes measured on the Spark ring).
 
 Any change to `spec.multiNode`, the model, the image, or the runtime config
 recreates the group as well. `replicas` must be 1 or unset; autoscaling does
-not apply.
+not apply. A `spec.autoscaling` block on a multiNode service is ignored: the
+operator creates no HorizontalPodAutoscaler for it, deletes one it created
+earlier, and reports `AutoscalingReady=False` with reason
+`UnsupportedForMultiNode` without failing the service.
 
 ### Bounded recreates
 

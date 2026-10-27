@@ -1360,3 +1360,68 @@ func TestQuotaWebhookChargesMaxReplicas(t *testing.T) {
 		}
 	})
 }
+
+// TestQuotaWebhookWarnsMultiNodeAutoscaling: spec.autoscaling on a
+// spec.multiNode service is admitted with a warning, never rejected, so an
+// object that already carries both stays updatable (#2094).
+func TestQuotaWebhookWarnsMultiNodeAutoscaling(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	if err := inferencev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add scheme: %v", err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add core: %v", err)
+	}
+	ns := corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
+	v := &InferenceServiceQuotaValidator{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(&ns).Build()}
+
+	multiNode := &inferencev1alpha1.MultiNodeSpec{Members: []inferencev1alpha1.MultiNodeMember{
+		{Node: "node-a", Fabric: &inferencev1alpha1.MultiNodeMemberFabric{Address: "10.0.0.1"}},
+		{Node: "node-b"},
+	}}
+	autoscaling := &inferencev1alpha1.AutoscalingSpec{MaxReplicas: 4}
+
+	cases := []struct {
+		name        string
+		multiNode   *inferencev1alpha1.MultiNodeSpec
+		autoscaling *inferencev1alpha1.AutoscalingSpec
+		wantWarning bool
+	}{
+		{name: "multiNode and autoscaling", multiNode: multiNode, autoscaling: autoscaling, wantWarning: true},
+		{name: "multiNode only", multiNode: multiNode},
+		{name: "autoscaling only", autoscaling: autoscaling},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			isvc := inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: "mn-svc", Namespace: "default"},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					Runtime:     "vllm",
+					MultiNode:   tc.multiNode,
+					Autoscaling: tc.autoscaling,
+				},
+			}
+			createWarnings, err := v.ValidateCreate(ctx, &isvc)
+			if err != nil {
+				t.Fatalf("create rejected: %v", err)
+			}
+			updateWarnings, err := v.ValidateUpdate(ctx, isvc.DeepCopy(), &isvc)
+			if err != nil {
+				t.Fatalf("update rejected: %v", err)
+			}
+			for op, warnings := range map[string]admission.Warnings{"create": createWarnings, "update": updateWarnings} {
+				if !tc.wantWarning {
+					if len(warnings) != 0 {
+						t.Fatalf("%s: unexpected warnings %v", op, warnings)
+					}
+					continue
+				}
+				if len(warnings) != 1 || !strings.Contains(warnings[0], "spec.autoscaling has no effect with spec.multiNode") ||
+					!strings.Contains(warnings[0], ReasonUnsupportedForMultiNode) {
+					t.Fatalf("%s: warnings %v, want one naming spec.multiNode and %s", op, warnings, ReasonUnsupportedForMultiNode)
+				}
+			}
+		})
+	}
+}
