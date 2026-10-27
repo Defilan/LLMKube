@@ -112,7 +112,15 @@ verification.
 The downloader checks the size again after publishing and removes the
 destination, checksum stamp, and staged size record if publication left the
 wrong size. Size records are written using a temporary file and rename so
-concurrent readers cannot observe a partially written number.
+concurrent readers cannot observe a partially written number. The same writer
+produces checksum stamps and rejection markers; its temporary files are named
+`<file>.llmkube-tmp.XXXXXX`. A pod that dies mid-write can leave one behind, so
+every downloader allowed to write the cache (any pod off FUSE, the prefetch
+stager on FUSE) removes such files once they are more than ten minutes old,
+along with the older `<file>.llmkube-size.XXXXXX` and
+`<marker>.sha256-rejected.XXXXXX` names. A stamp temporary from before this
+naming, `<file>.sha256.XXXXXX`, is not swept because that pattern can match a
+file a repository ships; delete one by hand if you find it.
 
 `OnChange` still revalidates each file against the current origin. A mutable
 source can therefore change shards independently during a refresh. Pin the

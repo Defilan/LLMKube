@@ -693,7 +693,27 @@ func hfAuthPrefix(isHFAuth bool) string {
 // so it compares equal to sha256sum output.
 const sha256HashFns = `llmkube_sha256_hash() { actual=$(sha256sum "$1" 2>/dev/null | cut -d" " -f1); if [ -z "$actual" ]; then echo "ERROR: could not compute the SHA256 of $1" >&2; return 1; fi; printf '%s' "$actual"; }; llmkube_precheck_sha256() { if [ -z "${MODEL_SHA256:-}" ]; then echo "ERROR: this downloader was built with SHA256 gates but MODEL_SHA256 is unset; refusing to transfer unchecked" >&2; return 1; fi; }; `
 
-const atomicWriteFn = `llmkube_atomic_write() { _llmkube_tmp=$(mktemp "$1.XXXXXX") || return 1; printf '%s' "$2" > "$_llmkube_tmp" && mv "$_llmkube_tmp" "$1"; }; `
+// atomicWriteFn defines llmkube_atomic_write, which writes a stamp, marker or
+// size record through a temp file and a rename so a concurrent reader never
+// sees a partial one. The temp file is named <dest>.llmkube-tmp.XXXXXX, a name
+// no artifact has, so atomicWriteDebrisSweep can find one a dead pod left; it
+// must not end in .tmp, which the resume sweeps own. A failed write removes
+// its own temp file.
+const atomicWriteFn = `llmkube_atomic_write() { _llmkube_tmp=$(mktemp "$1.llmkube-tmp.XXXXXX") || return 1; if printf '%s' "$2" > "$_llmkube_tmp" && mv "$_llmkube_tmp" "$1"; then return 0; fi; rm -f "$_llmkube_tmp"; return 1; }; `
+
+// atomicWriteDebrisSweep removes the temp files llmkube_atomic_write leaves
+// when a pod dies between its mktemp and its mv (#2255): the resume sweeps
+// delete only *.tmp, so these would otherwise stay on the claim. It also
+// takes the two unambiguous names the writer used before .llmkube-tmp
+// (<file>.llmkube-size.XXXXXX and <marker>.sha256-rejected.XXXXXX). The old
+// <file>.sha256.XXXXXX stamp temp is left alone: that pattern can match a
+// file a repository ships.
+//
+// Only files older than ten minutes go. A write takes milliseconds, and a
+// serving pod on FUSE writes stamps without the directory lock, so a young
+// match may be another pod's write in flight. The sweep is best effort and
+// never fails the start.
+const atomicWriteDebrisSweep = `find "$CACHE_DIR" -type f \( -name '*.llmkube-tmp.??????' -o -name '*.llmkube-size.??????' -o -name '*.sha256-rejected.??????' \) -mmin +10 -delete 2>/dev/null; `
 
 // sha256VerifyFns is the download-time gate set: sha256HashFns plus the
 // atomic stamp/marker writers and the verify-then-publish pair.
@@ -802,8 +822,8 @@ func cacheStagingPrologue(remedy string) string {
 	return `cache_fs=$(stat -f -c %t "$CACHE_DIR" 2>/dev/null || stat -f -c %t "$(dirname "$CACHE_DIR")") || { echo "WARNING: cannot determine the cache filesystem: this init image's stat has no -f; staging under the directory lock, which does not exclude pods on other nodes on a FUSE cache" >&2; cache_fs=unknown; }; ` +
 		`llmkube_fuse_reader() { [ "$cache_fs" = ` + fuseSuperMagic + ` ] && [ "${LLMKUBE_PREFETCH_STAGER:-false}" != true ]; }; ` +
 		`llmkube_stage_allowed() { if llmkube_fuse_reader; then echo "ERROR: ModelCacheLockUnsupported: FUSE cache cannot guarantee cross-node file locking for staging $1; ` + remedy + `" >&2; return 1; fi; }; ` +
-		`if [ "$cache_fs" != ` + fuseSuperMagic + ` ]; then mkdir -p "$CACHE_DIR" || exit 1; ` + cacheDirLock +
-		`elif [ "${LLMKUBE_PREFETCH_STAGER:-false}" = true ]; then mkdir -p "$CACHE_DIR" || exit 1; fi; `
+		`if [ "$cache_fs" != ` + fuseSuperMagic + ` ]; then mkdir -p "$CACHE_DIR" || exit 1; ` + cacheDirLock + atomicWriteDebrisSweep +
+		`elif [ "${LLMKUBE_PREFETCH_STAGER:-false}" = true ]; then mkdir -p "$CACHE_DIR" || exit 1; ` + atomicWriteDebrisSweep + `fi; `
 }
 
 // unlessFUSEReader runs cmd, a cache write that is not a transfer (a sweep),

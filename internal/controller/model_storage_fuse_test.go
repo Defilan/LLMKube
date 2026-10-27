@@ -27,6 +27,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -639,5 +640,158 @@ func TestMultiFileFUSEStagerBackfillsSizeRecord(t *testing.T) {
 	}
 	if strings.Contains(out, noRecord) {
 		t.Errorf("the backfilled record was not used on the next start:\n%s", out)
+	}
+}
+
+// TestCacheAtomicWriteDebrisSweep: a pod that may write the cache removes the
+// temp files a dead pod's llmkube_atomic_write left, once they are old enough
+// that no write can still be using them, and nothing else (#2255). A serving
+// pod on FUSE writes nothing, so it sweeps nothing either. Both builders open
+// with the same prologue; each is run on a warm cache, so no transfer runs.
+func TestCacheAtomicWriteDebrisSweep(t *testing.T) {
+	requireInitShellEnvironment(t)
+	const marker = "model.0123abcd.sha256-rejected"
+	for _, builder := range []string{"single-file", "multi-file"} {
+		for _, role := range []string{"ext4/serving", "fuse/serving", "fuse/prefetch"} {
+			t.Run(builder+"/"+role, func(t *testing.T) {
+				fs, prefetch, _ := strings.Cut(role, "/")
+				model := singleFileFUSEModel("https://example.invalid/org/repo/model.gguf", RefreshPolicyIfNotPresent)
+				model.Status.Path = "/models/cache/model.gguf"
+				artifact := "model.gguf"
+				if builder == "multi-file" {
+					model.Spec.Source, model.Spec.Format, model.Spec.Files = "https://example.invalid/org/repo", "safetensors", []string{"sub/model.safetensors"}
+					artifact = "sub/model.safetensors"
+				}
+				containers := buildModelStorageConfig(model, nil, "default", true, ModelCacheModeShared, "", defaultPrefetchImage, 0, ModelCachePrepAlways, nil, "").initContainers
+				if prefetch == "prefetch" {
+					job, err := (&ModelReconciler{InitContainerImage: defaultPrefetchImage}).buildPrefetchJob(context.Background(), model, "", "")
+					if err != nil {
+						t.Fatal(err)
+					}
+					containers = job.Spec.Template.Spec.InitContainers
+				}
+				dir := t.TempDir()
+				old := time.Now().Add(-time.Hour)
+				write := func(name, content string, mtime time.Time) {
+					path := filepath.Join(dir, name)
+					if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Chtimes(path, mtime, mtime); err != nil {
+						t.Fatal(err)
+					}
+				}
+				write(artifact, "cached", old)
+				write(artifact+".llmkube-size", "6", old)
+				debris := []string{
+					artifact + ".llmkube-tmp.AbC123",
+					artifact + ".llmkube-size.XyZ789",
+					marker + ".QwErTy",
+				}
+				kept := []string{
+					artifact + ".llmkube-size",
+					artifact + ".sha256",
+					marker,
+					"notes.sha256.backup",
+					artifact + ".llmkube-tmp.FrEsH1",
+				}
+				for _, name := range append(debris, kept[1:4]...) {
+					write(name, "x", old)
+				}
+				write(kept[4], "x", time.Now())
+
+				out, err := runDownloaderOnFS(t, downloaderOf(t, containers), dir, fs)
+				if err != nil {
+					t.Fatalf("warm start failed: %v\n%s", err, out)
+				}
+				swept := role != "fuse/serving"
+				for _, name := range debris {
+					_, err := os.Stat(filepath.Join(dir, name))
+					if gone := os.IsNotExist(err); gone != swept {
+						t.Errorf("%s: removed=%v, want %v", name, gone, swept)
+					}
+				}
+				for _, name := range kept {
+					if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+						t.Errorf("%s must survive the sweep: %v", name, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestAtomicWriteRemovesItsTempOnFailure: a write whose rename fails removes
+// its temp file instead of leaving it on the claim, and a successful write
+// leaves none (#2255).
+func TestAtomicWriteRemovesItsTempOnFailure(t *testing.T) {
+	requireInitShellEnvironment(t)
+	for _, failMv := range []bool{false, true} {
+		t.Run(fmt.Sprintf("mv-fails-%v", failMv), func(t *testing.T) {
+			dir, bin := t.TempDir(), t.TempDir()
+			if failMv {
+				if err := os.WriteFile(filepath.Join(bin, "mv"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cmd := exec.Command("sh", "-c", atomicWriteFn+`if llmkube_atomic_write "$DIR/record" 42; then echo written; else echo refused; fi`)
+			cmd.Env = append(os.Environ(), "DIR="+dir, "PATH="+bin+":"+os.Getenv("PATH"))
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("%v\n%s", err, out)
+			}
+			want := "written"
+			if failMv {
+				want = "refused"
+			}
+			if strings.TrimSpace(string(out)) != want {
+				t.Errorf("output %q, want %q", out, want)
+			}
+			if leftovers, _ := filepath.Glob(filepath.Join(dir, "record.llmkube-tmp.*")); len(leftovers) != 0 {
+				t.Errorf("temp files left behind: %v", leftovers)
+			}
+			if !failMv && readOrFail(t, filepath.Join(dir, "record")) != "42" {
+				t.Error("the record was not written")
+			}
+		})
+	}
+}
+
+// TestAtomicWriteDebrisMatchesTheSweep pins the contract between the writer
+// and the sweep: the temp file a pod dying mid-write leaves (here, mv and rm
+// that do nothing) is one atomicWriteDebrisSweep removes once it is old.
+func TestAtomicWriteDebrisMatchesTheSweep(t *testing.T) {
+	requireInitShellEnvironment(t)
+	dir, bin := t.TempDir(), t.TempDir()
+	for _, stub := range []string{"mv", "rm"} {
+		if err := os.WriteFile(filepath.Join(bin, stub), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cmd := exec.Command("sh", "-c", atomicWriteFn+`llmkube_atomic_write "$DIR/model.safetensors.llmkube-size" 6; llmkube_atomic_write "$DIR/model.safetensors.sha256" stamp; llmkube_atomic_write "$DIR/model.0123.sha256-rejected" 0123; true`)
+	cmd.Env = append(os.Environ(), "DIR="+dir, "PATH="+bin+":"+os.Getenv("PATH"))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	leftovers, err := os.ReadDir(dir)
+	if err != nil || len(leftovers) != 3 {
+		t.Fatalf("want the three temp files a dead writer leaves, got %v (%v)", leftovers, err)
+	}
+	old := time.Now().Add(-time.Hour)
+	for _, e := range leftovers {
+		if err := os.Chtimes(filepath.Join(dir, e.Name()), old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sweep := exec.Command("sh", "-c", atomicWriteDebrisSweep)
+	sweep.Env = append(os.Environ(), "CACHE_DIR="+dir)
+	if out, err := sweep.CombinedOutput(); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if left, _ := os.ReadDir(dir); len(left) != 0 {
+		t.Errorf("the sweep left the writer's temp files: %v", left)
 	}
 }
