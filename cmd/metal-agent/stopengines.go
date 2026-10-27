@@ -12,6 +12,7 @@ import (
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 	"github.com/defilantech/llmkube/pkg/agent"
+	"github.com/defilantech/llmkube/pkg/metaljoin"
 )
 
 // stopEnginesOptions are the flags of the stop-engines subcommand.
@@ -32,7 +33,7 @@ const stopEnginesUsage = "llmkube-metal-agent stop-engines [flags]: " +
 // here from there and read by loadKubeconfig.
 func parseStopEnginesArgs(args []string) (stopEnginesOptions, error) {
 	var opts stopEnginesOptions
-	fs := flag.NewFlagSet("stop-engines", flag.ContinueOnError)
+	fs := flag.NewFlagSet(metaljoin.StopEnginesCommand, flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	fs.Usage = func() {
 		_, _ = fmt.Fprint(os.Stderr, stopEnginesUsage)

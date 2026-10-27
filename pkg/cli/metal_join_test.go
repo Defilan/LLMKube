@@ -63,11 +63,14 @@ type fakeMac struct {
 	// loaded for while it stops.
 	stopPolls int
 	stopping  int
+	// onAgent runs when leave runs the agent binary; its error is the run's.
+	onAgent func(args []string) error
+	uid     int
 }
 
 func newFakeMac(t *testing.T) *fakeMac {
 	t.Helper()
-	m := &fakeMac{home: t.TempDir()}
+	m := &fakeMac{home: t.TempDir(), uid: 501}
 	m.agentBin = filepath.Join(t.TempDir(), "bin", metalAgentBinary)
 	if err := os.MkdirAll(filepath.Dir(m.agentBin), 0o755); err != nil {
 		t.Fatal(err)
@@ -84,7 +87,7 @@ func newFakeMac(t *testing.T) *fakeMac {
 		return metalHost{
 			goos: "darwin",
 			home: m.home,
-			uid:  501,
+			uid:  m.uid,
 			launchctl: func(_ context.Context, args ...string) error {
 				call := strings.Join(args, " ")
 				m.calls = append(m.calls, call)
@@ -125,6 +128,17 @@ func newFakeMac(t *testing.T) *fakeMac {
 			},
 			llamaServerPaths: []string{m.llamaServer},
 			executable:       func() (string, error) { return filepath.Join(m.home, "llmkube"), nil },
+			runAgent: func(_ context.Context, bin string, args []string, _, _ io.Writer) error {
+				call := "agent " + bin + " " + strings.Join(args, " ")
+				if m.loaded {
+					call += " (while the agent is loaded)"
+				}
+				m.calls = append(m.calls, call)
+				if m.onAgent != nil {
+					return m.onAgent(args)
+				}
+				return nil
+			},
 		}, nil
 	}
 	t.Cleanup(func() { newMetalHost = prev })
@@ -695,8 +709,12 @@ func TestMetalLeaveUndoesJoin(t *testing.T) {
 	if _, err := os.Stat(identity); err != nil {
 		t.Errorf("leave removed the agent's ingress identity: %v", err)
 	}
-	if len(mac.calls) != 1 || mac.calls[0] != "bootout gui/501/"+metalAgentLabel {
-		t.Errorf("launchctl calls %q, want the agent booted out", mac.calls)
+	if len(mac.calls) != 2 || mac.calls[0] != "bootout gui/501/"+metalAgentLabel ||
+		mac.calls[1] != "print gui/501/"+metalAgentLabel {
+		t.Errorf("launchctl calls %q, want the agent booted out and waited for", mac.calls)
+	}
+	if !strings.Contains(stdout, "has no stop-engines") {
+		t.Errorf("leave does not say why it skipped stop-engines for an agent without it: %q", stdout)
 	}
 	if !strings.Contains(stdout, "llmkube metal remove mac-a -n "+ns) {
 		t.Errorf("leave does not say how to revoke the Mac: %q", stdout)

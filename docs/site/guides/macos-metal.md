@@ -897,9 +897,14 @@ the token's lifetime cannot renew it: run `token create` and `join`
 again. Running `join` again on a Mac replaces its setup.
 
 `llmkube metal leave` undoes `join` on the Mac: it stops the
-LaunchAgent and removes its plist, the kubeconfig and the token. The
-ingress identity and the model store stay. A LaunchAgent `join` did
-not write is left running. If `join --force` replaced one, `leave`
+LaunchAgent and removes its plist, the kubeconfig and the token. Engines
+outlive the agent, so once the agent has exited, `leave` runs its
+`stop-engines` first, which stops the engines the agent started and
+withdraws their endpoints. If `stop-engines` fails, `leave` removes
+nothing; check its output and run `leave` again. An agent binary from
+before `stop-engines` stops its engines when it exits, so `leave` skips
+the step for it. The ingress identity and the model store stay. A
+LaunchAgent `join` did not write is left running, with its engines. If `join --force` replaced one, `leave`
 prints the commands that put it back. It does not revoke
 anything; the token stays valid until it expires, so also run
 `llmkube metal remove` where you have cluster access.
