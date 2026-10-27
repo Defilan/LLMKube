@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -40,11 +41,12 @@ var cacheAccessImage string
 // cacheAccessImageName resolves the cache-access pod image: the flag, then
 // LLMKUBE_CACHE_IMAGE, then the busybox default. Both the inspector and the
 // purge pod read it here, so an air-gapped mirror reaches all three commands.
+// A value that is only whitespace counts as unset.
 func cacheAccessImageName() string {
-	if cacheAccessImage != "" {
-		return cacheAccessImage
+	if image := strings.TrimSpace(cacheAccessImage); image != "" {
+		return image
 	}
-	if image := os.Getenv(cacheImageEnv); image != "" {
+	if image := strings.TrimSpace(os.Getenv(cacheImageEnv)); image != "" {
 		return image
 	}
 	return defaultCacheAccessImage
@@ -111,9 +113,10 @@ func claimSinglePod(pvc *corev1.PersistentVolumeClaim) bool {
 // as the serving pod a `delete --purge-cache` is tearing down.
 //
 // A pod that is being deleted releases the claim on its own, as does the pod
-// this run replaces at ownPod, so waiting for either is what base did and what
-// works. A pod that is merely running never releases it, so waiting only runs
-// out the start timeout.
+// this run replaces at ownPod and a cache pod a concurrent run deletes when it
+// ends, so waiting for any of them is what base did and what works. A pod that
+// is merely running never releases it, so waiting only runs out the start
+// timeout.
 func secondMountBlocker(holder *corev1.Pod, pvcName, ownPod string,
 	kind cacheAccessPodKind, runID string, singlePod bool, releasing func(*corev1.Pod) bool,
 ) error {
@@ -129,19 +132,17 @@ func secondMountBlocker(holder *corev1.Pod, pvcName, ownPod string,
 	if holder.Name == ownPod {
 		return nil
 	}
-	// An abandoned cache pod of this kind is replaced by the run that needs the
-	// claim, at a name this run would delete if that name is its own.
-	if cacheAccessPodOurs(holder, kind) && !cacheAccessPodInUse(holder, runID) {
-		return nil
-	}
-	if isCacheAccessPod(holder) && !cacheAccessPodInUse(holder, runID) {
-		// A leftover of the other kind sits at a name no run deletes, so no
-		// run will free the claim: say so instead of waiting out the start
-		// timeout on a pod that cannot mount.
+	if isCacheAccessPod(holder) {
+		if cacheAccessPodInUse(holder, runID) {
+			return nil
+		}
+		// A leftover at a name this run does not use is not deleted by this
+		// run, so say so instead of waiting out the start timeout on a pod
+		// that cannot mount.
 		return fmt.Errorf("claim %s is ReadWriteOncePod and pod %q holds it; "+
 			"only one pod can mount a ReadWriteOncePod claim, so the %s pod cannot start. "+
-			"That pod is a leftover llmkube cache pod, not a serving pod, so nothing will "+
-			"remove it; delete it and retry, or use a ReadWriteOnce or ReadWriteMany claim",
+			"That pod is a leftover llmkube cache pod, not a serving pod, and this run does not "+
+			"delete it; delete it and retry, or use a ReadWriteOnce or ReadWriteMany claim",
 			pvcName, holder.Name, kind.noun)
 	}
 	return fmt.Errorf("claim %s is ReadWriteOncePod and pod %q holds it; "+

@@ -111,8 +111,7 @@ type purgeTarget struct {
 	Name             string
 	UserOwned        bool
 	InferenceService string
-	// SinglePod is claimSinglePod of the claim as resolution read it, the one
-	// read that happens before a caller's own delete can collect the claim.
+	// SinglePod is claimSinglePod of the claim as resolution read it.
 	SinglePod bool
 }
 
@@ -292,8 +291,8 @@ func createPurgePodForPVC(
 
 // ensurePurgePodReleasing returns a running purge pod, creating it when absent,
 // with the caller's rule for a holder that is already going away:
-// `delete --purge-cache` passes one so the pod its own InferenceService delete
-// is tearing down does not refuse the purge, and waits for the drain instead.
+// `delete --purge-cache` passes waitForEveryHolder, so the pods of the service
+// and Model it deleted are waited for, not refused.
 // A purge pod is never pinned, so the holder check is the only guard before
 // creating one.
 func ensurePurgePodReleasing(

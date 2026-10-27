@@ -605,20 +605,20 @@ holds is not pinned either: the pod is its first consumer. A
 `ReadWriteOncePod` claim that another pod still holds cannot be mounted a second
 time on any node, so the command fails at once and names the mode and the
 holding pod instead of waiting for a pod that can never start; a pod that is
-already being deleted releases the claim, so it is waited for, as is the
-serving pod `delete --purge-cache` is tearing down, recognised by the owner
-chain: the ReplicaSet that owns the pod and the Deployment that owns that
-ReplicaSet must reach the service being deleted. The check lists pods in the
-namespace, so `cache clear` and `delete --purge-cache` need `list pods` for it,
-and `delete --purge-cache` also needs `get replicasets`; without them the
-command falls back to the old wait. A cache pod llmkube left behind at the name
-the command does not use is named as such, since no run will free that claim.
+already being deleted releases the claim, and so does a cache pod another
+running `llmkube` command deletes when it ends, so both are waited for. A cache
+pod llmkube left behind at a name the command does not use is named as such,
+since the command does not delete it. The check lists pods in the namespace,
+so `cache clear` needs `list pods` for it; without it the command falls back
+to the old wait. `delete --purge-cache` waits for every holder, as it did
+before, since the service it deleted takes its pods with it.
 `--all-namespaces` does not inspect claims and creates no pod.
 
 Both short-lived pods run `busybox:1.37.0`. On a cluster that cannot pull it,
 name a mirrored copy with `--cache-image` or `LLMKUBE_CACHE_IMAGE`; the flag
 wins over the variable, and both cache commands and `delete --purge-cache`
-read the same setting.
+read the same setting. The image needs `sh`, `sleep`, `ls`, `rm` and a `du`
+that takes `-sb`, as busybox and GNU coreutils do.
 
 ### Removing cache entries with `llmkube cache clear`
 

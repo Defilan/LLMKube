@@ -21,7 +21,6 @@ import (
 	"io"
 	"strings"
 	"testing"
-	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -323,6 +322,21 @@ func TestCacheAccessPodsUseTheConfiguredImage(t *testing.T) {
 		}
 	})
 
+	t.Run("flag on delete --purge-cache reaches the purge pod", func(t *testing.T) {
+		env := cache2155Env(t, "cache-2155-image-delete", dynamicClaim(corev1.ReadWriteOnce),
+			nil, modelWithCacheKey())
+		stubCacheCommandPods(t, func([]string) (string, error) { return "", nil }, true)
+
+		if err := runDeleteCommandFor2155(t, env.namespace, "--cache-image", mirror); err != nil {
+			t.Fatalf("delete --purge-cache --cache-image: %v", err)
+		}
+		container := getCreatedPod(t, env.clientset, env.namespace,
+			purgePodName(modelCachePVCName)).Spec.Containers[0]
+		if container.Image != mirror {
+			t.Errorf("image = %q, want %q", container.Image, mirror)
+		}
+	})
+
 	t.Run("environment reaches the inspector with no flag", func(t *testing.T) {
 		t.Setenv(cacheImageEnv2155, mirror)
 		env := cache2155Env(t, "cache-2155-image-env", dynamicClaim(corev1.ReadWriteOnce),
@@ -373,7 +387,8 @@ func TestCacheListPinsTheInspectorForAReadWriteOnceClaim(t *testing.T) {
 }
 
 // Parity: a holder whose containers have all stopped is no holder at all
-// (holderTerminated), so the claim is free and the command proceeds.
+// (holderTerminated), so the claim is free and the command proceeds without
+// pinning the inspector to that pod's node.
 func TestCacheListProceedsWhenTheHolderOfAReadWriteOncePodClaimIsTerminated(t *testing.T) {
 	holder := mountedPod("serving")
 	holder.Finalizers = []string{"test/hold"}
@@ -382,24 +397,29 @@ func TestCacheListProceedsWhenTheHolderOfAReadWriteOncePodClaimIsTerminated(t *t
 		[]*corev1.Pod{holder}, modelWithCacheKey())
 	stubCacheCommandPods(t, func([]string) (string, error) { return "", nil }, true)
 
-	// Stopped before it was deleted, so the pod is not running any container:
-	// the claim is free and the inspector may mount it on any node.
-	holder.Status = corev1.PodStatus{
-		Phase: corev1.PodRunning,
-		ContainerStatuses: []corev1.ContainerStatus{{
-			Name: "manager", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{}},
-		}},
-	}
-	// No grace period: the kubelet stops the container as it deletes the pod,
-	// which is what holderTerminated reads.
+	// No grace period: the kubelet stops the container as it deletes the pod.
+	// The finalizer keeps the pod, so the claim's only pod is one being
+	// deleted with no container running, which is what holderTerminated reads.
 	grace := int64(0)
 	if err := env.clientset.CoreV1().Pods(env.namespace).Delete(context.Background(), holder.Name,
 		metav1.DeleteOptions{GracePeriodSeconds: &grace}); err != nil {
 		t.Fatalf("delete the holder: %v", err)
 	}
+	env.setHolderStatus(t, holder.Name, corev1.PodStatus{
+		Phase: corev1.PodRunning,
+		ContainerStatuses: []corev1.ContainerStatus{{
+			Name: "manager", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{}},
+		}},
+	})
 
 	if err := runCacheCommand(t, "list", "-n", env.namespace); err != nil {
 		t.Fatalf("cache list against a terminated holder: %v", err)
+	}
+	// A terminated pod no longer holds the claim, so its node is not where the
+	// claim is attached: the inspector is not pinned there.
+	pod := getCreatedPod(t, env.clientset, env.namespace, inspectorPodName(modelCachePVCName))
+	if got := pinnedTo(pod); len(got) != 0 {
+		t.Errorf("inspector pinned to %v, want no pin: the holder has terminated", got)
 	}
 }
 
@@ -544,94 +564,58 @@ func nodeTheServingPods(t *testing.T, clientset kubernetes.Interface, namespace 
 	}
 }
 
-// A chain that cannot be read is not proof the pod belongs to someone else:
-// the purge waits for it, as it did before the refusal existed.
-func TestDeletePurgeWaitsWhenTheServingPodOwnershipCannotBeRead(t *testing.T) {
-	env := cache2155Env(t, "cache-2155-delete-unreadable", dynamicClaim(corev1.ReadWriteOncePod),
-		nil, modelWithCacheKey())
-	serving := createServingChain(t, env, "a-model", "7d9f4b8c9")
-	nodeTheServingPods(t, env.clientset, env.namespace, serving)
-	// The ReplicaSet is collected ahead of its pods, so it can be gone while
-	// the pod is not.
-	if err := env.clientset.AppsV1().ReplicaSets(env.namespace).Delete(context.Background(),
-		"a-model-7d9f4b8c9", metav1.DeleteOptions{}); err != nil {
-		t.Fatalf("delete the serving ReplicaSet: %v", err)
-	}
-	if controller := metav1.GetControllerOf(serving); controller == nil {
-		t.Fatal("the serving pod lost its owner reference")
-	}
-	stubCacheCommandPods(t, func([]string) (string, error) { return "", nil }, true)
+// delete --purge-cache waits for every pod holding a ReadWriteOncePod claim,
+// as base did: the service and Model it deleted take their pods with them, and
+// not every such pod sits under a Deployment. A multiNode rank pod is
+// controlled by the InferenceService itself, and a prefetch Job's pod by the
+// Job.
+func TestDeletePurgeWaitsForEveryHolderOfAReadWriteOncePodClaim(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		owner func(isvc *inferencev1alpha1.InferenceService) metav1.OwnerReference
+	}{
+		{"multinode-rank-pod", func(isvc *inferencev1alpha1.InferenceService) metav1.OwnerReference {
+			return metav1.OwnerReference{
+				APIVersion: "inference.llmkube.dev/v1alpha1", Kind: "InferenceService",
+				Name: isvc.Name, UID: isvc.UID, Controller: boolPtr(true),
+			}
+		}},
+		{"prefetch-job-pod", func(*inferencev1alpha1.InferenceService) metav1.OwnerReference {
+			return metav1.OwnerReference{
+				APIVersion: "batch/v1", Kind: "Job", Name: "a-model-prefetch",
+				UID: "0b1c2d3e-0000-4000-8000-000000000001", Controller: boolPtr(true),
+			}
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			env := cache2155Env(t, "cache-2155-delete-"+c.name, dynamicClaim(corev1.ReadWriteOncePod),
+				nil, modelWithCacheKey())
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: "a-model", Namespace: env.namespace},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef:   "a-model",
+					ModelCache: &inferencev1alpha1.ModelCacheSpec{ClaimName: modelCachePVCName},
+				},
+			}
+			if err := env.cr.Create(context.Background(), isvc); err != nil {
+				t.Fatalf("create InferenceService: %v", err)
+			}
+			holder := mountedPod("a-model-holder")
+			holder.Namespace = env.namespace
+			holder.OwnerReferences = []metav1.OwnerReference{c.owner(isvc)}
+			if _, err := env.clientset.CoreV1().Pods(env.namespace).Create(
+				context.Background(), holder, metav1.CreateOptions{}); err != nil {
+				t.Fatalf("create the holder: %v", err)
+			}
+			stubCacheCommandPods(t, func([]string) (string, error) { return "", nil }, true)
 
-	if err := runDeleteCommandFor2155(t, env.namespace); err != nil {
-		t.Fatalf("an unreadable owner chain must fall back to the wait, not refuse: %v", err)
-	}
-	if !podExists(t, env.clientset, env.namespace, purgePodName(modelCachePVCName)) {
-		t.Error("no purge pod was created, so the purge never ran")
-	}
-}
-
-// A pod of another service whose name merely starts with the deleted one is not
-// the pod this run is tearing down: the name is not proof, the owner chain is.
-func TestDeletePurgeRefusesAPodOfAServiceWhoseNameStartsWithIt(t *testing.T) {
-	env := cache2155Env(t, "cache-2155-delete-prefix", dynamicClaim(corev1.ReadWriteOncePod),
-		nil, modelWithCacheKey())
-	// "<name>-v2" produces ReplicaSet names that start with "<name>-" too. It
-	// is the only pod on the claim here: with this run's own pod beside it,
-	// the refusal names whichever the pod list returns first.
-	nodeTheServingPods(t, env.clientset, env.namespace, createServingChain(t, env, "a-model-v2", "8b6c1d2e3"))
-	target := &inferencev1alpha1.InferenceService{
-		ObjectMeta: metav1.ObjectMeta{Name: "a-model", Namespace: env.namespace},
-		Spec: inferencev1alpha1.InferenceServiceSpec{
-			ModelRef:   "a-model",
-			ModelCache: &inferencev1alpha1.ModelCacheSpec{ClaimName: modelCachePVCName},
-		},
-	}
-	if err := env.cr.Create(context.Background(), target); err != nil {
-		t.Fatalf("create the deleted InferenceService: %v", err)
-	}
-	stubCacheCommandPods(t, func([]string) (string, error) { return "", nil }, true)
-
-	err := runDeleteCommandFor2155(t, env.namespace)
-	if err == nil || !strings.Contains(err.Error(), "ReadWriteOncePod") {
-		t.Fatalf("another service's pod is not exempt as this run's own pod: err = %v", err)
-	}
-	if !strings.Contains(err.Error(), "a-model-v2-8b6c1d2e3-pod") {
-		t.Errorf("error = %v, want it to name the holding pod", err)
-	}
-	if podExists(t, env.clientset, env.namespace, purgePodName(modelCachePVCName)) {
-		t.Error("a purge pod was created for a claim it cannot mount")
-	}
-}
-
-// delete --purge-cache deletes the InferenceService and then purges, and the
-// service delete may be what collects the claim, so the mode has to be read
-// before it.
-func TestDeletePurgeRefusesAHeldReadWriteOncePodClaim(t *testing.T) {
-	env := cache2155Env(t, "cache-2155-delete-rwop", dynamicClaim(corev1.ReadWriteOncePod),
-		[]*corev1.Pod{mountedPod("serving")}, modelWithCacheKey())
-	isvc := &inferencev1alpha1.InferenceService{
-		ObjectMeta: metav1.ObjectMeta{Name: "a-model"},
-		Spec: inferencev1alpha1.InferenceServiceSpec{
-			ModelRef:   "a-model",
-			ModelCache: &inferencev1alpha1.ModelCacheSpec{ClaimName: modelCachePVCName},
-		},
-	}
-	isvc.Namespace = env.namespace
-	if err := env.cr.Create(context.Background(), isvc); err != nil {
-		t.Fatalf("create InferenceService: %v", err)
-	}
-	// Another command in this process must not answer for this run's claims.
-	stubCacheCommandPods(t, func([]string) (string, error) { return "", nil }, true)
-
-	err := runDeleteCommandFor2155(t, env.namespace)
-	if err == nil {
-		t.Fatal("delete --purge-cache succeeded; want the ReadWriteOncePod refusal")
-	}
-	if !strings.Contains(err.Error(), "ReadWriteOncePod") {
-		t.Errorf("error = %q, want it to name the access mode", err)
-	}
-	if podExists(t, env.clientset, env.namespace, purgePodName(modelCachePVCName)) {
-		t.Error("a purge pod was created for a claim it cannot mount")
+			if err := runDeleteCommandFor2155(t, env.namespace); err != nil {
+				t.Fatalf("delete --purge-cache must wait for the %s, not refuse it: %v", c.name, err)
+			}
+			if !podExists(t, env.clientset, env.namespace, purgePodName(modelCachePVCName)) {
+				t.Error("no purge pod was created, so the purge never ran")
+			}
+		})
 	}
 }
 
@@ -732,13 +716,12 @@ func TestPurgeRefusesAReadWriteOncePodClaimFromItsResolvedTarget(t *testing.T) {
 	}
 }
 
-// A leftover cache pod of the other kind sits at a name no run deletes, so no
-// run will free the claim: the refusal says so, at once, instead of waiting out
-// the start timeout on a pod that cannot mount.
+// A leftover cache pod of the other kind sits at a name this run does not
+// delete: the refusal says so, at once, instead of waiting out the start
+// timeout on a pod that cannot mount.
 func TestCacheClearRefusesALeakedInspectorPodOfTheOtherKind(t *testing.T) {
 	leaked := mountedPod(inspectorPodName(modelCachePVCName))
 	leaked.Labels = map[string]string{managedByLabel: managedByValue, modelCacheLabel: inspectorPodKind.component}
-	leaked.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Hour))
 	env := cache2155Env(t, "cache-2155-cross-kind", dynamicClaim(corev1.ReadWriteOncePod),
 		[]*corev1.Pod{leaked}, nil)
 	stubCacheCommandPods(t, func([]string) (string, error) { return "", nil }, false)
@@ -750,103 +733,11 @@ func TestCacheClearRefusesALeakedInspectorPodOfTheOtherKind(t *testing.T) {
 	if !strings.Contains(err.Error(), "ReadWriteOncePod") || !strings.Contains(err.Error(), leaked.Name) {
 		t.Errorf("error = %v, want it to name the access mode and the holding pod", err)
 	}
-	if !strings.Contains(err.Error(), "nothing will remove it") {
-		t.Errorf("error = %v, want it to say no run will free the claim", err)
+	if !strings.Contains(err.Error(), "this run does not delete it") {
+		t.Errorf("error = %v, want it to say this run does not delete that pod", err)
 	}
 	if podExists(t, env.clientset, env.namespace, purgePodName(modelCachePVCName)) {
 		t.Error("a purge pod was created for a claim it cannot mount")
-	}
-}
-
-// A ReplicaSet is this run's own only when the Deployment above it, not the
-// ReplicaSet's name, is the one the operator built for the deleted service.
-func TestServingPodsOfFollowsTheDeploymentNotTheName(t *testing.T) {
-	cfg := cacheListEnvtest(t)
-	namespace := "cache-2155-owner-chain"
-	clientset, err := kubernetes.NewForConfig(cfg)
-	if err != nil {
-		t.Fatalf("clientset: %v", err)
-	}
-	if _, err := clientset.CoreV1().Namespaces().Create(context.Background(),
-		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}, metav1.CreateOptions{}); err != nil {
-		t.Fatalf("create namespace: %v", err)
-	}
-	labelsFor := func(name string) map[string]string { return map[string]string{"app": name} }
-	createDeployment := func(service string) *metav1.OwnerReference {
-		t.Helper()
-		labels := labelsFor(service)
-		template := corev1.PodTemplateSpec{
-			ObjectMeta: metav1.ObjectMeta{Labels: labels},
-			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "serving", Image: "busybox"}}},
-		}
-		got, err := clientset.AppsV1().Deployments(namespace).Create(context.Background(), &appsv1.Deployment{
-			ObjectMeta: metav1.ObjectMeta{Name: service, Namespace: namespace, Labels: labels},
-			Spec: appsv1.DeploymentSpec{
-				Selector: &metav1.LabelSelector{MatchLabels: labels},
-				Template: template,
-			},
-		}, metav1.CreateOptions{})
-		if err != nil {
-			t.Fatalf("create Deployment %s: %v", service, err)
-		}
-		return &metav1.OwnerReference{
-			APIVersion: "apps/v1", Kind: "Deployment", Name: got.Name, UID: got.UID, Controller: boolPtr(true),
-		}
-	}
-	createSet := func(name string, owner *metav1.OwnerReference) *appsv1.ReplicaSet {
-		t.Helper()
-		labels := labelsFor(name)
-		var refs []metav1.OwnerReference
-		if owner != nil {
-			refs = append(refs, *owner)
-		}
-		got, err := clientset.AppsV1().ReplicaSets(namespace).Create(context.Background(), &appsv1.ReplicaSet{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, Labels: labels, OwnerReferences: refs},
-			Spec: appsv1.ReplicaSetSpec{
-				Selector: &metav1.LabelSelector{MatchLabels: labels},
-				Template: corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{Labels: labels},
-					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "serving", Image: "busybox"}}},
-				},
-			},
-		}, metav1.CreateOptions{})
-		if err != nil {
-			t.Fatalf("create ReplicaSet %s: %v", name, err)
-		}
-		return got
-	}
-	servingPod := func(set *appsv1.ReplicaSet) *corev1.Pod {
-		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-			Name:      set.Name + "-pod",
-			Namespace: namespace,
-			OwnerReferences: []metav1.OwnerReference{{
-				APIVersion: "apps/v1", Kind: "ReplicaSet", Name: set.Name, UID: set.UID, Controller: boolPtr(true),
-			}},
-		}}
-	}
-
-	own := createSet("a-model-7d9f4b8c9", createDeployment("a-model"))
-	// "<name>-v2" produces ReplicaSets whose names start with "<name>-".
-	other := createSet("a-model-v2-8b6c1d2e3", createDeployment("a-model-v2"))
-	// A ReplicaSet under no Deployment holds the claim just as hard.
-	orphan := createSet("a-model-9a8b7c6d5", nil)
-	gone := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: "a-model-collected"}}
-
-	releasing := servingPodsOf(context.Background(), clientset, namespace, "a-model")
-	for _, c := range []struct {
-		name string
-		pod  *corev1.Pod
-		want bool
-	}{
-		{"the Deployment named after the service", servingPod(own), true},
-		{"the Deployment of a longer-named service", servingPod(other), false},
-		{"a ReplicaSet with no Deployment above it", servingPod(orphan), false},
-		{"a ReplicaSet already collected", servingPod(gone), true},
-		{"no controller reference", &corev1.Pod{}, false},
-	} {
-		if got := releasing(c.pod); got != c.want {
-			t.Errorf("%s: releasing = %v, want %v", c.name, got, c.want)
-		}
 	}
 }
 
@@ -930,10 +821,10 @@ func TestCacheAccessPodShapeThroughTheCommand(t *testing.T) {
 
 // runDeleteCommandFor2155 executes delete --purge-cache for the service every
 // case here deletes.
-func runDeleteCommandFor2155(t *testing.T, namespace string) error {
+func runDeleteCommandFor2155(t *testing.T, namespace string, extra ...string) error {
 	t.Helper()
 	cmd := NewDeleteCommand()
-	cmd.SetArgs([]string{"a-model", "--purge-cache", "-n", namespace})
+	cmd.SetArgs(append([]string{"a-model", "--purge-cache", "-n", namespace}, extra...))
 	cmd.SilenceUsage = true
 	cmd.SilenceErrors = true
 	cmd.SetOut(io.Discard)
