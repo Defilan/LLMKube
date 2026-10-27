@@ -57,8 +57,11 @@ func applyExplicitAPIKey(opts *benchmarkOptions) error {
 		return nil
 	}
 
-	if key := trimHeaderValue(os.Getenv(benchmarkAPIKeyEnv)); key != "" {
-		opts.apiKey = key
+	if raw := os.Getenv(benchmarkAPIKeyEnv); raw != "" {
+		if raw != trimHeaderValue(raw) {
+			warnTrimmedKey(benchmarkAPIKeyEnv)
+		}
+		opts.apiKey = trimHeaderValue(raw)
 		fmt.Printf("🔑 API key: from %s\n", benchmarkAPIKeyEnv)
 	}
 	return nil
@@ -109,16 +112,24 @@ func hasEnv(isvc *inferencev1alpha1.InferenceService, name string) bool {
 	return false
 }
 
-// trimHeaderValue drops the whitespace a header value cannot carry. net/http
-// rejects CR and LF outright, and trims trailing SP and HTAB on the wire, so
-// the trimmed form is the only one the server can compare against.
+// trimHeaderValue drops the bytes a header value cannot carry. net/http rejects
+// CR and LF outright and trims trailing SP and HTAB on the wire, so the trimmed
+// form is the only sendable one. vLLM hashes the Secret bytes unstripped
+// (authenticate.py in v0.32.0), so a value that needed trimming cannot match a
+// vLLM server's key; callers warn when they change the value.
+
+// warnTrimmedKey tells the user a key was altered, so a 401 after it is
+// explained rather than mysterious.
+func warnTrimmedKey(source string) {
+	fmt.Printf("⚠️  %s ends in whitespace a header cannot carry; it was stripped. "+
+		"If requests get 401, the server's key may include those bytes\n", source)
+}
 func trimHeaderValue(v string) string {
 	return strings.TrimRight(v, " \t\r\n")
 }
 
-// readAPIKeySecret returns the Secret's value for ref, trimmed the way a
-// header value must be (the env var the pod reads carries bytes a header
-// cannot, such as a file's trailing newline).
+// readAPIKeySecret returns the Secret's value for ref, trimmed of bytes a
+// header cannot carry and with that truncation reported.
 func readAPIKeySecret(
 	ctx context.Context, c client.Client, namespace string, ref *corev1.SecretKeySelector,
 ) (string, error) {
@@ -133,7 +144,11 @@ func readAPIKeySecret(
 	if len(value) == 0 {
 		return "", fmt.Errorf("API key Secret %s/%s key %q is empty", namespace, ref.Name, ref.Key)
 	}
-	return trimHeaderValue(string(value)), nil
+	if trimmed := trimHeaderValue(string(value)); trimmed != string(value) {
+		warnTrimmedKey(fmt.Sprintf("Secret %s/%s key %q", namespace, ref.Name, ref.Key))
+		return trimmed, nil
+	}
+	return string(value), nil
 }
 
 // applyAPIKeyFromInferenceService resolves the key a Ready service already

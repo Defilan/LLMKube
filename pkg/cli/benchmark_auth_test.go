@@ -347,13 +347,45 @@ func TestBenchmarkSecretValueSentVerbatim(t *testing.T) {
 	}
 }
 
+// TestBenchmarkNewlineTerminatedSecretValue feeds the producer's bytes: the
+// pod receives the Secret verbatim through apiKeyEnvVar (internal/controller/
+// endpoint_auth.go), and vLLM hashes those bytes unstripped. A header cannot
+// carry the newline, so the CLI sends the sendable form and says it changed
+// the key, rather than reporting silent successes against a value the real
+// server would reject.
 func TestBenchmarkNewlineTerminatedSecretValue(t *testing.T) {
 	c, ns := keyedNamespace(t)
-	// An operator's key file ends in a newline; a header value cannot carry
-	// one, so the CLI sends the value without it and the server compares the
-	// same bytes.
+	podKey := benchAuthKey + "\n"
+	srv, calls := keyedServer(t, podKey)
+	createSecret(t, c, ns, "upstream-key", map[string]string{"key": podKey})
+	createKeyedInferenceService(t, c, ns, "keyed-llm", srv.URL,
+		&corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "upstream-key"}, Key: "key"},
+		nil)
+
+	out, err := runBenchmarkCommand(t, "keyed-llm", "-n", ns,
+		"--port-forward=false", "--warmup", "0", "--iterations", "1", "-o", "json")
+	if err != nil {
+		t.Fatalf("benchmark failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "cannot carry") {
+		t.Fatalf("no warning that the key was trimmed:\n%s", out)
+	}
+	for _, auth := range calls.forPath("/v1/chat/completions") {
+		if auth != "Bearer "+benchAuthKey {
+			t.Fatalf("Authorization = %q, want the sendable (trimmed) form", auth)
+		}
+	}
+	if strings.Contains(out, podKey) {
+		t.Fatalf("stdout printed the key:\n%s", out)
+	}
+}
+
+// TestBenchmarkCleanSecretValueWarnsNothing is the paired case: an untouched
+// value passes through unaltered and prints no warning.
+func TestBenchmarkCleanSecretValueWarnsNothing(t *testing.T) {
+	c, ns := keyedNamespace(t)
 	srv, calls := keyedServer(t, benchAuthKey)
-	createSecret(t, c, ns, "upstream-key", map[string]string{"key": benchAuthKey + "\n"})
+	createSecret(t, c, ns, "upstream-key", map[string]string{"key": benchAuthKey})
 	createKeyedInferenceService(t, c, ns, "keyed-llm", srv.URL,
 		&corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "upstream-key"}, Key: "key"},
 		nil)
@@ -366,9 +398,12 @@ func TestBenchmarkNewlineTerminatedSecretValue(t *testing.T) {
 	if got := summaryFromStdout(t, out).SuccessfulRuns; got != 2 {
 		t.Fatalf("successful_runs = %d, want 2", got)
 	}
+	if strings.Contains(out, "cannot carry") {
+		t.Fatalf("warning printed for a clean value:\n%s", out)
+	}
 	for _, auth := range calls.forPath("/v1/chat/completions") {
 		if auth != "Bearer "+benchAuthKey {
-			t.Fatalf("Authorization = %q, want the newline trimmed", auth)
+			t.Fatalf("Authorization = %q, want the Secret bytes", auth)
 		}
 	}
 }

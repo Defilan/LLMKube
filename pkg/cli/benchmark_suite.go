@@ -315,9 +315,8 @@ func deployCatalogForPhase(
 
 	testOpts := *opts
 	testOpts.name = modelID
-	// The copy drops any key resolved into opts by an earlier service, but the
-	// ISVC deployed here was created by this run and carries no apiKeySecretRef,
-	// so getEndpoint has nothing to resolve for it.
+	// Each phase works on a copy, so the shared opts is never mutated: a key
+	// resolved for one model cannot leak into the next phase's endpoint.
 	endpoint, cleanup, err := getEndpoint(ctx, &testOpts)
 	if err != nil {
 		if opts.cleanup {
