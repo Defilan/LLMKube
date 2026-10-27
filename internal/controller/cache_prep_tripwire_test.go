@@ -34,14 +34,19 @@ import (
 // shape for the default configuration; that is either a bug in the policy
 // gating or a deliberate template change that needs its own reason and its
 // own upgrade note.
+//
+// Deliberate changes since: #2254 opens the single-file cache downloader with
+// the shared FUSE staging prologue and sets LLMKUBE_PREFETCH_STAGER on it, so
+// every cache-backed single-file pod and prefetch Job rolls once on upgrade
+// (upgrade note in docs/MODEL-CACHE.md).
 
 const (
 	// cachePrepTripwireDeploymentHash is desiredTemplateHash of
 	// constructDeployment for cachePrepTripwireIsvc and cachePrepTripwireModel.
-	cachePrepTripwireDeploymentHash = "0a7017684ea68911"
+	cachePrepTripwireDeploymentHash = "3c1f82982c3b7329" //nolint:gosec // a SHA-256 prefix of a pod template, not a credential
 	// cachePrepTripwireJobHash is desiredTemplateHash of buildPrefetchJob's
 	// pod template for cachePrepTripwireModel.
-	cachePrepTripwireJobHash = "f72f2d11ad1a66b3" //nolint:gosec // a SHA-256 prefix of a pod template, not a credential
+	cachePrepTripwireJobHash = "5093fbccbb436e16" //nolint:gosec // a SHA-256 prefix of a pod template, not a credential
 )
 
 func cachePrepTripwireModel() *inferencev1alpha1.Model {

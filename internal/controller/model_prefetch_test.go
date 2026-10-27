@@ -1365,6 +1365,7 @@ var _ = Describe("Model Prefetch", func() {
 					return err
 				}
 				if job.DeletionTimestamp != nil {
+					finishJobDeletion(ctx, jobKey)
 					return apierrors.NewNotFound(batchv1.Resource("jobs"), job.Name)
 				}
 				if job.Annotations[annotationPrefetchFingerprint] == oldFingerprint {
@@ -1659,6 +1660,7 @@ var _ = Describe("Model Prefetch", func() {
 				Expect(k8sClient.Get(ctx, modelKey, m)).To(Succeed())
 				_, _, err := r.reconcilePrefetch(ctx, m)
 				Expect(err).NotTo(HaveOccurred())
+				finishJobDeletion(ctx, jobKey)
 				Expect(k8sClient.Get(ctx, modelKey, m)).To(Succeed())
 				entry := findPrefetchStatus(m, "llmkube-node-a-cache")
 				if entry == nil || entry.JobName == "" {

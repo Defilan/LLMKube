@@ -121,18 +121,22 @@ Concurrent staging requires filesystem locks that work across writer nodes.
 `ReadWriteMany` alone does not guarantee this. BlobFuse lists `flock` as an
 [unsupported operation](https://learn.microsoft.com/en-us/azure/storage/blobs/blobfuse2-known-issues).
 **Behavior change:** serving pods refuse to download missing or mismatched
-multi-file artifacts on FUSE mounts. Warm caches remain usable, including
-when the origin is offline; the serving downloader does not sweep temporary
-files or create a lock file on these mounts. Detection uses the Linux FUSE
-magic value, which also covers virtiofs (including Kata Containers volumes).
+artifacts on FUSE mounts, for single-file models as well as multi-file ones
+(single-file models since #2254). Warm caches remain usable, including when the
+origin is offline; the serving downloader does not sweep temporary files or
+create a lock file on these mounts. Detection uses the Linux FUSE magic value,
+which also covers virtiofs (including Kata Containers volumes).
 It reads the magic with `stat -f`; a custom init image whose `stat` lacks
 `-f` cannot detect FUSE, so it stages under the directory lock as before and
 logs a warning, which leaves a FUSE cache unprotected across nodes.
 The filesystem type alone cannot establish cross-node locking support.
+Upgrading to a release with this change rolls every cache-backed serving pod
+once, because the downloader's command changes.
 A refusal sets `ModelTransferHealthy=False` with reason
 `ModelCacheLockUnsupported`. The condition message carries the same remedy the
 downloader logs, which depends on the source kind (prefetch for HTTP/HF
-sources; storage with cross-node `flock` or a `pvc://` source for `s3://`).
+sources; storage with cross-node `flock` or a `pvc://` source for `s3://` and
+local sources).
 
 For HTTP/HF sources, set `spec.modelCache.prefetch: true` on every
 InferenceService using such a claim. The operator's prefetch Job is allowed
@@ -148,9 +152,9 @@ replacement. Serving pods wait for successful staging into their claim,
 then mount the cache read-only. See
 [Letting the service require a prefetch](#letting-the-service-require-a-prefetch).
 
-`s3://` sources do not support prefetch. Use storage with cross-node `flock`
-support, or stage the files separately and use a `pvc://` source. Avoid other
-writers (including separate Models sharing the same cache key) while a
+`s3://` and local sources do not support prefetch. Use storage with cross-node
+`flock` support, or stage the files separately and use a `pvc://` source. Avoid
+other writers (including separate Models sharing the same cache key) while a
 prefetch Job stages its directory. Other filesystems still use `flock`;
 their cross-node lock semantics must be supported by the storage provider.
 

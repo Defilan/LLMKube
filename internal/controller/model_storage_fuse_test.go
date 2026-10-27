@@ -320,8 +320,10 @@ func downloaderOf(t *testing.T, containers []corev1.Container) *corev1.Container
 
 // runDownloaderOnFS runs a generated downloader container's command under sh
 // with the container's own env, its cache directory moved to dir, and a stat
-// that answers -f as fs would (see fakeStatScript).
-func runDownloaderOnFS(t *testing.T, c *corev1.Container, dir, fs string, extraEnv ...string) (string, error) {
+// that answers -f as fs would (see fakeStatScript). envFrom stands in for the
+// container's EnvFrom: the explicit Env is applied after it and wins, as in a
+// pod.
+func runDownloaderOnFS(t *testing.T, c *corev1.Container, dir, fs string, envFrom ...string) (string, error) {
 	t.Helper()
 	realStat, err := exec.LookPath("stat")
 	if err != nil {
@@ -332,7 +334,7 @@ func runDownloaderOnFS(t *testing.T, c *corev1.Container, dir, fs string, extraE
 		t.Fatal(err)
 	}
 	cmd := exec.Command("sh", "-c", c.Command[2])
-	cmd.Env = os.Environ()
+	cmd.Env = append(os.Environ(), envFrom...)
 	for _, env := range c.Env {
 		switch env.Name {
 		case "CACHE_DIR":
@@ -343,7 +345,6 @@ func runDownloaderOnFS(t *testing.T, c *corev1.Container, dir, fs string, extraE
 		cmd.Env = append(cmd.Env, env.Name+"="+env.Value)
 	}
 	cmd.Env = append(cmd.Env, "PATH="+bin+":"+os.Getenv("PATH"), "REAL_STAT="+realStat)
-	cmd.Env = append(cmd.Env, extraEnv...)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
@@ -379,6 +380,185 @@ func TestCacheLockRemedyLogMatchesCondition(t *testing.T) {
 				t.Errorf("the downloader printed remedy %q, want %q", got, tc.want)
 			}
 			assertCacheLockCondition(t, out)
+		})
+	}
+}
+
+// singleFileFUSEModel is a single-file cached Model on source, which the tests
+// point at a stub origin.
+func singleFileFUSEModel(source, policy string) *inferencev1alpha1.Model {
+	return &inferencev1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "weights", Namespace: "default"},
+		Spec:       inferencev1alpha1.ModelSpec{Source: source, Format: "gguf", RefreshPolicy: policy},
+		Status:     inferencev1alpha1.ModelStatus{CacheKey: "cache"},
+	}
+}
+
+// TestSingleFileFUSEStaging: a single-file cached Model stages on FUSE only
+// from the prefetch stager, as the multi-file builder does (#2254). A serving
+// pod on a cold FUSE cache refuses with ModelCacheLockUnsupported before it
+// writes anything; other filesystems, and a stat that cannot tell, stage under
+// the directory lock as before.
+func TestSingleFileFUSEStaging(t *testing.T) {
+	requireInitShellEnvironment(t)
+	for _, kind := range []string{"http-IfNotPresent", "http-OnChange", "s3"} {
+		for _, fs := range []string{"fuse", "fuseblk", "busybox-fuse", "ext4", "unavailable"} {
+			for _, prefetch := range []bool{false, true} {
+				role := "serving"
+				if prefetch {
+					role = "prefetch"
+				}
+				t.Run(kind+"/"+fs+"/"+role, func(t *testing.T) {
+					runSingleFileFUSEStagingCase(t, kind, fs, prefetch)
+				})
+			}
+		}
+	}
+}
+
+func runSingleFileFUSEStagingCase(t *testing.T, kind, fs string, prefetch bool) {
+	t.Helper()
+	origin := newRangeOrigin(t, true)
+	source, policy, extraEnv := origin.srv.URL+"/org/repo/model.gguf", RefreshPolicyIfNotPresent, []string(nil)
+	switch kind {
+	case "http-OnChange":
+		policy = RefreshPolicyOnChange
+	case "s3":
+		source = "s3://bucket/model.gguf"
+		extraEnv = s3TestEnv(origin.srv.URL)
+	}
+	model := singleFileFUSEModel(source, policy)
+	containers := buildModelStorageConfig(model, nil, "default", true, ModelCacheModeShared, "", defaultPrefetchImage, 0, ModelCachePrepAlways, nil, "").initContainers
+	if prefetch {
+		job, err := (&ModelReconciler{InitContainerImage: defaultPrefetchImage}).buildPrefetchJob(context.Background(), model, "", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if job.Spec.PodReplacementPolicy == nil || *job.Spec.PodReplacementPolicy != batchv1.Failed {
+			t.Error("a single-file prefetch stager must wait for a failed pod before replacing it")
+		}
+		containers = job.Spec.Template.Spec.InitContainers
+	}
+	downloader := downloaderOf(t, containers)
+	dir := t.TempDir()
+	sentinel := filepath.Join(dir, "orphan.tmp")
+	if err := os.WriteFile(sentinel, []byte("untouched"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// EnvFrom cannot override the explicit serving-pod setting, which the
+	// container's own Env carries after this.
+	out, err := runDownloaderOnFS(t, downloader, dir, fs, append([]string{"LLMKUBE_PREFETCH_STAGER=true"}, extraEnv...)...)
+	published := filepath.Join(dir, singleFileStagedBasename(model))
+	if !prefetch && fs != "ext4" && fs != "unavailable" {
+		if err == nil {
+			t.Fatalf("a serving pod staged on FUSE: %s", out)
+		}
+		if got := origin.fullFromZero.Load() + origin.rangeRequests.Load(); got != 0 {
+			t.Errorf("a serving pod on FUSE issued %d downloads", got)
+		}
+		if got := readOrFail(t, sentinel); got != "untouched" {
+			t.Errorf("a serving pod on FUSE swept the cache: %q", got)
+		}
+		if _, err := os.Stat(published); !os.IsNotExist(err) {
+			t.Error("a serving pod on FUSE published a file")
+		}
+		if _, err := os.Stat(filepath.Join(dir, ".llmkube-download.lock")); !os.IsNotExist(err) {
+			t.Error("a serving pod on FUSE created a lock file")
+		}
+		assertCacheLockCondition(t, out)
+		return
+	}
+	if err != nil {
+		t.Fatalf("staging failed: %v\n%s", err, out)
+	}
+	if got := readOrFail(t, published); got != string(origin.content()) {
+		t.Errorf("staging published %d bytes, want the origin's %d", len(got), len(origin.content()))
+	}
+	if strings.Contains(out, "ModelCacheLockUnsupported") {
+		t.Errorf("a pod allowed to stage logged a refusal: %s", out)
+	}
+	lockFile := filepath.Join(dir, ".llmkube-download.lock")
+	if fs == "ext4" || fs == "unavailable" {
+		if _, err := os.Stat(lockFile); err != nil {
+			t.Errorf("staging off FUSE must hold the directory lock: %v", err)
+		}
+	} else if _, err := os.Stat(lockFile); !os.IsNotExist(err) {
+		t.Error("the FUSE stager must not rely on flock")
+	}
+}
+
+// TestSingleFileFUSEWarmCache: a serving pod on FUSE still starts from a warm
+// single-file cache (#2254), whatever the origin says, and changes nothing on
+// the claim: no lock file, no sweep, no transfer.
+func TestSingleFileFUSEWarmCache(t *testing.T) {
+	requireInitShellEnvironment(t)
+	for _, tc := range []struct {
+		policy, origin string
+		pinned         bool
+		wantLog        string
+	}{
+		{RefreshPolicyIfNotPresent, "matching", false, "Model already cached, skipping download"},
+		{RefreshPolicyIfNotPresent, "offline", false, "Model already cached, skipping download"},
+		{RefreshPolicyIfNotPresent, "matching", true, "Model already cached, skipping download"},
+		{RefreshPolicyOnChange, "matching", false, "Model revalidated (unchanged, skipped download)"},
+		{RefreshPolicyOnChange, "offline", false, "Revalidation unreachable for model.gguf; kept cached copy"},
+		{RefreshPolicyOnChange, "changed", false, "Upstream changed for model.gguf; a serving pod does not stage on a FUSE cache, so it kept the cached copy"},
+		{RefreshPolicyOnChange, "changed", true, "Upstream changed for model.gguf; a serving pod does not stage on a FUSE cache, so it kept the cached copy"},
+	} {
+		t.Run(fmt.Sprintf("%s/%s/pinned-%v", tc.policy, tc.origin, tc.pinned), func(t *testing.T) {
+			const cached = "cached"
+			var gets atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodHead {
+					gets.Add(1)
+				}
+				size := len(cached)
+				if tc.origin == "changed" {
+					size = 100
+				}
+				w.Header().Set("Content-Length", fmt.Sprint(size))
+			}))
+			t.Cleanup(srv.Close)
+			if tc.origin == "offline" {
+				srv.Close()
+			}
+			model := singleFileFUSEModel(srv.URL+"/org/repo/model.gguf", tc.policy)
+			model.Status.Path = "/models/cache/model.gguf"
+			if tc.pinned {
+				model.Spec.SHA256 = sha256Hex([]byte(cached))
+			}
+			storage := buildModelStorageConfig(model, nil, "default", true, ModelCacheModeShared, "", defaultPrefetchImage, 0, ModelCachePrepAlways, nil, "")
+			dir := t.TempDir()
+			dest := filepath.Join(dir, "model.gguf")
+			if err := os.WriteFile(dest, []byte(cached), 0o444); err != nil {
+				t.Fatal(err)
+			}
+			sentinel := filepath.Join(dir, "orphan.tmp")
+			if err := os.WriteFile(sentinel, []byte("untouched"), 0o444); err != nil {
+				t.Fatal(err)
+			}
+			out, err := runDownloaderOnFS(t, downloaderOf(t, storage.initContainers), dir, "fuse")
+			if err != nil {
+				t.Fatalf("a warm FUSE cache did not start: %v\n%s", err, out)
+			}
+			if !strings.Contains(out, tc.wantLog) {
+				t.Errorf("log does not say %q:\n%s", tc.wantLog, out)
+			}
+			if strings.Contains(out, "ModelCacheLockUnsupported") {
+				t.Errorf("a warm cache start logged a refusal:\n%s", out)
+			}
+			if gets.Load() != 0 {
+				t.Errorf("a serving pod on FUSE issued %d downloads", gets.Load())
+			}
+			if readOrFail(t, dest) != cached {
+				t.Error("a serving pod modified the FUSE cache")
+			}
+			if readOrFail(t, sentinel) != "untouched" {
+				t.Error("a serving pod swept the FUSE cache")
+			}
+			if _, err := os.Stat(filepath.Join(dir, ".llmkube-download.lock")); !os.IsNotExist(err) {
+				t.Error("a serving pod created a lock file on FUSE")
+			}
 		})
 	}
 }

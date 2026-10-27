@@ -191,7 +191,7 @@ func TestModelDownloadProgress_Behavioral(t *testing.T) {
 		{"IfNotPresent", func() string {
 			return buildModelInitCommand(false, false, true, false, false, RefreshPolicyIfNotPresent)
 		}},
-		{"OnChange", func() string { return remoteRevalidateScript(false, false) }},
+		{"OnChange", func() string { return remoteRevalidateScript(false, false, false) }},
 	}
 
 	for _, v := range variants {

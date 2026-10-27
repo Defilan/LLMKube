@@ -206,7 +206,7 @@ func TestModelDownloadResume_Behavioral(t *testing.T) {
 	t.Run("OnChange", func(t *testing.T) {
 		testResumeVariant(t, resumeVariant{
 			name:   "OnChange",
-			script: func() string { return remoteRevalidateScript(false, false) },
+			script: func() string { return remoteRevalidateScript(false, false, false) },
 		})
 	})
 	// The multi-file loop reuses the same resume helpers per file. With

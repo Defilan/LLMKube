@@ -192,6 +192,19 @@ func markJobFailed(ctx context.Context, key types.NamespacedName) {
 	Expect(k8sClient.Status().Update(ctx, job)).To(Succeed())
 }
 
+// finishJobDeletion stands in for the garbage collector envtest lacks. Every
+// prefetch stager is deleted in the foreground (deletePrefetchJob), so it
+// keeps the foregroundDeletion finalizer until its pods are gone, and no pods
+// run here. A Job that is not being deleted is left alone.
+func finishJobDeletion(ctx context.Context, key types.NamespacedName) {
+	job := &batchv1.Job{}
+	if err := k8sClient.Get(ctx, key, job); err != nil || job.DeletionTimestamp == nil {
+		return
+	}
+	job.Finalizers = nil
+	Expect(client.IgnoreNotFound(k8sClient.Update(ctx, job))).To(Succeed())
+}
+
 // cacheClaimOf returns the PersistentVolumeClaim the pod's model-cache volume
 // mounts, or "".
 func cacheClaimOf(spec *corev1.PodSpec) string {
@@ -305,6 +318,9 @@ var _ = Describe("InferenceService modelCache.prefetch (#2136)", func() {
 		Eventually(func() bool {
 			m, _, _ := prefetchModel(r, name)
 			e := findPrefetchStatus(m, claim)
+			if e != nil && e.JobName != "" {
+				finishJobDeletion(ctx, types.NamespacedName{Name: e.JobName, Namespace: ns})
+			}
 			return e != nil && e.Phase == inferencev1alpha1.PrefetchPhaseRunning && e.Fingerprint != previousFingerprint
 		}, 10*time.Second, 200*time.Millisecond).Should(BeTrue())
 	}
@@ -476,6 +492,7 @@ var _ = Describe("InferenceService modelCache.prefetch (#2136)", func() {
 		transfer := meta.FindStatusCondition(got.Status.Conditions, ConditionModelTransferHealthy)
 		Expect(transfer).NotTo(BeNil())
 		Expect(transfer.Reason).To(Equal(ReasonPrefetchedFilesMissing))
+		finishJobDeletion(ctx, jobKey)
 		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, jobKey, &batchv1.Job{}))).To(BeTrue(),
 			"the prefetch Job is deleted so the Model stages the claim again")
 		Expect(drainEvents(recorder)).To(ContainElement(HavePrefix("Warning " + ReasonPrefetchRestaged)))
