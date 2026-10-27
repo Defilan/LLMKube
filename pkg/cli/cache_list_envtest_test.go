@@ -46,9 +46,22 @@ import (
 
 var (
 	cacheListEnvOnce sync.Once
+	cacheListEnv     *envtest.Environment
 	cacheListEnvCfg  *rest.Config
 	cacheListEnvErr  error
 )
+
+// TestMain stops the control plane cacheListEnvtest shares across the
+// package. Without it, every run of this package left an etcd and a
+// kube-apiserver running after the test binary exited, and they piled up
+// across runs until envtest's own start timed out.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if cacheListEnv != nil {
+		_ = cacheListEnv.Stop()
+	}
+	os.Exit(code)
+}
 
 // cacheListEnvtest starts one envtest control plane for the whole package run.
 func cacheListEnvtest(t *testing.T) *rest.Config {
@@ -74,7 +87,7 @@ func cacheListEnvtest(t *testing.T) *rest.Config {
 			cacheListEnvErr = err
 			return
 		}
-		cacheListEnvCfg = cfg
+		cacheListEnv, cacheListEnvCfg = env, cfg
 	})
 	if cacheListEnvErr != nil {
 		t.Fatalf("start envtest: %v", cacheListEnvErr)
