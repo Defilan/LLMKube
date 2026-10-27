@@ -57,7 +57,7 @@ func applyExplicitAPIKey(opts *benchmarkOptions) error {
 		return nil
 	}
 
-	if key := os.Getenv(benchmarkAPIKeyEnv); key != "" {
+	if key := trimHeaderValue(os.Getenv(benchmarkAPIKeyEnv)); key != "" {
 		opts.apiKey = key
 		fmt.Printf("🔑 API key: from %s\n", benchmarkAPIKeyEnv)
 	}
@@ -77,36 +77,48 @@ func selectAPIKeyRef(isvc *inferencev1alpha1.InferenceService) *corev1.SecretKey
 	return isvc.Spec.Endpoint.APIKeySecretRef
 }
 
-// unresolvableKeyReason mirrors inferenceServiceRequiresAPIKey in
-// internal/controller/endpoint_auth.go and returns why the service demands a
-// key the CLI cannot read, or "" when it can read one or needs none. If that
-// function grows another keyed form, this one needs the same case.
+// unresolvableKeyReason returns why a service needs a key the CLI did not
+// read, or "" when it needs none (or the CLI read one: this is only consulted
+// after selectAPIKeyRef). It mirrors the keyed forms of
+// inferenceServiceRequiresAPIKey in internal/controller/endpoint_auth.go; a
+// form added there needs a case here. A ref is not one of them: when a ref is
+// declared without an extraArgs veto, it was already read.
 func unresolvableKeyReason(isvc *inferencev1alpha1.InferenceService) string {
 	if isvc == nil {
 		return ""
 	}
-	if isvc.Spec.Endpoint != nil && isvc.Spec.Endpoint.APIKeySecretRef != nil {
-		return ""
-	}
-	if hasMatchingExtraArg(isvc.Spec.ExtraArgs, "api-key") {
+	switch {
+	case hasMatchingExtraArg(isvc.Spec.ExtraArgs, "api-key"):
 		return "--api-key in spec.extraArgs"
-	}
-	if len(isvc.Spec.Command) > 0 && hasMatchingExtraArg(isvc.Spec.Args, "api-key") {
+	case len(isvc.Spec.Command) > 0 && hasMatchingExtraArg(isvc.Spec.Args, "api-key"):
 		return "--api-key in spec.args"
-	}
-	if isvc.Spec.Runtime == runtimeVLLM {
-		for _, e := range isvc.Spec.Env {
-			if e.Name == vllmAPIKeyEnv {
-				return vllmAPIKeyEnv + " in spec.env"
-			}
-		}
+	case isvc.Spec.Runtime == runtimeVLLM && hasEnv(isvc, vllmAPIKeyEnv):
+		return vllmAPIKeyEnv + " in spec.env"
 	}
 	return ""
 }
 
-// readAPIKeySecret returns the Secret's value for ref. The value is used
-// verbatim because the pod sends the same bytes; only --api-key-file is
-// trimmed.
+// hasEnv reports whether spec.env names the variable; presence is the verdict,
+// as in the controller.
+func hasEnv(isvc *inferencev1alpha1.InferenceService, name string) bool {
+	for _, e := range isvc.Spec.Env {
+		if e.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// trimHeaderValue drops the whitespace a header value cannot carry. net/http
+// rejects CR and LF outright, and trims trailing SP and HTAB on the wire, so
+// the trimmed form is the only one the server can compare against.
+func trimHeaderValue(v string) string {
+	return strings.TrimRight(v, " \t\r\n")
+}
+
+// readAPIKeySecret returns the Secret's value for ref, trimmed the way a
+// header value must be (the env var the pod reads carries bytes a header
+// cannot, such as a file's trailing newline).
 func readAPIKeySecret(
 	ctx context.Context, c client.Client, namespace string, ref *corev1.SecretKeySelector,
 ) (string, error) {
@@ -121,12 +133,12 @@ func readAPIKeySecret(
 	if len(value) == 0 {
 		return "", fmt.Errorf("API key Secret %s/%s key %q is empty", namespace, ref.Name, ref.Key)
 	}
-	return string(value), nil
+	return trimHeaderValue(string(value)), nil
 }
 
 // applyAPIKeyFromInferenceService resolves the key a Ready service already
-// carries. An explicit override wins, and a ref the controller left unwired is
-// reported instead of being sent.
+// carries. An explicit override wins, and a service that needs a key the CLI
+// cannot read is reported instead of being sent one the server will reject.
 func applyAPIKeyFromInferenceService(
 	ctx context.Context, c client.Client, isvc *inferencev1alpha1.InferenceService, opts *benchmarkOptions,
 ) error {

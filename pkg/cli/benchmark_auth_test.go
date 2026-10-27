@@ -347,6 +347,32 @@ func TestBenchmarkSecretValueSentVerbatim(t *testing.T) {
 	}
 }
 
+func TestBenchmarkNewlineTerminatedSecretValue(t *testing.T) {
+	c, ns := keyedNamespace(t)
+	// An operator's key file ends in a newline; a header value cannot carry
+	// one, so the CLI sends the value without it and the server compares the
+	// same bytes.
+	srv, calls := keyedServer(t, benchAuthKey)
+	createSecret(t, c, ns, "upstream-key", map[string]string{"key": benchAuthKey + "\n"})
+	createKeyedInferenceService(t, c, ns, "keyed-llm", srv.URL,
+		&corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "upstream-key"}, Key: "key"},
+		nil)
+
+	out, err := runBenchmarkCommand(t, "keyed-llm", "-n", ns,
+		"--port-forward=false", "--warmup", "0", "--iterations", "2", "-o", "json")
+	if err != nil {
+		t.Fatalf("benchmark failed: %v\n%s", err, out)
+	}
+	if got := summaryFromStdout(t, out).SuccessfulRuns; got != 2 {
+		t.Fatalf("successful_runs = %d, want 2", got)
+	}
+	for _, auth := range calls.forPath("/v1/chat/completions") {
+		if auth != "Bearer "+benchAuthKey {
+			t.Fatalf("Authorization = %q, want the newline trimmed", auth)
+		}
+	}
+}
+
 func TestBenchmarkAPIKeyNeverPrinted(t *testing.T) {
 	srv, _ := keyedServer(t, benchAuthKey)
 	t.Setenv(apiKeyEnv, benchAuthKey)
@@ -639,6 +665,22 @@ func TestBenchmarkUnresolvableKeyPrintsHint(t *testing.T) {
 			want: "--api-key in spec.extraArgs",
 		},
 		{
+			// The ref is declared but the controller wired nothing, so the
+			// Secret's value is not the server's key and the run must say so.
+			name: "extraArgs api-key with a ref",
+			mutate: func(isvc *inferencev1alpha1.InferenceService) {
+				isvc.Spec.Runtime = benchFixtureRuntime
+				isvc.Spec.ExtraArgs = []string{"--api-key", "literal"}
+				isvc.Spec.Endpoint = &inferencev1alpha1.EndpointSpec{
+					Port: 8080,
+					APIKeySecretRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "upstream-key"}, Key: "key",
+					},
+				}
+			},
+			want: "--api-key in spec.extraArgs",
+		},
+		{
 			name: "args api-key with command",
 			mutate: func(isvc *inferencev1alpha1.InferenceService) {
 				isvc.Spec.Command = []string{"vllm"}
@@ -660,6 +702,9 @@ func TestBenchmarkUnresolvableKeyPrintsHint(t *testing.T) {
 			c, ns := keyedNamespace(t)
 			srv, calls := keyedServer(t, "")
 			name := fixtureName("keyed-" + tc.name)
+			// Present, so a read that should not happen would succeed rather
+			// than fail on a missing Secret.
+			createSecret(t, c, ns, "upstream-key", map[string]string{"key": benchAuthKey})
 			createKeyedInferenceService(t, c, ns, name, srv.URL, nil, tc.mutate)
 
 			out, err := runBenchmarkCommand(t, name, "-n", ns,

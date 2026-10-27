@@ -476,7 +476,8 @@ Examples:
 	cmd.Flags().IntVar(&opts.maxTokens, "max-tokens", 50, "Maximum tokens to generate per request")
 	cmd.Flags().IntVarP(&opts.concurrent, "concurrent", "c", 1, "Number of concurrent requests for stress testing")
 	cmd.Flags().StringVarP(&opts.output, "output", "o", "table", "Output format: table, json, markdown")
-	cmd.Flags().StringVar(&opts.endpoint, "endpoint", "", "Override endpoint URL (default: auto-detect from service)")
+	cmd.Flags().StringVar(&opts.endpoint, "endpoint", "",
+		"Benchmark this URL instead of looking the service up (SERVICE_NAME may be omitted)")
 	cmd.Flags().StringVar(&opts.apiKeyFile, "api-key-file", "",
 		"File holding the endpoint API key (default: the InferenceService's endpoint.apiKeySecretRef)")
 	cmd.Flags().DurationVar(&opts.timeout, "timeout", 60*time.Second, "Request timeout")
@@ -547,7 +548,7 @@ func dispatchBenchmarkMode(ctx context.Context, opts *benchmarkOptions) error {
 		return runPromptDepthSweep(ctx, opts)
 	}
 
-	return runBenchmark(opts)
+	return runBenchmark(ctx, opts)
 }
 
 func runWarmupRequests(ctx context.Context, endpoint string, opts *benchmarkOptions) {
@@ -587,8 +588,7 @@ func runBenchmarkIterations(ctx context.Context, endpoint string, opts *benchmar
 	return results
 }
 
-func runBenchmark(opts *benchmarkOptions) error {
-	ctx := context.Background()
+func runBenchmark(ctx context.Context, opts *benchmarkOptions) error {
 	startTime := time.Now()
 
 	endpoint, cleanup, err := getEndpoint(ctx, opts)
