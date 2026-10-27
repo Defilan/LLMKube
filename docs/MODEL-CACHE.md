@@ -93,7 +93,9 @@ checked against its recorded staged size before it is reused. Older entries
 without a valid size record are kept without contacting the origin, preserving
 the existing revision even if upstream has changed. Their current local size
 is recorded on a best-effort basis, except on FUSE where serving pods do not
-write to warm caches. This baseline detects subsequent size changes; it cannot
+write to warm caches; there the prefetch stager records it, so a FUSE cache
+staged before size records existed stops warning once a stager has run. This
+baseline detects subsequent size changes; it cannot
 prove that a legacy file was complete before the upgrade. A mismatch with a
 valid record triggers a fresh staging attempt; a failed download fails the
 init container. This also applies to unpinned files in a partially pinned

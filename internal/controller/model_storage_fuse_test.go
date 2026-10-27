@@ -589,3 +589,55 @@ func TestSingleFileFUSEWarmCache(t *testing.T) {
 		})
 	}
 }
+
+// TestMultiFileFUSEStagerBackfillsSizeRecord: a FUSE cache staged before size
+// records existed has none, and serving pods on FUSE must not write one. The
+// prefetch stager may write there, so its IfNotPresent pass records the cached
+// file's size without a transfer, and later starts stop warning (#2255).
+func TestMultiFileFUSEStagerBackfillsSizeRecord(t *testing.T) {
+	requireInitShellEnvironment(t)
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Length", "6")
+	}))
+	t.Cleanup(srv.Close)
+	model := &inferencev1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "weights", Namespace: "default"},
+		Spec:       inferencev1alpha1.ModelSpec{Source: srv.URL, Format: "safetensors", Files: []string{"model.safetensors"}},
+		Status:     inferencev1alpha1.ModelStatus{CacheKey: "cache"},
+	}
+	job, err := (&ModelReconciler{InitContainerImage: defaultPrefetchImage}).buildPrefetchJob(context.Background(), model, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stager := downloaderOf(t, job.Spec.Template.Spec.InitContainers)
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "model.safetensors")
+	if err := os.WriteFile(dest, []byte("cached"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const noRecord = "no valid size record for model.safetensors"
+
+	out, err := runDownloaderOnFS(t, stager, dir, "fuse")
+	if err != nil {
+		t.Fatalf("stager failed on a legacy FUSE cache: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, noRecord) {
+		t.Errorf("the first pass should report the missing record:\n%s", out)
+	}
+	if got := readOrFail(t, dest+".llmkube-size"); got != "6" {
+		t.Errorf("size record = %q, want the cached file's size 6", got)
+	}
+	if readOrFail(t, dest) != "cached" || requests.Load() != 0 {
+		t.Errorf("the stager replaced a cached file it should keep (%d requests)", requests.Load())
+	}
+
+	out, err = runDownloaderOnFS(t, stager, dir, "fuse")
+	if err != nil {
+		t.Fatalf("second stager pass failed: %v\n%s", err, out)
+	}
+	if strings.Contains(out, noRecord) {
+		t.Errorf("the backfilled record was not used on the next start:\n%s", out)
+	}
+}

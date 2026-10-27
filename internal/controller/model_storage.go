@@ -1308,10 +1308,17 @@ func buildMultiFileInitCommand(useCache, isS3, isHFAuth, withSHA256 bool, refres
 	}
 	// A mutable origin's size only proves staleness, not local corruption.
 	// Preserve legacy caches without probing the origin. Backfill their local
-	// baseline under IfNotPresent, except on FUSE where readers must not write.
+	// baseline under IfNotPresent, except from a serving pod on FUSE, which
+	// must not write there. The prefetch stager is the pod that may write a
+	// FUSE cache, so it backfills one staged before size records existed;
+	// otherwise that cache would warn on every start (#2255).
 	backfill := ""
 	if refreshPolicy != RefreshPolicyOnChange {
-		backfill = `if [ "${cache_fs:-}" != ` + fuseSuperMagic + ` ]; then llmkube_atomic_write "$dest.llmkube-size" "$_llmkube_local_size" || echo "WARNING: could not record cached size for $rel" >&2; fi; `
+		writer := `if [ "${cache_fs:-}" != ` + fuseSuperMagic + ` ]; then `
+		if useCache {
+			writer = `if ! llmkube_fuse_reader; then `
+		}
+		backfill = writer + `llmkube_atomic_write "$dest.llmkube-size" "$_llmkube_local_size" || echo "WARNING: could not record cached size for $rel" >&2; fi; `
 	}
 	sizeCheck := `llmkube_cached_size_matches() { ` +
 		`_llmkube_local_size=$(stat -c %s "$dest" 2>/dev/null) || return 1; ` +
