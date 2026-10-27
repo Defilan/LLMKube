@@ -567,8 +567,9 @@ kubectl describe pod -n llmkube-system <pod-name>
 # Verify CRDs are installed
 kubectl get crds | grep llmkube
 
-# Manually install CRDs if needed
-kubectl apply -f charts/llmkube/templates/crds/
+# Manually install CRDs if needed. Server-side apply: the InferenceService
+# CRD is too large for the last-applied annotation a plain apply writes.
+kubectl apply --server-side -f charts/llmkube/templates/crds/
 ```
 
 ### Prometheus Metrics Not Available
