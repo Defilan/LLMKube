@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestProcessInspector_StartTokenStableForSameProcess(t *testing.T) {
@@ -78,7 +79,18 @@ func TestProcessInspector_ScriptEngineMatchesItsScript(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
 	want, _ := filepath.EvalSymlinks(script)
-	got, err := newProcessInspector().Executables(cmd.Process.Pid)
+	// Start returns once the exec has begun, which on Linux can be before the
+	// kernel sets up the new argv: /proc/<pid>/exe already names the
+	// interpreter while /proc/<pid>/cmdline is still empty. A recorded engine
+	// has long passed that point, so wait it out here.
+	var got []string
+	var err error
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		got, err = newProcessInspector().Executables(cmd.Process.Pid)
+		if (err == nil && executableMatches(got, want)) || time.Now().After(deadline) {
+			break
+		}
+	}
 	if err != nil || !executableMatches(got, want) {
 		t.Fatalf("Executables(script) = %q, %v; want it to include %q", got, err, want)
 	}
