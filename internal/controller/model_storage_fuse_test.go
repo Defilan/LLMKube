@@ -399,7 +399,7 @@ func TestCacheLockRemedyLogMatchesCondition(t *testing.T) {
 				Spec:       inferencev1alpha1.ModelSpec{Source: tc.source, Format: "safetensors", Files: []string{"model.safetensors"}},
 				Status:     inferencev1alpha1.ModelStatus{CacheKey: "cache"},
 			}
-			storage := buildModelStorageConfig(model, nil, "default", true, ModelCacheModeShared, "", defaultPrefetchImage, 0, ModelCachePrepAlways, nil, "")
+			storage := buildModelStorageConfig(model, nil, "default", true, ModelCacheModeShared, "", defaultPrefetchImage, 0, ModelCachePrepAlways, DefaultInitContainerUser, nil, "")
 			out, err := runDownloaderOnFS(t, downloaderOf(t, storage.initContainers), t.TempDir(), "fuse", tc.env...)
 			if err == nil {
 				t.Fatalf("a serving pod staged on FUSE: %s", out)
@@ -456,7 +456,7 @@ func runSingleFileFUSEStagingCase(t *testing.T, kind, fs string, prefetch bool) 
 		extraEnv = s3TestEnv(origin.srv.URL)
 	}
 	model := singleFileFUSEModel(source, policy)
-	containers := buildModelStorageConfig(model, nil, "default", true, ModelCacheModeShared, "", defaultPrefetchImage, 0, ModelCachePrepAlways, nil, "").initContainers
+	containers := buildModelStorageConfig(model, nil, "default", true, ModelCacheModeShared, "", defaultPrefetchImage, 0, ModelCachePrepAlways, DefaultInitContainerUser, nil, "").initContainers
 	if prefetch {
 		job, err := (&ModelReconciler{InitContainerImage: defaultPrefetchImage}).buildPrefetchJob(context.Background(), model, "", "")
 		if err != nil {
@@ -555,7 +555,7 @@ func TestSingleFileFUSEWarmCache(t *testing.T) {
 			if tc.pinned {
 				model.Spec.SHA256 = sha256Hex([]byte(cached))
 			}
-			storage := buildModelStorageConfig(model, nil, "default", true, ModelCacheModeShared, "", defaultPrefetchImage, 0, ModelCachePrepAlways, nil, "")
+			storage := buildModelStorageConfig(model, nil, "default", true, ModelCacheModeShared, "", defaultPrefetchImage, 0, ModelCachePrepAlways, DefaultInitContainerUser, nil, "")
 			dir := t.TempDir()
 			dest := filepath.Join(dir, "model.gguf")
 			if err := os.WriteFile(dest, []byte(cached), 0o444); err != nil {
@@ -662,7 +662,7 @@ func TestCacheAtomicWriteDebrisSweep(t *testing.T) {
 					model.Spec.Source, model.Spec.Format, model.Spec.Files = "https://example.invalid/org/repo", "safetensors", []string{"sub/model.safetensors"}
 					artifact = "sub/model.safetensors"
 				}
-				containers := buildModelStorageConfig(model, nil, "default", true, ModelCacheModeShared, "", defaultPrefetchImage, 0, ModelCachePrepAlways, nil, "").initContainers
+				containers := buildModelStorageConfig(model, nil, "default", true, ModelCacheModeShared, "", defaultPrefetchImage, 0, ModelCachePrepAlways, DefaultInitContainerUser, nil, "").initContainers
 				if prefetch == "prefetch" {
 					job, err := (&ModelReconciler{InitContainerImage: defaultPrefetchImage}).buildPrefetchJob(context.Background(), model, "", "")
 					if err != nil {
