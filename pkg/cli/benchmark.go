@@ -402,6 +402,9 @@ AUTHENTICATION:
   be read (an --api-key in spec.extraArgs, or a service outside Kubernetes).
   An --endpoint run never reads the cluster. The key is never printed.
   Reading the Secret needs "get secrets" in the service's namespace.
+  Trailing whitespace a header cannot carry is stripped and reported; a file
+  reads with it trimmed, and a variable holding only whitespace is treated as
+  unset, so the ref still applies.
 
 Examples:
   # Basic benchmark (sequential requests)

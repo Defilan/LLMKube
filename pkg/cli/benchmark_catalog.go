@@ -207,8 +207,11 @@ func benchmarkSingleCatalogModel(
 	}
 	fmt.Printf("   ✅ Deployment ready\n\n")
 
-	opts.name = modelID
-	endpoint, endpointCleanup, err := getEndpoint(ctx, opts)
+	// A copy, as the sweep and suite paths use: a key resolved here belongs to
+	// this model, not to the next one in the loop.
+	testOpts := *opts
+	testOpts.name = modelID
+	endpoint, endpointCleanup, err := getEndpoint(ctx, &testOpts)
 	if err != nil {
 		fmt.Printf("   ❌ Failed to get endpoint: %v\n\n", err)
 		modelBenchmark.Status = statusFailed
@@ -221,7 +224,7 @@ func benchmarkSingleCatalogModel(
 
 	benchmarkStartTime := time.Now()
 	if isStressTest {
-		stressSummary, stressErr := runStressTestInternal(ctx, endpoint, opts, benchmarkStartTime)
+		stressSummary, stressErr := runStressTestInternal(ctx, endpoint, &testOpts, benchmarkStartTime)
 		if stressErr != nil {
 			fmt.Printf("   ❌ Benchmark failed: %v\n\n", stressErr)
 			modelBenchmark.Status = statusFailed
@@ -237,7 +240,7 @@ func benchmarkSingleCatalogModel(
 			modelBenchmark.ErrorRate = stressSummary.ErrorRate
 		}
 	} else {
-		summary, benchErr := runBenchmarkInternalWithEndpoint(ctx, endpoint, opts, benchmarkStartTime)
+		summary, benchErr := runBenchmarkInternalWithEndpoint(ctx, endpoint, &testOpts, benchmarkStartTime)
 		if benchErr != nil {
 			fmt.Printf("   ❌ Benchmark failed: %v\n\n", benchErr)
 			modelBenchmark.Status = statusFailed

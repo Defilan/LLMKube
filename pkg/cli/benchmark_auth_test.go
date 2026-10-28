@@ -149,6 +149,9 @@ func summaryFromStdout(t *testing.T, out string) BenchmarkSummary {
 
 func keyedNamespace(t *testing.T) (client.Client, string) {
 	t.Helper()
+	// Ambient LLMKUBE_API_KEY (a normal thing to have exported while using
+	// this feature) must not decide what the assertions below see.
+	t.Setenv(apiKeyEnv, "")
 	_, c, ns := metalEnvtest(t)
 	return c, ns
 }
@@ -253,6 +256,27 @@ func TestBenchmarkSendsAPIKeyFromFile(t *testing.T) {
 	}
 	if strings.Contains(out, benchAuthKey) {
 		t.Fatalf("stdout printed the key:\n%s", out)
+	}
+}
+
+// TestBenchmarkTrimmedEnvWarns: a variable the CLI must trim is reported, the
+// same way a Secret is, so a later 401 is explained.
+func TestBenchmarkTrimmedEnvWarns(t *testing.T) {
+	srv, calls := keyedServer(t, benchAuthKey)
+	t.Setenv(apiKeyEnv, benchAuthKey+"\n")
+
+	out, err := runBenchmarkCommand(t, "--endpoint", srv.URL,
+		"--warmup", "0", "--iterations", "1", "-o", "json")
+	if err != nil {
+		t.Fatalf("benchmark failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "cannot carry") {
+		t.Fatalf("no warning that the variable was trimmed:\n%s", out)
+	}
+	for _, auth := range calls.forPath("/v1/chat/completions") {
+		if auth != "Bearer "+benchAuthKey {
+			t.Fatalf("Authorization = %q, want the sendable (trimmed) form", auth)
+		}
 	}
 }
 
