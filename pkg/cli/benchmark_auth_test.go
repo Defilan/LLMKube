@@ -682,6 +682,27 @@ func TestBenchmarkEndpointFlagDoesNotReadTheSecretRef(t *testing.T) {
 	}
 }
 
+// TestBenchmarkEndpointRunNeedsNoKubeconfig: an --endpoint run is a plain HTTP
+// client, so it must work with no cluster at all. This is the input the
+// documented flow for "a service outside Kubernetes" uses.
+func TestBenchmarkEndpointRunNeedsNoKubeconfig(t *testing.T) {
+	srv, calls := keyedServer(t, "")
+	t.Setenv("KUBECONFIG", filepath.Join(t.TempDir(), "absent"))
+	t.Setenv(apiKeyEnv, "")
+
+	out, err := runBenchmarkCommand(t, "--endpoint", srv.URL,
+		"--warmup", "0", "--iterations", "1", "-o", "json")
+	if err != nil {
+		t.Fatalf("benchmark failed without a kubeconfig: %v\n%s", err, out)
+	}
+	if got := summaryFromStdout(t, out).SuccessfulRuns; got != 1 {
+		t.Fatalf("successful_runs = %d, want 1", got)
+	}
+	if n := len(calls.forPath("/v1/chat/completions")); n != 1 {
+		t.Fatalf("server saw %d chat requests, want 1", n)
+	}
+}
+
 // TestBenchmarkRefIgnoredWhenExtraArgsSetAPIKey: the controller wires nothing
 // when --api-key is already in extraArgs, so the Secret's value is not the
 // server's key and must not be sent.
