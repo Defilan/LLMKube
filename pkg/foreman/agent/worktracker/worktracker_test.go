@@ -18,6 +18,8 @@ package worktracker
 
 import (
 	"context"
+	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/defilantech/llmkube/pkg/foreman/agent/githubissue"
@@ -25,11 +27,13 @@ import (
 
 // fakeFetcher implements githubissue.Fetcher for testing.
 type fakeFetcher struct {
-	Issue *githubissue.Issue
-	Err   error
+	Issue  *githubissue.Issue
+	Err    error
+	Tokens []string
 }
 
-func (f *fakeFetcher) Fetch(_ context.Context, _, _ string, _ int, _ string) (*githubissue.Issue, error) {
+func (f *fakeFetcher) Fetch(_ context.Context, _, _ string, _ int, token string) (*githubissue.Issue, error) {
+	f.Tokens = append(f.Tokens, token)
 	return f.Issue, f.Err
 }
 
@@ -230,4 +234,29 @@ func findSubstring(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// TokenSource is resolved on every call, so a rotated token reaches the next
+// fetch without restarting the agent; a resolution error means an
+// unauthenticated request.
+func TestGitHubWorkItemsTokenSourcePerCall(t *testing.T) {
+	fetcher := &fakeFetcher{Issue: &githubissue.Issue{Number: 1}}
+	current := "first"
+	var resolveErr error
+	g := &GitHubWorkItems{Fetcher: fetcher, TokenSource: func() (string, error) { return current, resolveErr }}
+
+	steps := []func(){
+		func() {},
+		func() { current = "rotated" },
+		func() { resolveErr = errors.New("no token") },
+	}
+	for _, step := range steps {
+		step()
+		if _, err := g.Get(context.Background(), "o/r", "1"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if want := []string{"first", "rotated", ""}; !reflect.DeepEqual(fetcher.Tokens, want) {
+		t.Errorf("tokens used = %q, want %q", fetcher.Tokens, want)
+	}
 }

@@ -93,18 +93,29 @@ var (
 
 // githubCodeHost builds the GitHub-backed CodeHost seam (#1158), wrapping the
 // githubpr client with the same token source (env / file) as the git auth so
-// PR creation and head-commit reads stay authenticated.
+// PR creation and head-commit reads stay authenticated. The token is resolved
+// per call, so a rotated credential is picked up without a restart.
 func githubCodeHost() codehost.CodeHost {
-	token, _ := repo.TokenFromEnvOrFile()
-	return &codehost.GitHubCodeHost{Ensurer: githubpr.NewClient(), Token: token}
+	return &codehost.GitHubCodeHost{Ensurer: githubpr.NewClient(), TokenSource: repo.TokenFromEnvOrFile}
 }
 
 // githubWorkItems builds the GitHub-backed WorkItems seam (#1158), wrapping the
 // githubissue client with the same token source as the git auth so issue-body
-// fetches stay authenticated.
+// fetches stay authenticated, resolved per call like githubCodeHost's.
 func githubWorkItems() worktracker.WorkItems {
-	token, _ := repo.TokenFromEnvOrFile()
-	return &worktracker.GitHubWorkItems{Fetcher: githubissue.NewClient(), Token: token}
+	return &worktracker.GitHubWorkItems{Fetcher: githubissue.NewClient(), TokenSource: repo.TokenFromEnvOrFile}
+}
+
+// forgeSeams are the provider seams an executor and its tool registry share.
+// They are built once per executor so the tools reach the same forge the
+// executor does.
+type forgeSeams struct {
+	codeHost  codehost.CodeHost
+	workItems worktracker.WorkItems
+}
+
+func githubForgeSeams() forgeSeams {
+	return forgeSeams{codeHost: githubCodeHost(), workItems: githubWorkItems()}
 }
 
 func init() {
@@ -476,6 +487,7 @@ func main() {
 	case "stub":
 		executor = &foremanagent.StubExecutor{SleepDuration: stubSleep}
 	case "native":
+		seams := githubForgeSeams()
 		executor = &foremanagent.NativeAgentLoopExecutor{
 			Stream:                       turnStream,
 			Client:                       kc,
@@ -491,9 +503,9 @@ func main() {
 				Email: committerEmail(commitCommitterEmail, commitAuthorEmail),
 			},
 			KeepWorkspace:   keepWorkspace,
-			RegistryFactory: makeRegistryFactory(kc, kcs, foremanNamespace, gateCachePVC),
-			CodeHost:        githubCodeHost(),
-			WorkItems:       githubWorkItems(),
+			RegistryFactory: makeRegistryFactory(kc, kcs, foremanNamespace, gateCachePVC, seams),
+			CodeHost:        seams.codeHost,
+			WorkItems:       seams.workItems,
 			ChangePolicy:    changepolicy.NewDefaultPolicy(),
 			// CoderJobSubmitter routes Job-mode Agents to an ephemeral
 			// per-task Job (#620). Wired ONLY on the watcher executor: the
@@ -685,6 +697,7 @@ func runTaskCommand(args []string) {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	seams := githubForgeSeams()
 	res, err := foremanagent.RunTask(ctx, foremanagent.RunTaskConfig{
 		Client:                       kc,
 		Task:                         types.NamespacedName{Namespace: namespace, Name: taskName},
@@ -698,9 +711,9 @@ func runTaskCommand(args []string) {
 			Email: committerEmail(commitCommitterEmail, commitAuthorEmail),
 		},
 		KeepWorkspace:   keepWorkspace,
-		RegistryFactory: makeRegistryFactory(kc, kcs, foremanNamespace, gateCachePVC),
-		CodeHost:        githubCodeHost(),
-		WorkItems:       githubWorkItems(),
+		RegistryFactory: makeRegistryFactory(kc, kcs, foremanNamespace, gateCachePVC, seams),
+		CodeHost:        seams.codeHost,
+		WorkItems:       seams.workItems,
 		ChangePolicy:    changepolicy.NewDefaultPolicy(),
 	})
 	if err != nil {
@@ -875,7 +888,7 @@ func assembleAgentRegistry(
 // gate being closed runs the loop with native tools only, exactly like
 // before MCP existed.
 func makeRegistryFactory(
-	kc client.Client, kcs kubernetes.Interface, foremanNamespace, gateCachePVC string,
+	kc client.Client, kcs kubernetes.Interface, foremanNamespace, gateCachePVC string, seams forgeSeams,
 ) func(
 	ctx context.Context, workspace string, ag *foremanv1alpha1.Agent, workloadMCPEnabled bool,
 ) (foremanagent.ToolRegistry, error) {
@@ -907,6 +920,11 @@ func makeRegistryFactory(
 			LogTailFn:                 logTail,
 			Token:                     repo.TokenFromEnvOrFile,
 			GateActiveDeadlineSeconds: gateDeadline,
+			// The tools reach the same forge as the executor; nil here left
+			// fetch_issue and the gate's clone URL on their GitHub defaults
+			// whatever seam the executor was given (#1298).
+			CodeHost:  seams.codeHost,
+			WorkItems: seams.workItems,
 		})
 
 		var mcpTools []foremantools.Tool

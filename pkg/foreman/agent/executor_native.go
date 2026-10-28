@@ -443,20 +443,7 @@ func (e *NativeAgentLoopExecutor) Execute(
 	// upstream base below (#813). The test override lets envtest inject a
 	// local remote.
 	//
-	// The injected CodeHost seam wins when set (#1298). Reading the
-	// package-level default here instead would make a Forgejo or GitLab
-	// CodeHost compile, satisfy the interface, be injected, and still hand
-	// back https://github.com/<slug>.git, which is the failure this seam
-	// exists to prevent.
-	resolveUpstream := func(repoSlug string) string {
-		if e.CodeHost != nil {
-			return e.CodeHost.ResolveCloneURL(repoSlug)
-		}
-		return upstreamURLForRepo(repoSlug)
-	}
-	if e.UpstreamURLForRepo != nil {
-		resolveUpstream = e.UpstreamURLForRepo
-	}
+	resolveUpstream := e.upstreamURL
 
 	branch := branchNameForTask(task)
 	// Resolve the clone+push target ONCE so every downstream caller — the
@@ -1997,7 +1984,7 @@ func (e *NativeAgentLoopExecutor) executeDeterministic(
 	// repository the Workload asked for, #1464) so the gate Job clones
 	// from the same repo the coder pushed to, rather than the upstream
 	// payload.repo where the branch does not yet exist.
-	args := buildDeterministicArgs(task, branch, cloneURL)
+	args := buildDeterministicArgs(task, branch, cloneURL, e.resolveUpstreamForRun(task))
 
 	result, dispatchErr := registry.Dispatch(ctx, toolName, args)
 	if dispatchErr != nil {
@@ -2151,7 +2138,10 @@ func pickDeterministicTool(tools []string) string {
 // --git-remote-url) and the gate must verify that branch on the fork, not on
 // the upstream payload.repo where the branch does not yet exist. Empty
 // cloneURL preserves the M4 default (upstream + repo).
-func buildDeterministicArgs(task *foremanv1alpha1.AgenticTask, branch, cloneURL string) json.RawMessage {
+//
+// upstreamURL is the payload repo's canonical clone URL, resolved by the
+// caller through the executor's CodeHost (resolveUpstreamForRun).
+func buildDeterministicArgs(task *foremanv1alpha1.AgenticTask, branch, cloneURL, upstreamURL string) json.RawMessage {
 	// Resolve once. Resolve() is nil-safe: a nil GateProfile yields the go
 	// preset (image golang:1.26, the make-target checks), so a Go task stays
 	// byte-identical to before this field existed.
@@ -2184,7 +2174,7 @@ func buildDeterministicArgs(task *foremanv1alpha1.AgenticTask, branch, cloneURL 
 		// canonical repo and revert to the true merge-base instead of the
 		// fork's possibly-stale ref tip (#1259). Empty (no repo slug) keeps
 		// the origin-fallback path.
-		"upstreamURL": upstreamURLForRepo(task.Spec.Payload.Repo),
+		"upstreamURL": upstreamURL,
 		// image is the container image the gate Job runs.
 		"image": resolved.Image,
 	}
@@ -3483,16 +3473,28 @@ func (e *NativeAgentLoopExecutor) mapLoopError(
 	}
 }
 
-// resolveUpstreamForRun mirrors the resolveUpstream selection used at
-// the top of Execute (test override vs. package default), so the
-// self-commit recovery path uses the same upstream URL the branch was
-// originally cut from. Pulled out as a method so runLLMPath stays
-// under the gocyclo ceiling.
-func (e *NativeAgentLoopExecutor) resolveUpstreamForRun(task *foremanv1alpha1.AgenticTask) string {
+// upstreamURL resolves a repo slug's canonical clone URL: the test override,
+// else the injected CodeHost seam (#1298), else the package GitHub default.
+// Every upstream lookup goes through here, so the clone, the gates, the base
+// SHAs and the reviewer diff all name the same forge. Reading the package
+// default anywhere else would let a Forgejo or GitLab CodeHost be injected
+// and still hand back https://github.com/<slug>.git for part of the run.
+func (e *NativeAgentLoopExecutor) upstreamURL(repoSlug string) string {
 	if e.UpstreamURLForRepo != nil {
-		return e.UpstreamURLForRepo(task.Spec.Payload.Repo)
+		return e.UpstreamURLForRepo(repoSlug)
 	}
-	return upstreamURLForRepo(task.Spec.Payload.Repo)
+	if e.CodeHost != nil {
+		return e.CodeHost.ResolveCloneURL(repoSlug)
+	}
+	return upstreamURLForRepo(repoSlug)
+}
+
+// resolveUpstreamForRun is upstreamURL for the task's payload repo, so the
+// self-commit recovery path uses the same upstream URL the branch was
+// originally cut from. Pulled out as a method so runLLMPath stays under the
+// gocyclo ceiling.
+func (e *NativeAgentLoopExecutor) resolveUpstreamForRun(task *foremanv1alpha1.AgenticTask) string {
+	return e.upstreamURL(task.Spec.Payload.Repo)
 }
 
 // resolveEvidenceBaseSHA resolves evidenceBaseSHA for the claim-evidence

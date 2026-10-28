@@ -193,7 +193,7 @@ func TestBuildDeterministicArgs(t *testing.T) {
 	}
 
 	t.Run("cloneURL set", func(t *testing.T) {
-		raw := buildDeterministicArgs(task, "foreman/issue-510", "https://github.com/Defilan/LLMKube.git")
+		raw := buildDeterministicArgs(task, "foreman/issue-510", "https://github.com/Defilan/LLMKube.git", upstreamURLForRepo(task.Spec.Payload.Repo))
 		var got map[string]any
 		if err := json.Unmarshal(raw, &got); err != nil {
 			t.Fatalf("decode args: %v", err)
@@ -223,7 +223,7 @@ func TestBuildDeterministicArgs(t *testing.T) {
 	})
 
 	t.Run("cloneURL empty preserves M4 default", func(t *testing.T) {
-		raw := buildDeterministicArgs(task, "foreman/issue-510", "")
+		raw := buildDeterministicArgs(task, "foreman/issue-510", "", upstreamURLForRepo(task.Spec.Payload.Repo))
 		var got map[string]any
 		if err := json.Unmarshal(raw, &got); err != nil {
 			t.Fatalf("decode args: %v", err)
@@ -234,7 +234,7 @@ func TestBuildDeterministicArgs(t *testing.T) {
 	})
 
 	t.Run("nil GateProfile resolves to golang image", func(t *testing.T) {
-		raw := buildDeterministicArgs(task, "foreman/issue-510", "")
+		raw := buildDeterministicArgs(task, "foreman/issue-510", "", upstreamURLForRepo(task.Spec.Payload.Repo))
 		var got map[string]any
 		if err := json.Unmarshal(raw, &got); err != nil {
 			t.Fatalf("decode args: %v", err)
@@ -261,7 +261,7 @@ func TestBuildDeterministicArgs(t *testing.T) {
 				},
 			},
 		}
-		raw := buildDeterministicArgs(pyTask, "foreman/issue-839", "")
+		raw := buildDeterministicArgs(pyTask, "foreman/issue-839", "", upstreamURLForRepo(pyTask.Spec.Payload.Repo))
 		var got map[string]any
 		if err := json.Unmarshal(raw, &got); err != nil {
 			t.Fatalf("decode args: %v", err)

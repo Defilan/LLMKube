@@ -51,6 +51,23 @@ type GitHubWorkItems struct {
 	// unauthenticated request (public repos, subject to rate limits),
 	// matching the executor's prior best-effort issue fetch.
 	Token string
+	// TokenSource, when Token is empty, resolves the token on every call, so
+	// a rotated credential is picked up without restarting the agent. A
+	// resolution error means an unauthenticated request, as an empty Token
+	// does.
+	TokenSource func() (string, error)
+}
+
+// token is the credential for one API call.
+func (g *GitHubWorkItems) token() string {
+	if g.Token != "" || g.TokenSource == nil {
+		return g.Token
+	}
+	t, err := g.TokenSource()
+	if err != nil {
+		return ""
+	}
+	return t
 }
 
 // Get fetches a single work item by repo slug and ID. The ID is
@@ -67,7 +84,7 @@ func (g *GitHubWorkItems) Get(ctx context.Context, repoSlug, id string) (*WorkIt
 		return nil, fmt.Errorf("worktracker: parse id %q as int: %w", id, err)
 	}
 
-	issue, err := g.Fetcher.Fetch(ctx, owner, repo, num, g.Token)
+	issue, err := g.Fetcher.Fetch(ctx, owner, repo, num, g.token())
 	if err != nil {
 		return nil, fmt.Errorf("worktracker: fetch issue %d: %w", num, err)
 	}

@@ -18,6 +18,8 @@ package codehost
 
 import (
 	"context"
+	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/defilantech/llmkube/pkg/foreman/agent/githubpr"
@@ -429,5 +431,32 @@ func TestIsValidRepoSlug(t *testing.T) {
 				t.Errorf("IsValidRepoSlug(%q) = %v, want %v", tc.slug, got, tc.want)
 			}
 		})
+	}
+}
+
+// TokenSource is resolved on every call, so a rotated token reaches the next
+// API call without restarting the agent; an explicit Token still wins, and a
+// resolution error means an unauthenticated call.
+func TestGitHubCodeHostTokenSourcePerCall(t *testing.T) {
+	var seen []string
+	fake := &fakeEnsurer{commitFunc: func(_ context.Context, _, _, _, token string) string {
+		seen = append(seen, token)
+		return "subject"
+	}}
+	current := "first"
+	var resolveErr error
+	g := &GitHubCodeHost{Ensurer: fake, TokenSource: func() (string, error) { return current, resolveErr }}
+
+	_, _ = g.HeadCommitSubject(context.Background(), "o/r", "b")
+	current = "rotated"
+	_, _ = g.HeadCommitSubject(context.Background(), "o/r", "b")
+	resolveErr = errors.New("no token")
+	_, _ = g.HeadCommitSubject(context.Background(), "o/r", "b")
+	g.Token = "pinned"
+	_, _ = g.HeadCommitSubject(context.Background(), "o/r", "b")
+
+	want := []string{"first", "rotated", "", "pinned"}
+	if !reflect.DeepEqual(seen, want) {
+		t.Errorf("tokens used = %q, want %q", seen, want)
 	}
 }

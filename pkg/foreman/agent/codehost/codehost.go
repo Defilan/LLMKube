@@ -115,6 +115,22 @@ type GitHubCodeHost struct {
 	// read). Empty means unauthenticated; PR creation needs a real token,
 	// so main wires it from the same source as the git auth.
 	Token string
+	// TokenSource, when Token is empty, resolves the token on every call, so
+	// a rotated credential is picked up without restarting the agent. A
+	// resolution error means an unauthenticated call, as an empty Token does.
+	TokenSource func() (string, error)
+}
+
+// token is the credential for one API call.
+func (g *GitHubCodeHost) token() string {
+	if g.Token != "" || g.TokenSource == nil {
+		return g.Token
+	}
+	t, err := g.TokenSource()
+	if err != nil {
+		return ""
+	}
+	return t
 }
 
 // NewGitHubCodeHost constructs a GitHubCodeHost from a githubpr.Ensurer.
@@ -147,7 +163,7 @@ func (g *GitHubCodeHost) EnsureChangeRequest(
 	if !ok {
 		return "", false, nil
 	}
-	res, err := g.Ensurer.EnsurePR(ctx, owner, name, headBranch, baseBranch, title, body, draft, g.Token)
+	res, err := g.Ensurer.EnsurePR(ctx, owner, name, headBranch, baseBranch, title, body, draft, g.token())
 	if err != nil {
 		return "", false, err
 	}
@@ -155,7 +171,7 @@ func (g *GitHubCodeHost) EnsureChangeRequest(
 	// its body so the description matches what the amended head branch now
 	// contains (#1567). A freshly created PR already carries this body.
 	if !res.Created {
-		if _, updErr := g.Ensurer.UpdatePR(ctx, owner, name, headBranch, body, g.Token); updErr != nil {
+		if _, updErr := g.Ensurer.UpdatePR(ctx, owner, name, headBranch, body, g.token()); updErr != nil {
 			return res.URL, false, updErr
 		}
 		return res.URL, false, nil
@@ -174,7 +190,7 @@ func (g *GitHubCodeHost) PullRequestUpdate(
 	if !ok {
 		return "", fmt.Errorf("PullRequestUpdate: repo slug %q is not a valid repo slug", repoSlug)
 	}
-	return g.Ensurer.UpdatePR(ctx, owner, name, head, body, g.Token)
+	return g.Ensurer.UpdatePR(ctx, owner, name, head, body, g.token())
 }
 
 // HeadCommitSubject returns the first line of the branch head's commit
@@ -185,5 +201,5 @@ func (g *GitHubCodeHost) HeadCommitSubject(ctx context.Context, repoSlug, headBr
 	if !ok {
 		return "", nil
 	}
-	return g.Ensurer.HeadCommitSubject(ctx, owner, name, headBranch, g.Token), nil
+	return g.Ensurer.HeadCommitSubject(ctx, owner, name, headBranch, g.token()), nil
 }

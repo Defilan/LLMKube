@@ -20,8 +20,10 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
+	"github.com/defilantech/llmkube/pkg/foreman/agent/oai"
 )
 
 func TestUpstreamURLForRepo(t *testing.T) {
@@ -92,7 +94,8 @@ func TestBuildDeterministicArgs_ThreadsUpstreamURL(t *testing.T) {
 					},
 				},
 			}
-			raw := buildDeterministicArgs(task, "foreman/issue-1259", "https://github.com/Defilan/LLMKube.git")
+			raw := buildDeterministicArgs(task, "foreman/issue-1259", "https://github.com/Defilan/LLMKube.git",
+				upstreamURLForRepo(task.Spec.Payload.Repo))
 			var m map[string]any
 			if err := json.Unmarshal(raw, &m); err != nil {
 				t.Fatalf("unmarshal args: %v", err)
@@ -133,7 +136,8 @@ func TestBuildDeterministicArgs_ThreadsBaseBranch(t *testing.T) {
 					},
 				},
 			}
-			raw := buildDeterministicArgs(task, "foreman/issue-813", "https://github.com/Defilan/LLMKube.git")
+			raw := buildDeterministicArgs(task, "foreman/issue-813", "https://github.com/Defilan/LLMKube.git",
+				upstreamURLForRepo(task.Spec.Payload.Repo))
 			var m map[string]any
 			if err := json.Unmarshal(raw, &m); err != nil {
 				t.Fatalf("unmarshal args: %v", err)
@@ -174,18 +178,12 @@ func (r *recordingCodeHost) HeadCommitSubject(context.Context, string, string) (
 // compiled, satisfied the interface, was injected, and still produced
 // https://github.com/<slug>.git.
 //
-// This exercises the same selection the executor performs, without standing up
-// a full Execute run: injected seam wins, package default otherwise.
+// It calls the executor's own resolver, which Execute and every later run
+// path use: injected seam wins, package default otherwise.
 func TestResolveUpstreamPrefersInjectedCodeHost(t *testing.T) {
 	ch := &recordingCodeHost{}
 	e := &NativeAgentLoopExecutor{CodeHost: ch}
-
-	resolve := func(slug string) string {
-		if e.CodeHost != nil {
-			return e.CodeHost.ResolveCloneURL(slug)
-		}
-		return upstreamURLForRepo(slug)
-	}
+	resolve := e.upstreamURL
 
 	got := resolve("group/sub/project")
 	if want := "https://forge.example.org/group/sub/project.git"; got != want {
@@ -199,5 +197,59 @@ func TestResolveUpstreamPrefersInjectedCodeHost(t *testing.T) {
 	e.CodeHost = nil
 	if got := resolve("owner/name"); got != "https://github.com/owner/name.git" {
 		t.Errorf("default path changed: %q", got)
+	}
+}
+
+// The paths after the clone (the envtest and scan gates, the self-commit and
+// claim-evidence base SHAs, the reviewer diff) resolve the upstream through
+// resolveUpstreamForRun, which read the package GitHub default and ignored the
+// injected CodeHost (#1298).
+func TestResolveUpstreamForRunUsesInjectedCodeHost(t *testing.T) {
+	ch := &recordingCodeHost{}
+	e := &NativeAgentLoopExecutor{CodeHost: ch}
+	task := &foremanv1alpha1.AgenticTask{Spec: foremanv1alpha1.AgenticTaskSpec{
+		Payload: foremanv1alpha1.AgenticTaskPayload{Repo: "group/sub/project"},
+	}}
+	if got, want := e.resolveUpstreamForRun(task), "https://forge.example.org/group/sub/project.git"; got != want {
+		t.Errorf("resolveUpstreamForRun = %q, want %q (injected CodeHost bypassed)", got, want)
+	}
+
+	e.UpstreamURLForRepo = func(string) string { return "https://override.example/x.git" }
+	if got := e.resolveUpstreamForRun(task); got != "https://override.example/x.git" {
+		t.Errorf("resolveUpstreamForRun = %q, want the test override to win", got)
+	}
+}
+
+// argsRegistry records the args of the one tool a deterministic run
+// dispatches.
+type argsRegistry struct{ args json.RawMessage }
+
+func (r *argsRegistry) Schemas() []oai.Tool { return nil }
+
+func (r *argsRegistry) Dispatch(_ context.Context, _ string, args json.RawMessage) (*ToolResult, error) {
+	r.args = args
+	return &ToolResult{Output: map[string]any{}}, nil
+}
+
+// A deterministic gate run hands the gate the upstream URL its bite check
+// fetches the base from. buildDeterministicArgs built it from the package
+// GitHub default, so a gate behind an injected CodeHost fetched from
+// github.com (#1298).
+func TestExecuteDeterministicPassesCodeHostUpstream(t *testing.T) {
+	reg := &argsRegistry{}
+	e := &NativeAgentLoopExecutor{CodeHost: &recordingCodeHost{}}
+	task := &foremanv1alpha1.AgenticTask{Spec: foremanv1alpha1.AgenticTaskSpec{
+		Kind:    foremanv1alpha1.AgenticTaskKindIssueFix,
+		Payload: foremanv1alpha1.AgenticTaskPayload{Repo: "group/sub/project", Issue: 1},
+	}}
+	ag := &foremanv1alpha1.Agent{Spec: foremanv1alpha1.AgentSpec{Tools: []string{"run_gate_job"}}}
+	e.executeDeterministic(context.Background(), task, ag, "foreman/issue-1", reg, "", time.Now())
+
+	var m map[string]any
+	if err := json.Unmarshal(reg.args, &m); err != nil {
+		t.Fatalf("dispatched args: %v (%s)", err, reg.args)
+	}
+	if got, want := m["upstreamURL"], "https://forge.example.org/group/sub/project.git"; got != want {
+		t.Errorf("args[upstreamURL] = %v, want %q from the injected CodeHost", got, want)
 	}
 }
