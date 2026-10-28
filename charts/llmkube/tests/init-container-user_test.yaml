@@ -23,6 +23,21 @@ tests:
           path: spec.template.spec.containers[0].args
           content: --init-container-user=101
 
+  # `helm upgrade --reuse-values` from 0.10.12 reuses the old chart's
+  # values, which have no initContainer.user. The flag must be left off (the
+  # operator then uses its default) rather than rendered as 0, which the
+  # operator refuses at startup.
+  - it: omits the flag when the value is unset
+    set:
+      controllerManager.initContainer.user: null
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --init-container-user=0
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --init-container-user=
+
   # A values file decodes numbers as float64; without the int64 cast an
   # OpenShift-range uid renders as 1.00068e+09 and the operator's flag parse
   # fails at startup.
