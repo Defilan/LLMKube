@@ -589,7 +589,7 @@ Contributions are welcome! Please see [CONTRIBUTING.md](https://github.com/defil
 
 ## License
 
-Copyright 2025.
+Copyright 2026.
 
 Licensed under the Apache License, Version 2.0.
 
