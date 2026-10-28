@@ -81,6 +81,21 @@ spec:
       kubernetes.io/hostname: edge-1
 ```
 
+### Labels and annotations on the proxy pods
+
+`spec.proxy.podLabels` and `spec.proxy.podAnnotations` are merged into the proxy pod template, as `spec.podLabels` and `spec.podAnnotations` are on an `InferenceService`. Use them to match label-based NetworkPolicies. A proxy that needs the API server (for ModelPool activation or `resolution: endpoint`) may need such a policy to reach it.
+
+```yaml
+spec:
+  proxy:
+    podLabels:
+      netpol.example.com/apiserver: allow
+    podAnnotations:
+      example.com/team: llm
+```
+
+The operator's own keys win on collision: the `app` and `inference.llmkube.dev/model-router` labels, the config-hash annotation, and the `prometheus.io` annotations when the operator emits them. The `Deployment` and `Service` selectors use only the operator's labels, so changing these fields rolls the pods but never changes a selector. A key you remove from the spec is removed from the pods. The operator records the keys it applied in the `inference.llmkube.dev/applied-pod-labels` and `inference.llmkube.dev/applied-pod-annotations` annotations on the `Deployment`. Keys other tools put on the pod template, such as `kubectl rollout restart`'s, are left alone.
+
 ### One proxy replica per node
 
 `spec.proxy.affinity` and `spec.proxy.topologySpreadConstraints` are passed through to the proxy pod, as on `InferenceService`. The proxy pods carry two stable labels to select on: `app: <router>-router-proxy` and `inference.llmkube.dev/model-router: <router>`.

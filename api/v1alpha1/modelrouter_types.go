@@ -828,6 +828,23 @@ type RouterProxySpec struct {
 	// placed.
 	// +optional
 	TopologySpreadConstraints []corev1.TopologySpreadConstraint `json:"topologySpreadConstraints,omitempty"`
+
+	// PodLabels are merged into the router-proxy pod's metadata.labels, for
+	// example so label-based NetworkPolicies select the proxy. The operator's
+	// own labels (app, inference.llmkube.dev/model-router) win on collision,
+	// and the Deployment and Service selectors use only those, so changing
+	// PodLabels rolls the pods without touching a selector. A label removed
+	// here is removed from the pods; labels other tools add are kept.
+	// +optional
+	PodLabels map[string]string `json:"podLabels,omitempty"`
+
+	// PodAnnotations are merged into the router-proxy pod's
+	// metadata.annotations. The operator's own annotations (the config hash,
+	// and the prometheus.io scrape annotations when the operator emits them)
+	// win on collision. An annotation removed here is removed from the pods;
+	// annotations other tools add are kept.
+	// +optional
+	PodAnnotations map[string]string `json:"podAnnotations,omitempty"`
 }
 
 // MCPServerSpec configures a Model Context Protocol endpoint on the
