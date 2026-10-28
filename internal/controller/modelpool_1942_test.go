@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -26,6 +27,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
@@ -89,7 +91,10 @@ var _ = Describe("ModelPool #1942", func() {
 		}
 	})
 
-	It("keeps a resident the router re-activates during a reclaim, and restarts its idle clock", func() {
+	// reactivateDuringReclaim builds the pool, makes B resident, runs the
+	// reclaim that drains it, and re-activates B the way the router does. It
+	// returns the idle clock the reclaim fired on.
+	reactivateDuringReclaim := func() metav1.Time {
 		for name, n := range map[string]int32{memberA: 0, memberB: 1} {
 			Expect(k8sClient.Create(ctx, &inferencev1alpha1.InferenceService{
 				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
@@ -149,6 +154,12 @@ var _ = Describe("ModelPool #1942", func() {
 		b.Spec.Replicas = ptr.To(int32(1))
 		Expect(k8sClient.Update(ctx, b)).To(Succeed())
 
+		return long
+	}
+
+	It("keeps a resident the router re-activates during a reclaim, and restarts its idle clock", func() {
+		long := reactivateDuringReclaim()
+
 		reconcileOnce()
 		Expect(replicasOf(member(memberB))).To(Equal(int32(1)),
 			"the reclaim must not scale the re-activated resident back down; the router would wait out swapBudget")
@@ -167,4 +178,59 @@ var _ = Describe("ModelPool #1942", func() {
 		Expect(replicasOf(member(memberB))).To(Equal(int32(1)))
 		Expect(pool().Status.PendingMember).NotTo(Equal(memberA))
 	})
+
+	// The status write at the end of the re-activation pass can fail after the
+	// owner's scale-up cleared B's mark. The retry must still keep B: it reads
+	// the pool's status, so the cancelled swap and the restarted idle clock must
+	// already be there.
+	DescribeTable("keeps the re-activated resident when a status write fails and the pass is retried",
+		func(statusWritesBeforeFailure int) {
+			long := reactivateDuringReclaim()
+
+			failing := r()
+			failing.Client = statusFailsAfterClient{Client: k8sClient, allowed: ptr.To(statusWritesBeforeFailure)}
+			_, err := failing.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: poolName, Namespace: "default"}})
+			Expect(err).To(HaveOccurred())
+
+			reconcileOnce()
+			Expect(replicasOf(member(memberB))).To(Equal(int32(1)),
+				"the retry must not drain the re-activated resident")
+			Expect(replicasOf(member(memberA))).To(Equal(int32(0)))
+			after := pool()
+			Expect(after.Status.PendingMember).NotTo(Equal(memberA))
+			if after.Status.ResidentIdleSince != nil {
+				Expect(after.Status.ResidentIdleSince.Time).To(BeTemporally(">", long.Time.Add(time.Minute)))
+			}
+		},
+		Entry("the first status write fails", 0),
+		Entry("the final status write fails", 1),
+	)
 })
+
+// statusFailsAfterClient lets the first *allowed ModelPool status patches
+// through and rejects the rest.
+type statusFailsAfterClient struct {
+	client.Client
+	allowed *int
+}
+
+func (c statusFailsAfterClient) Status() client.SubResourceWriter {
+	return statusFailsAfterWriter{SubResourceWriter: c.Client.Status(), allowed: c.allowed}
+}
+
+type statusFailsAfterWriter struct {
+	client.SubResourceWriter
+	allowed *int
+}
+
+func (w statusFailsAfterWriter) Patch(
+	ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption,
+) error {
+	if _, ok := obj.(*inferencev1alpha1.ModelPool); ok {
+		if *w.allowed == 0 {
+			return errors.New("etcdserver: request timed out")
+		}
+		*w.allowed--
+	}
+	return w.SubResourceWriter.Patch(ctx, obj, patch, opts...)
+}

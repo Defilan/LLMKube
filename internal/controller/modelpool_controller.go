@@ -237,7 +237,7 @@ func (r *ModelPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 				return ctrl.Result{}, err
 			}
 		}
-		if err := r.scaleOwner(ctx, members[owner], desired); err != nil {
+		if err := r.scaleOwner(ctx, statusBefore, members, owner, desired); err != nil {
 			return ctrl.Result{}, err
 		}
 		if !memberReady(members[owner]) {
@@ -550,17 +550,51 @@ func (r *ModelPoolReconciler) drainMember(ctx context.Context, isvc *inferencev1
 // drained mark, in the same patch, so the activation it answers is not read
 // as a fresh one again. Holding it at zero during a swap leaves the mark: the
 // hold is not a drain.
-func (r *ModelPoolReconciler) scaleOwner(ctx context.Context, isvc *inferencev1alpha1.InferenceService, desired int32) error {
+func (r *ModelPoolReconciler) scaleOwner(
+	ctx context.Context,
+	base *inferencev1alpha1.ModelPool,
+	members map[string]*inferencev1alpha1.InferenceService,
+	owner string,
+	desired int32,
+) error {
+	isvc := members[owner]
 	if desired == 0 {
 		return r.ensureReplicas(ctx, isvc, 0)
 	}
 	if replicasOf(isvc) == desired && !drainedByPool(isvc) {
 		return nil
 	}
+	if err := r.persistReactivation(ctx, base, isvc, owner); err != nil {
+		return err
+	}
 	patched := isvc.DeepCopy()
 	patched.Spec.Replicas = ptr.To(desired)
 	delete(patched.Annotations, annotationModelPoolDrained)
 	return r.Patch(ctx, patched, client.MergeFrom(isvc))
+}
+
+// persistReactivation writes a re-activated resident's cancellation of the
+// pending swap (pendingMember cleared, idle clock restarted) to status before
+// scaleOwner clears the drained mark. The mark is the only record of the
+// re-activation: if the status write at the end of the pass failed after the
+// mark was gone, the retry would read the old pendingMember and the old idle
+// clock and drain the resident again.
+func (r *ModelPoolReconciler) persistReactivation(
+	ctx context.Context, base *inferencev1alpha1.ModelPool, isvc *inferencev1alpha1.InferenceService, owner string,
+) error {
+	if owner != base.Status.ResidentMember || !drainedByPool(isvc) {
+		return nil
+	}
+	if base.Status.PendingMember == "" && base.Status.ResidentIdleSince == nil {
+		return nil
+	}
+	recorded := base.DeepCopy()
+	recorded.Status.PendingMember = ""
+	recorded.Status.ResidentIdleSince = nil
+	if err := r.Status().Patch(ctx, recorded, client.MergeFrom(base)); err != nil {
+		return fmt.Errorf("record re-activation of %q: %w", owner, err)
+	}
+	return nil
 }
 
 // memberNames returns the pool's member names in declaration order, giving the
