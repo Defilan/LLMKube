@@ -189,7 +189,7 @@ func writeSuiteConfig(reportWriter *ReportWriter, suite BenchmarkSuite, modelIDs
 	_ = reportWriter.writeSection("Test Suite Configuration", header.String())
 }
 
-func runSuite(opts *benchmarkOptions) error {
+func runSuite(ctx context.Context, opts *benchmarkOptions) error {
 	suites := AvailableSuites()
 	suite, ok := suites[opts.suite]
 	if !ok {
@@ -201,7 +201,6 @@ func runSuite(opts *benchmarkOptions) error {
 		return fmt.Errorf("unknown suite '%s'. Available: %s", opts.suite, strings.Join(validSuites, ", "))
 	}
 
-	ctx := context.Background()
 	startTime := time.Now()
 
 	modelIDs := strings.Split(opts.catalog, ",")
@@ -315,6 +314,8 @@ func deployCatalogForPhase(
 
 	testOpts := *opts
 	testOpts.name = modelID
+	// Each phase works on a copy, so the shared opts is never mutated: a key
+	// resolved for one model cannot leak into the next phase's endpoint.
 	endpoint, cleanup, err := getEndpoint(ctx, &testOpts)
 	if err != nil {
 		if opts.cleanup {

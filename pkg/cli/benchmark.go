@@ -40,6 +40,12 @@ type benchmarkOptions struct {
 	duration    time.Duration
 	promptFile  string
 
+	// API key sent as "Authorization: Bearer <key>". apiKey is resolved by
+	// applyExplicitAPIKey or applyAPIKeyFromInferenceService; never printed,
+	// logged, or written to a report.
+	apiKeyFile string
+	apiKey     string
+
 	catalog     string
 	gpu         bool
 	gpuCount    int32
@@ -388,6 +394,21 @@ SWEEP MODES:
 REPORTING:
   Generate markdown reports with --report or --report-dir for analysis and sharing.
 
+AUTHENTICATION:
+  A service whose InferenceService sets spec.endpoint.apiKeySecretRef is
+  benchmarked with that key: the CLI reads the Secret through your kubeconfig
+  and sends "Authorization: Bearer <key>". Override it with --api-key-file or
+  LLMKUBE_API_KEY, which win over the ref and are required when the key cannot
+  be read (an --api-key in spec.extraArgs, or a service outside Kubernetes).
+  An --endpoint run never reads the cluster, and --api-key-file and
+  LLMKUBE_API_KEY apply to it like to any other run: an exported variable is
+  sent to whatever URL you point --endpoint at, so scope it to the run.
+  The key is never printed. Reading the Secret needs "get secrets" in the
+  service's namespace.
+  Whitespace a header cannot carry is stripped: a Secret or a variable that
+  needed it says so, --api-key-file is trimmed at both ends silently, and a
+  variable holding only whitespace counts as unset, so the ref applies.
+
 Examples:
   # Basic benchmark (sequential requests)
   llmkube benchmark my-llm -n default
@@ -418,17 +439,29 @@ Examples:
 `,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			if err := applyExplicitAPIKey(opts); err != nil {
+				return err
+			}
+
 			// Suite mode (requires catalog)
 			if opts.suite != "" {
 				if opts.catalog == "" {
 					return fmt.Errorf("--suite requires --catalog to specify model(s) to test")
 				}
-				return runSuite(opts)
+				return runSuite(ctx, opts)
 			}
 
 			// Catalog mode
 			if opts.catalog != "" {
-				return runCatalogBenchmark(opts)
+				return runCatalogBenchmark(ctx, opts)
+			}
+
+			// An explicit endpoint needs no service name: there is nothing in
+			// the cluster to look up, so the run is a plain HTTP client.
+			if len(args) == 0 && opts.endpoint != "" {
+				opts.name = opts.endpoint
+				return dispatchBenchmarkMode(ctx, opts)
 			}
 
 			// Service name required for all other modes
@@ -437,21 +470,7 @@ Examples:
 			}
 			opts.name = args[0]
 
-			// Sweep modes (mutually exclusive)
-			if opts.concurrencySweep != "" {
-				return runConcurrencySweep(opts)
-			}
-			if opts.tokensSweep != "" {
-				return runTokensSweep(opts)
-			}
-			if opts.contextSweep != "" {
-				return runContextSweep(opts)
-			}
-			if opts.promptDepthSweep != "" {
-				return runPromptDepthSweep(opts)
-			}
-
-			return runBenchmark(opts)
+			return dispatchBenchmarkMode(ctx, opts)
 		},
 	}
 
@@ -463,7 +482,10 @@ Examples:
 	cmd.Flags().IntVar(&opts.maxTokens, "max-tokens", 50, "Maximum tokens to generate per request")
 	cmd.Flags().IntVarP(&opts.concurrent, "concurrent", "c", 1, "Number of concurrent requests for stress testing")
 	cmd.Flags().StringVarP(&opts.output, "output", "o", "table", "Output format: table, json, markdown")
-	cmd.Flags().StringVar(&opts.endpoint, "endpoint", "", "Override endpoint URL (default: auto-detect from service)")
+	cmd.Flags().StringVar(&opts.endpoint, "endpoint", "",
+		"Benchmark this URL instead of looking the service up (SERVICE_NAME may be omitted)")
+	cmd.Flags().StringVar(&opts.apiKeyFile, "api-key-file", "",
+		"File holding the endpoint API key (default: the InferenceService's endpoint.apiKeySecretRef)")
 	cmd.Flags().DurationVar(&opts.timeout, "timeout", 60*time.Second, "Request timeout")
 	cmd.Flags().BoolVar(&opts.portForward, "port-forward", true, "Automatically set up port forwarding")
 	cmd.Flags().DurationVar(&opts.duration, "duration", 0, "Run stress test for specified duration (e.g., 30m, 2h)")
@@ -515,6 +537,26 @@ Examples:
 	return cmd
 }
 
+// dispatchBenchmarkMode routes a named service (or an explicit endpoint) to one
+// of the single-deployment modes.
+func dispatchBenchmarkMode(ctx context.Context, opts *benchmarkOptions) error {
+	// Sweep modes (mutually exclusive)
+	if opts.concurrencySweep != "" {
+		return runConcurrencySweep(ctx, opts)
+	}
+	if opts.tokensSweep != "" {
+		return runTokensSweep(ctx, opts)
+	}
+	if opts.contextSweep != "" {
+		return runContextSweep(ctx, opts)
+	}
+	if opts.promptDepthSweep != "" {
+		return runPromptDepthSweep(ctx, opts)
+	}
+
+	return runBenchmark(ctx, opts)
+}
+
 func runWarmupRequests(ctx context.Context, endpoint string, opts *benchmarkOptions) {
 	fmt.Printf("🔥 Running %d warmup requests...\n", opts.warmup)
 	for i := 0; i < opts.warmup; i++ {
@@ -552,8 +594,7 @@ func runBenchmarkIterations(ctx context.Context, endpoint string, opts *benchmar
 	return results
 }
 
-func runBenchmark(opts *benchmarkOptions) error {
-	ctx := context.Background()
+func runBenchmark(ctx context.Context, opts *benchmarkOptions) error {
 	startTime := time.Now()
 
 	endpoint, cleanup, err := getEndpoint(ctx, opts)

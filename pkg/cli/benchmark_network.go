@@ -77,6 +77,12 @@ func getEndpoint(ctx context.Context, opts *benchmarkOptions) (string, func(), e
 		return "", nil, fmt.Errorf("InferenceService '%s' is not ready (phase: %s)", opts.name, isvc.Status.Phase)
 	}
 
+	// The key is resolved here, not in RunE, so an --endpoint run never touches
+	// the cluster and a not-Ready service still fails with its own error first.
+	if err := applyAPIKeyFromInferenceService(ctx, k8sClient, isvc, opts); err != nil {
+		return "", nil, err
+	}
+
 	// Check if this is a Metal deployment by looking up the referenced Model's accelerator
 	if isMetalDeployment(ctx, k8sClient, isvc) {
 		return getMetalEndpoint(isvc)

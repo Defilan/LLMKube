@@ -18,6 +18,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -702,7 +703,7 @@ func TestRunPromptDepthSweepWithMockServer(t *testing.T) {
 	r, w, _ := os.Pipe()
 	os.Stdout = w
 
-	err := runPromptDepthSweep(opts)
+	err := runPromptDepthSweep(context.Background(), opts)
 
 	_ = w.Close()
 	os.Stdout = old

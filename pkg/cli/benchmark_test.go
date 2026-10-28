@@ -238,6 +238,7 @@ func TestNewBenchmarkCommand(t *testing.T) {
 		"concurrent",
 		"output",
 		"endpoint",
+		"api-key-file",
 		"timeout",
 		"port-forward",
 	}
@@ -264,6 +265,7 @@ func TestBenchmarkCommandDefaults(t *testing.T) {
 		{"concurrent", "1"},
 		{"output", "table"},
 		{"endpoint", ""},
+		{"api-key-file", ""},
 		{"timeout", "1m0s"},
 		{"port-forward", "true"},
 	}
