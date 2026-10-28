@@ -336,6 +336,22 @@ func TestBenchmarkWhitespaceOnlyEnvFallsThroughToTheSecretRef(t *testing.T) {
 	}
 }
 
+// TestBenchmarkHelpStatesEndpointKeyScope pins the documented answer for an
+// --endpoint run with an exported key: the override applies to it, and the URL
+// receives what the variable holds.
+func TestBenchmarkHelpStatesEndpointKeyScope(t *testing.T) {
+	long := NewBenchmarkCommand().Long
+	for _, want := range []string{
+		"--api-key-file and",
+		"LLMKUBE_API_KEY apply to it like to any other run",
+		"sent to whatever URL you point --endpoint at",
+	} {
+		if !strings.Contains(long, want) {
+			t.Fatalf("benchmark help does not state %q:\n%s", want, long)
+		}
+	}
+}
+
 func TestBenchmarkAPIKeyFileBeatsEnvAndSecretRef(t *testing.T) {
 	c, ns := keyedNamespace(t)
 	srv, _ := keyedServer(t, "from-file")

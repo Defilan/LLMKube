@@ -129,9 +129,12 @@ llmkube benchmark qwen38 -n llm --report-dir ./reports
 
 Reading the Secret needs `get secrets` in the service's namespace. Pass
 `--api-key-file`, or set `LLMKUBE_API_KEY`, to benchmark a service whose key
-LLMKube cannot read (an `--api-key` in `spec.extraArgs`, a keyed service from
-another tool) or one you reach with `--endpoint`. The key is never printed and
-never written to the report.
+LLMKube cannot read, such as one that passes `--api-key` in `spec.extraArgs`, or
+a service that is not in the cluster at all. `--endpoint` runs take the same
+two sources and read nothing from the cluster, so an exported
+`LLMKUBE_API_KEY` is sent to whatever URL you point `--endpoint` at; prefer
+`--api-key-file` there, or scope the variable to the command. The key is never
+printed and never written to the report.
 
 How LLMKube wires the key:
 

@@ -400,8 +400,11 @@ AUTHENTICATION:
   and sends "Authorization: Bearer <key>". Override it with --api-key-file or
   LLMKUBE_API_KEY, which win over the ref and are required when the key cannot
   be read (an --api-key in spec.extraArgs, or a service outside Kubernetes).
-  An --endpoint run never reads the cluster. The key is never printed.
-  Reading the Secret needs "get secrets" in the service's namespace.
+  An --endpoint run never reads the cluster, and --api-key-file and
+  LLMKUBE_API_KEY apply to it like to any other run: an exported variable is
+  sent to whatever URL you point --endpoint at, so scope it to the run.
+  The key is never printed. Reading the Secret needs "get secrets" in the
+  service's namespace.
   Whitespace a header cannot carry is stripped: a Secret or a variable that
   needed it says so, --api-key-file is trimmed at both ends silently, and a
   variable holding only whitespace counts as unset, so the ref applies.
