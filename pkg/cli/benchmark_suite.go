@@ -189,7 +189,7 @@ func writeSuiteConfig(reportWriter *ReportWriter, suite BenchmarkSuite, modelIDs
 	_ = reportWriter.writeSection("Test Suite Configuration", header.String())
 }
 
-func runSuite(opts *benchmarkOptions) error {
+func runSuite(ctx context.Context, opts *benchmarkOptions) error {
 	suites := AvailableSuites()
 	suite, ok := suites[opts.suite]
 	if !ok {
@@ -201,7 +201,6 @@ func runSuite(opts *benchmarkOptions) error {
 		return fmt.Errorf("unknown suite '%s'. Available: %s", opts.suite, strings.Join(validSuites, ", "))
 	}
 
-	ctx := context.Background()
 	startTime := time.Now()
 
 	modelIDs := strings.Split(opts.catalog, ",")

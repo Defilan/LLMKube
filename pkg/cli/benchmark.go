@@ -402,10 +402,9 @@ AUTHENTICATION:
   be read (an --api-key in spec.extraArgs, or a service outside Kubernetes).
   An --endpoint run never reads the cluster. The key is never printed.
   Reading the Secret needs "get secrets" in the service's namespace.
-  Trailing whitespace a header cannot carry is stripped, and a Secret or a
-  variable that needed it says so; --api-key-file is read with it trimmed
-  silently, and a variable holding only whitespace counts as unset, so the ref
-  still applies.
+  Whitespace a header cannot carry is stripped: a Secret or a variable that
+  needed it says so, --api-key-file is trimmed at both ends silently, and a
+  variable holding only whitespace counts as unset, so the ref applies.
 
 Examples:
   # Basic benchmark (sequential requests)
@@ -447,12 +446,12 @@ Examples:
 				if opts.catalog == "" {
 					return fmt.Errorf("--suite requires --catalog to specify model(s) to test")
 				}
-				return runSuite(opts)
+				return runSuite(ctx, opts)
 			}
 
 			// Catalog mode
 			if opts.catalog != "" {
-				return runCatalogBenchmark(opts)
+				return runCatalogBenchmark(ctx, opts)
 			}
 
 			// An explicit endpoint needs no service name: there is nothing in

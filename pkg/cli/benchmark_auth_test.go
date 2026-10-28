@@ -536,8 +536,6 @@ func TestBenchmarkAPIKeySecretErrors(t *testing.T) {
 			want: "holds only whitespace",
 		},
 	}
-	// -o markdown rather than json, so the "no key in the output" probe covers
-	// the summary tables too.
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			name := fixtureName("keyed-" + tc.name)

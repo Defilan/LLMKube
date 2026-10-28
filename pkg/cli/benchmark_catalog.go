@@ -110,8 +110,7 @@ func outputFormattedReport(report ComparisonReport, opts *benchmarkOptions, repo
 	return nil
 }
 
-func runCatalogBenchmark(opts *benchmarkOptions) error {
-	ctx := context.Background()
+func runCatalogBenchmark(ctx context.Context, opts *benchmarkOptions) error {
 	if opts.contextSweep != "" {
 		return runContextSweep(ctx, opts)
 	}
