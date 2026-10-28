@@ -118,9 +118,16 @@ spec:
         - --allowed-remote-hosts={{ join "," . }}
         {{- end }}
         - --init-container-image={{ include "llmkube.initContainerImage" . }}
-        # int64: Helm decodes values-file numbers as float64, which would render
-        # an OpenShift-range uid such as 1000680000 as 1.00068e+09.
-        - --init-container-user={{ int64 .Values.controllerManager.initContainer.user }}
+        # Rendered only when set: `helm upgrade --reuse-values` from a release
+        # older than this value keeps the old chart's values, where it is
+        # missing, and a missing value cast to 0 makes the operator exit at
+        # startup. Unset, the operator uses its own default (101); the schema
+        # refuses an explicit 0. int64: Helm decodes values-file numbers as
+        # float64, which would render an OpenShift-range uid such as 1000680000
+        # as 1.00068e+09.
+        {{- with .Values.controllerManager.initContainer.user }}
+        - --init-container-user={{ int64 . }}
+        {{- end }}
         # The default value is set in values.yaml. We do NOT use `| default 102`
         # here because Go template's default treats 0 as missing, which would
         # re-replace the OpenShift preset's deliberate 0 with 102 and break
