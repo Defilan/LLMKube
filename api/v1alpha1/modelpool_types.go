@@ -129,7 +129,9 @@ type ModelPoolSpec struct {
 
 	// Members lists the InferenceServices that share the pool's GPU slot. Each
 	// member is an ordinary single-model InferenceService with its own image,
-	// context size, and runtime.
+	// context size, and runtime. The pool owns each member's spec.replicas:
+	// leave it out of GitOps manifests, or every sync that restores it is read
+	// as a request for that member (docs/operations/gpu-sharing.md, "GitOps").
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinItems=1
 	// +listType=atomic
