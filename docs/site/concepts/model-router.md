@@ -556,6 +556,32 @@ The proxy cancels the upstream request when its own request ends, so a
 `cancel task` line in llama.cpp's log usually pairs with a
 `client_cancelled` or `timeout` line here.
 
+To see who sent each request, opt in under `spec.policy.auditLog`:
+
+```yaml
+spec:
+  policy:
+    auditLog:
+      logClientAddress: true
+      trustedProxyCIDRs: ["10.0.0.0/8"]  # only behind an ingress or gateway
+      callerHeader: X-LLMKube-Client
+```
+
+- `logClientAddress` adds `client`, the sender's address.
+  - In-cluster callers keep their pod IP through the ClusterIP.
+  - The backend only ever sees the proxy's IP, so llama.cpp's own log can't tell you this.
+  - It's off by default because client addresses are personal data in some deployments.
+- `trustedProxyCIDRs` names the proxies in front of the router whose `X-Forwarded-For` is believed.
+  - When the TCP peer is one of them, `client` is the first address in `X-Forwarded-For`, read from the right, that is not a trusted proxy.
+  - Any client can send `X-Forwarded-For`, so without this list the header is ignored.
+  - Entries are CIDRs or single addresses, and the field requires `logClientAddress`.
+- `callerHeader` adds `caller`, the value of a header each client sets.
+  - The client chooses the value, so treat it as a label, not an identity.
+  - It's cut to 128 bytes, and characters outside printable ASCII become `?`.
+  - Headers that carry a credential (`Authorization`, `Proxy-Authorization`, `Cookie`, `X-Api-Key`, `Api-Key`, `X-Goog-Api-Key`) are refused.
+
+The proxy doesn't look up pod names: resolving an IP to a pod would need read access to every pod in the cluster. On Cilium, `hubble observe --to-pod <namespace>/<router>-router-proxy --port 8080` shows the calling pods.
+
 Per-request token/byte accounting and a proxy-emitted Prometheus
 histogram are planned for Phase 2 (issue [#433](https://github.com/defilantech/LLMKube/issues/433)).
 

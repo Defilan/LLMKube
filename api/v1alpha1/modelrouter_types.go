@@ -716,6 +716,37 @@ type AuditLogPolicy struct {
 	// every audit entry. Disabled by default for size and privacy.
 	// +optional
 	IncludeRequestBody bool `json:"includeRequestBody,omitempty"`
+
+	// LogClientAddress, when true, adds the address of the request's sender
+	// to every audit entry as client. It is the TCP peer: in-cluster callers
+	// keep their pod IP through the ClusterIP. When the peer is in
+	// TrustedProxyCIDRs, it is the first address in X-Forwarded-For, read
+	// from the right, that is not a trusted proxy. Off by default, because a
+	// client address is personal data in some deployments.
+	// +optional
+	LogClientAddress bool `json:"logClientAddress,omitempty"`
+
+	// TrustedProxyCIDRs lists the proxies in front of the router (an
+	// ingress, a gateway) whose X-Forwarded-For is believed, as CIDRs or
+	// single addresses. Any client can send X-Forwarded-For, so with this
+	// unset the header is ignored and client is always the TCP peer.
+	// Requires logClientAddress. The controller validates the entries.
+	// +kubebuilder:validation:MaxItems=32
+	// +kubebuilder:validation:items:MaxLength=50
+	// +optional
+	TrustedProxyCIDRs []string `json:"trustedProxyCIDRs,omitempty"`
+
+	// CallerHeader names a request header whose value is added to every
+	// audit entry as caller, for example X-LLMKube-Client set by each
+	// client. The client chooses the value, so it is a label rather than an
+	// identity. It is cut to 128 bytes, and characters outside printable
+	// ASCII are replaced with '?'. A header that carries a credential (Authorization,
+	// Proxy-Authorization, Cookie, X-Api-Key, Api-Key, X-Goog-Api-Key) is
+	// refused.
+	// +kubebuilder:validation:MaxLength=64
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9!#$%&'*+.^_|~-]+$`
+	// +optional
+	CallerHeader string `json:"callerHeader,omitempty"`
 }
 
 // RouterProxySpec overrides the managed router-proxy Deployment.

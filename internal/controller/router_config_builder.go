@@ -570,6 +570,9 @@ func translatePolicy(p *inferencev1alpha1.RouterPolicy) router.Policy {
 			Sink:               p.AuditLog.Sink,
 			FilePath:           p.AuditLog.FilePath,
 			IncludeRequestBody: p.AuditLog.IncludeRequestBody,
+			LogClientAddress:   p.AuditLog.LogClientAddress,
+			TrustedProxyCIDRs:  append([]string(nil), p.AuditLog.TrustedProxyCIDRs...),
+			CallerHeader:       p.AuditLog.CallerHeader,
 		}
 		if out.AuditLog.Sink == "" {
 			out.AuditLog.Sink = "stdout"

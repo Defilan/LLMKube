@@ -19,6 +19,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -39,8 +40,10 @@ type Proxy struct {
 	disp       *Dispatcher
 	logger     *slog.Logger
 	routerName string
-	activator  *Activator
-	budgets    *BudgetStore
+	// trustedProxies is policy.auditLog.trustedProxyCIDRs, parsed once.
+	trustedProxies []netip.Prefix
+	activator      *Activator
+	budgets        *BudgetStore
 	// hasUSDBudget is set when any configured budget carries a dollar cap.
 	// It gates the residual no_pricing counter for a request served by an
 	// unpriced backend, a config that bypassed validation.
@@ -97,6 +100,9 @@ func NewProxy(cfg *Config, logger *slog.Logger, opts ...ProxyOption) *Proxy {
 		routerName: "default",
 		budgets:    NewBudgetStore(compileBudgetRules(cfg.Policy.Budgets), time.Now),
 	}
+	// Config.Validate rejects an unparseable entry, so the error is not
+	// checked again here.
+	p.trustedProxies, _ = ParseTrustedProxies(cfg.Policy.AuditLog.TrustedProxyCIDRs)
 	for _, b := range cfg.Policy.Budgets {
 		if b.MaxUSD > 0 {
 			p.hasUSDBudget = true
@@ -244,6 +250,7 @@ func (p *Proxy) handleCompletion(upstreamPath string) http.HandlerFunc {
 			writeErrorFor(anthropic, w, http.StatusBadRequest, "request body: "+err.Error())
 			return
 		}
+		p.attributeRequest(&features, r)
 
 		decision := p.matcher.Match(&features)
 		if len(decision.Backends) == 0 {
@@ -463,6 +470,18 @@ func (p *Proxy) writeDispatchError(
 	}
 	writeErrorFor(anthropic, w, http.StatusBadGateway, "all backends failed: "+err.Error())
 	p.audit(*features, *decision, nil, http.StatusBadGateway, "all_backends_failed", elapsed, budgetAudit{}, "error", err.Error())
+}
+
+// attributeRequest records who sent r on its features for the audit line,
+// as far as policy.auditLog opts in (#2283).
+func (p *Proxy) attributeRequest(f *RequestFeatures, r *http.Request) {
+	a := p.cfg.Policy.AuditLog
+	if a.LogClientAddress {
+		f.ClientAddr = clientAddress(r, p.trustedProxies)
+	}
+	if a.CallerHeader != "" {
+		f.Caller = callerValue(r, a.CallerHeader)
+	}
 }
 
 // statusClientClosedRequest is nginx's 499, the status the audit line records
@@ -949,6 +968,12 @@ func (p *Proxy) audit(
 		"status", statusCode,
 		"outcome", outcome,
 		"latencyMs", elapsed.Milliseconds(),
+	}
+	if f.ClientAddr != "" {
+		attrs = append(attrs, "client", f.ClientAddr)
+	}
+	if f.Caller != "" {
+		attrs = append(attrs, "caller", f.Caller)
 	}
 	if dec.Rule != nil {
 		attrs = append(attrs, "rule", dec.Rule.Name)
