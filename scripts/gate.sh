@@ -27,7 +27,8 @@
 #   ENVTEST_BIN, BIN_DIR, ENVTEST_K8S_VERSION
 #                     setup-envtest binary, local bin dir and k8s version;
 #                     the Makefile passes these, standalone runs derive them
-#   GATE_REGEN_CMD, GATE_FMT_CMD, GATE_VET_CMD, GATE_LINT_CMD, GATE_TEST_CMD
+#   GATE_REGEN_CMD, GATE_FMT_CMD, GATE_COPYRIGHT_CMD, GATE_VET_CMD,
+#   GATE_LINT_CMD, GATE_TEST_CMD
 #                     step command overrides; scripts/gate_test.sh drives the
 #                     gate with stubs through them
 #
@@ -47,6 +48,7 @@ LINT_GOTOOLCHAIN="${LINT_GOTOOLCHAIN:-}"
 
 GATE_REGEN_CMD="${GATE_REGEN_CMD:-make manifests generate}"
 GATE_FMT_CMD="${GATE_FMT_CMD:-}"
+GATE_COPYRIGHT_CMD="${GATE_COPYRIGHT_CMD:-}"
 GATE_VET_CMD="${GATE_VET_CMD:-go vet ./...}"
 GATE_LINT_CMD="${GATE_LINT_CMD:-}"
 GATE_TEST_CMD="${GATE_TEST_CMD:-}"
@@ -103,6 +105,11 @@ step_regen() { eval "$GATE_REGEN_CMD"; }
 step_fmt() {
 	if [ -n "$GATE_FMT_CMD" ]; then eval "$GATE_FMT_CMD"; else fmt_check; fi
 }
+# The copyright step sits before vet because a stale header is fixed in one
+# edit, while the lint and test round it would otherwise precede costs minutes.
+step_copyright() {
+	if [ -n "$GATE_COPYRIGHT_CMD" ]; then eval "$GATE_COPYRIGHT_CMD"; else make check-copyright; fi
+}
 step_vet() { eval "$GATE_VET_CMD"; }
 step_lint() {
 	if [ -n "$GATE_LINT_CMD" ]; then eval "$GATE_LINT_CMD"; else lint_default; fi
@@ -155,6 +162,11 @@ else
 	rc_fmt=""
 fi
 if [ "$failed" -eq 0 ]; then
+	if run_logged copyright step_copyright; then rc_copyright=0; else rc_copyright=$?; failed=1; fi
+else
+	rc_copyright=""
+fi
+if [ "$failed" -eq 0 ]; then
 	if run_logged vet step_vet; then rc_vet=0; else rc_vet=$?; failed=1; fi
 else
 	rc_vet=""
@@ -192,6 +204,7 @@ summary_line() {
 summary_line regen "$rc_regen"
 summary_line drift "$rc_drift"
 summary_line fmt "$rc_fmt"
+summary_line copyright "$rc_copyright"
 summary_line vet "$rc_vet"
 summary_line lint "$rc_lint"
 summary_line test "$rc_test"

@@ -110,6 +110,10 @@ check-reviewer-prompts: ## Drift-check: fail if any reviewer Agent's systemPromp
 check-agents-md: ## Drift-check: fail if any make target, repo path, or Go version AGENTS.md references no longer resolves.
 	@go run ./cmd/check-agents-md --check
 
+.PHONY: check-copyright
+check-copyright: ## Fail when a branch adds a Go file whose copyright header is not the current year (#2298).
+	@go run ./cmd/check-copyright -base "$(BASE_REF)"
+
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
 	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
