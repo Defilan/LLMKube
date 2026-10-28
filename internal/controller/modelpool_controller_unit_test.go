@@ -119,6 +119,26 @@ func TestResolveSlotOwner(t *testing.T) {
 	}
 }
 
+// A resident the pool drained and the router scaled back up is a fresh
+// activation: it beats the pending swap away from it, where the same replica
+// count without the drained mark is steady state and the swap continues
+// (#1942).
+func TestResolveSlotOwnerReactivatedResident(t *testing.T) {
+	pool := mpoolFor("coder", "judge", "judge", "coder", "judge")
+	members := membersMap(map[string]int32{"coder": 1, "judge": 0})
+	if got := resolveSlotOwner(pool, members); got != "judge" {
+		t.Fatalf("unmarked resident: resolveSlotOwner = %q, want the pending judge", got)
+	}
+	members["coder"].Annotations = map[string]string{annotationModelPoolDrained: "true"}
+	if got := resolveSlotOwner(pool, members); got != "coder" {
+		t.Errorf("re-activated resident: resolveSlotOwner = %q, want coder", got)
+	}
+	members["coder"].Spec.Replicas = ptr.To(int32(0))
+	if got := resolveSlotOwner(pool, members); got != "judge" {
+		t.Errorf("drained resident still at zero: resolveSlotOwner = %q, want the pending judge", got)
+	}
+}
+
 func TestReplicasOf(t *testing.T) {
 	if got := replicasOf(&inferencev1alpha1.InferenceService{}); got != 1 {
 		t.Errorf("replicasOf(nil replicas) = %d, want 1 (apiserver default)", got)

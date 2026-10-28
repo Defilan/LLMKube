@@ -220,6 +220,15 @@ The reclaim reuses the ordinary drain contract: the idle resident is drained
 like any displaced incumbent, then the default loads. A busy resident is never
 reclaimed. Reclaims are counted in `llmkube_modelpool_reclaims_total`.
 
+A request for the resident can arrive after the reclaim has started draining it,
+before the default is up. The router then scales the resident back up, and that
+cancels the reclaim. The resident keeps the slot, and its idle clock starts over.
+
+To tell this re-activation apart from the resident simply staying up, the pool
+marks every member it scales to zero with the annotation
+`inference.llmkube.dev/modelpool-drained: "true"`, and removes the mark when it
+scales that member up as the owner.
+
 **`reclaimAfter` must be longer than the on-demand member's inter-burst gap.**
 This is the one way to misconfigure reclaim. If the grace is shorter than the gap
 between the on-demand model's requests, the pool reclaims the default the moment
