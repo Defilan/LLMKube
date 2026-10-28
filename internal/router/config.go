@@ -414,11 +414,15 @@ type ClassificationPolicy struct {
 }
 
 // AuditLogPolicy configures audit log emission. The proxy always emits
-// one structured log line per routing decision; this configures the sink.
+// one structured log line per routing decision; this configures the sink
+// and the opt-in client attribution on that line.
 type AuditLogPolicy struct {
-	Sink               string `json:"sink"`
-	FilePath           string `json:"filePath,omitempty"`
-	IncludeRequestBody bool   `json:"includeRequestBody,omitempty"`
+	Sink               string   `json:"sink"`
+	FilePath           string   `json:"filePath,omitempty"`
+	IncludeRequestBody bool     `json:"includeRequestBody,omitempty"`
+	LogClientAddress   bool     `json:"logClientAddress,omitempty"`
+	TrustedProxyCIDRs  []string `json:"trustedProxyCIDRs,omitempty"`
+	CallerHeader       string   `json:"callerHeader,omitempty"`
 }
 
 // LoadConfig reads and parses a router-proxy config from path. The proxy
@@ -502,7 +506,22 @@ func (c *Config) Validate() error {
 				i, r.Name, r.Route.PoolActivation, PoolActivationWait, PoolActivationIfIdle)
 		}
 	}
+	if err := c.Policy.AuditLog.validate(); err != nil {
+		return err
+	}
 	return c.validateBudgets(ruleNames)
+}
+
+// validate checks the client attribution settings. The controller rejects
+// the same values at admission; this guards a config written by hand.
+func (a AuditLogPolicy) validate() error {
+	if _, err := ParseTrustedProxies(a.TrustedProxyCIDRs); err != nil {
+		return fmt.Errorf("policy.auditLog.%w", err)
+	}
+	if IsCredentialHeader(a.CallerHeader) {
+		return fmt.Errorf("policy.auditLog.callerHeader %q carries a credential and must not be logged", a.CallerHeader)
+	}
+	return nil
 }
 
 // validateBalancing checks a backend's balancing and metrics-profile settings.

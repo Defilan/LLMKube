@@ -33,6 +33,12 @@ type RequestFeatures struct {
 	// Headers is the inbound HTTP header map (canonicalized lower-case
 	// keys for case-insensitive matching).
 	Headers map[string]string
+
+	// ClientAddr and Caller are for the audit line only, and set only when
+	// policy.auditLog asks for them: the resolved client address, and the
+	// configured caller header's sanitized value. Rules never match on them.
+	ClientAddr string
+	Caller     string
 }
 
 // MatchResult records the outcome of evaluating the rule set for one

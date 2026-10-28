@@ -748,6 +748,18 @@ spec:
                       AuditLog controls structured audit emission. Auditing is always on;
                       this field tunes the destination and verbosity.
                     properties:
+                      callerHeader:
+                        description: |-
+                          CallerHeader names a request header whose value is added to every
+                          audit entry as caller, for example X-LLMKube-Client set by each
+                          client. The client chooses the value, so it is a label rather than an
+                          identity. It is cut to 128 bytes, and characters outside printable
+                          ASCII are replaced with '?'. A header that carries a credential (Authorization,
+                          Proxy-Authorization, Cookie, X-Api-Key, Api-Key, X-Goog-Api-Key) is
+                          refused.
+                        maxLength: 64
+                        pattern: ^[A-Za-z0-9!#$%&'*+.^_|~-]+$
+                        type: string
                       filePath:
                         description: |-
                           FilePath is the destination when Sink=file. Must be writable inside
@@ -757,6 +769,15 @@ spec:
                         description: |-
                           IncludeRequestBody, when true, includes the OpenAI request body in
                           every audit entry. Disabled by default for size and privacy.
+                        type: boolean
+                      logClientAddress:
+                        description: |-
+                          LogClientAddress, when true, adds the address of the request's sender
+                          to every audit entry as client. It is the TCP peer: in-cluster callers
+                          keep their pod IP through the ClusterIP. When the peer is in
+                          TrustedProxyCIDRs, it is the first address in X-Forwarded-For, read
+                          from the right, that is not a trusted proxy. Off by default, because a
+                          client address is personal data in some deployments.
                         type: boolean
                       sink:
                         default: stdout
@@ -772,6 +793,18 @@ spec:
                         - file
                         - otlp
                         type: string
+                      trustedProxyCIDRs:
+                        description: |-
+                          TrustedProxyCIDRs lists the proxies in front of the router (an
+                          ingress, a gateway) whose X-Forwarded-For is believed, as CIDRs or
+                          single addresses. Any client can send X-Forwarded-For, so with this
+                          unset the header is ignored and client is always the TCP peer.
+                          Requires logClientAddress. The controller validates the entries.
+                        items:
+                          maxLength: 50
+                          type: string
+                        maxItems: 32
+                        type: array
                     type: object
                   auth:
                     description: |-

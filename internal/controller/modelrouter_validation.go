@@ -17,6 +17,7 @@ import (
 	"time"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
+	"github.com/defilantech/llmkube/internal/router"
 )
 
 // Sane bounds for rule and backend timeouts. The lower bound rejects
@@ -77,7 +78,39 @@ func validateModelRouter(mr *inferencev1alpha1.ModelRouter) []ModelRouterValidat
 	ruleNames, ruleErrs := validateRules(spec, nameSet, backendsByName)
 	errs = append(errs, ruleErrs...)
 	errs = append(errs, validateBudgets(spec, ruleNames)...)
+	errs = append(errs, validateAuditLog(spec)...)
 
+	return errs
+}
+
+// validateAuditLog checks the client attribution settings in
+// spec.policy.auditLog (#2283). The CIDRs are parsed here, not by a CEL
+// rule, because CEL's isCIDR() needs Kubernetes 1.31; the proxy's
+// Config.Validate repeats the checks for a config written by hand.
+func validateAuditLog(spec *inferencev1alpha1.ModelRouterSpec) []ModelRouterValidationError {
+	if spec.Policy == nil || spec.Policy.AuditLog == nil {
+		return nil
+	}
+	a := spec.Policy.AuditLog
+	var errs []ModelRouterValidationError
+	if _, err := router.ParseTrustedProxies(a.TrustedProxyCIDRs); err != nil {
+		errs = append(errs, ModelRouterValidationError{
+			Field:   "spec.policy.auditLog.trustedProxyCIDRs",
+			Message: err.Error(),
+		})
+	}
+	if len(a.TrustedProxyCIDRs) > 0 && !a.LogClientAddress {
+		errs = append(errs, ModelRouterValidationError{
+			Field:   "spec.policy.auditLog.trustedProxyCIDRs",
+			Message: "has no effect unless logClientAddress is true",
+		})
+	}
+	if router.IsCredentialHeader(a.CallerHeader) {
+		errs = append(errs, ModelRouterValidationError{
+			Field:   "spec.policy.auditLog.callerHeader",
+			Message: fmt.Sprintf("%q carries a credential; logging it would write the secret into every audit entry", a.CallerHeader),
+		})
+	}
 	return errs
 }
 
