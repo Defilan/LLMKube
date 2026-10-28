@@ -12,6 +12,7 @@ package router
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -1186,9 +1187,9 @@ func TestResolveDispatchTimeoutHandlesNilDecisionOrBackend(t *testing.T) {
 // TestProxyAppliesRuleTimeoutOnDispatch is the end-to-end version of
 // the resolve test: a rule with a sub-100ms timeout against a fake
 // backend that sleeps 200ms should surface as a context-deadline
-// error, with the proxy returning 502 (non-fail-closed) or 503
-// (fail-closed). We assert the upstream's call count remains 1
-// (the backend WAS reached but the proxy abandoned waiting).
+// error, with the proxy returning 504 and auditing outcome=timeout, not
+// the 502 of an outage (#2281). We assert the upstream's call count
+// remains 1 (the backend WAS reached but the proxy abandoned waiting).
 func TestProxyAppliesRuleTimeoutOnDispatch(t *testing.T) {
 	slow := newFakeBackend(t)
 	slow.srv.Close()
@@ -1215,7 +1216,8 @@ func TestProxyAppliesRuleTimeoutOnDispatch(t *testing.T) {
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("cfg: %v", err)
 	}
-	proxy := NewProxy(cfg, slog.Default())
+	var logs bytes.Buffer
+	proxy := NewProxy(cfg, slog.New(slog.NewTextHandler(&logs, nil)))
 	mux := http.NewServeMux()
 	proxy.Mount(mux)
 
@@ -1228,8 +1230,11 @@ func TestProxyAppliesRuleTimeoutOnDispatch(t *testing.T) {
 	mux.ServeHTTP(rec, req)
 	elapsed := time.Since(start)
 
-	if rec.Code != http.StatusBadGateway && rec.Code != http.StatusServiceUnavailable {
-		t.Errorf("status = %d, want 502 or 503 (deadline-exceeded)", rec.Code)
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Errorf("status = %d, want 504 (deadline-exceeded)", rec.Code)
+	}
+	if out := logs.String(); !strings.Contains(out, "outcome=timeout") {
+		t.Errorf("audit lacks outcome=timeout:\n%s", out)
 	}
 	// The proxy should give up well before the upstream's 200ms sleep
 	// completes. 100ms is generous headroom for test runner overhead.

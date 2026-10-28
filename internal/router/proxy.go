@@ -307,53 +307,7 @@ func (p *Proxy) handleCompletion(upstreamPath string) http.HandlerFunc {
 		chosen, resp, err := p.dispatchWithFallback(ctx, &decision, r.Header, body, upstreamPath)
 		elapsed := time.Since(start)
 		if err != nil {
-			// ModelPool cold-start hold exceeded its budget: the client's request
-			// outlived the swap window. 503 + Retry-After is the standards-correct
-			// "temporarily unavailable" signal so well-behaved clients back off
-			// deterministically; 429 would wrongly imply rate limiting.
-			// An abandoned swap is the same condition as an expired hold, so the
-			// status here does not depend on which of the two timers fires first.
-			if errors.Is(err, ErrHoldBudgetExceeded) || errors.Is(err, ErrSwapDeadlineExceeded) {
-				w.Header().Set("Retry-After", modelPoolRetryAfterSeconds)
-				writeErrorFor(anthropic, w, http.StatusServiceUnavailable,
-					"model pool activation did not complete within the request budget; retry")
-				p.audit(features, decision, nil, http.StatusServiceUnavailable,
-					"pool_activation_timeout", elapsed, budgetAudit{})
-				return
-			}
-			// Every backend in an IfIdle rule skipped because its ModelPool incumbent
-			// was busy: no preferred member is warm right now. This is the same
-			// transient, retryable class as the hold-budget timeout above (the
-			// incumbent will drain and a retry will serve), so give it the same 503 +
-			// Retry-After treatment and its own audit reason rather than a generic
-			// 502 that reads as an upstream outage.
-			if errors.Is(err, ErrIncumbentBusy) {
-				w.Header().Set("Retry-After", modelPoolRetryAfterSeconds)
-				writeErrorFor(anthropic, w, http.StatusServiceUnavailable,
-					"model pool incumbent busy; no preferred member is warm, retry")
-				p.audit(features, decision, nil, http.StatusServiceUnavailable,
-					"pool_incumbent_busy", elapsed, budgetAudit{})
-				return
-			}
-			// Runtime fail-closed: when every backend in a fail-closed
-			// rule's pool is unreachable, return 503 with a clear reason
-			// rather than 502. This is the runtime counterpart to the
-			// controller's static fail-closed validation: we refuse the
-			// request instead of letting it spill onto an unmatched
-			// backend (which dispatchWithFallback never does anyway, but
-			// the status code communicates intent — sensitive data did
-			// not egress because policy said so, not because of a generic
-			// upstream outage).
-			if decision.FailClosed {
-				writeErrorFor(anthropic, w, http.StatusServiceUnavailable,
-					"fail-closed: all rule backends unhealthy: "+err.Error())
-				p.audit(features, decision, nil, http.StatusServiceUnavailable,
-					"fail_closed_runtime", elapsed, budgetAudit{})
-				p.observeFailClosed(&features, &decision)
-				return
-			}
-			writeErrorFor(anthropic, w, http.StatusBadGateway, "all backends failed: "+err.Error())
-			p.audit(features, decision, nil, http.StatusBadGateway, "all_backends_failed", elapsed, budgetAudit{}, "error", err.Error())
+			p.writeDispatchError(w, r, anthropic, &features, &decision, err, elapsed)
 			return
 		}
 		defer func() { _ = resp.Body.Close() }()
@@ -368,8 +322,12 @@ func (p *Proxy) handleCompletion(upstreamPath string) http.HandlerFunc {
 		// keeps the tail, where an SSE usage chunk lives.
 		captured := captureForBudget(resp, scopeKeys)
 
-		streamed := streamResponse(w, resp, isStream)
-		outcome := streamedReason(streamed)
+		streamed, copyErr := streamResponse(w, resp, isStream)
+		outcome := responseOutcome(r.Context(), streamed, copyErr)
+		var auditErr []any
+		if copyErr != nil {
+			auditErr = []any{"error", copyErr.Error()}
+		}
 
 		// Charge the served request against every resolved budget scope. When
 		// the upstream reported no usage the request goes uncharged and the
@@ -396,7 +354,7 @@ func (p *Proxy) handleCompletion(upstreamPath string) http.HandlerFunc {
 			p.observeBudgets()
 		}
 
-		p.audit(features, decision, chosen, resp.StatusCode, outcome, elapsed, ba)
+		p.audit(features, decision, chosen, resp.StatusCode, outcome, elapsed, ba, auditErr...)
 		p.observeRequest(&features, &decision, chosen, outcome, elapsed)
 
 		// Record TTFT for streaming responses. We approximate first-byte
@@ -428,6 +386,89 @@ func (p *Proxy) handleCompletion(upstreamPath string) http.HandlerFunc {
 		}
 	}
 }
+
+// writeDispatchError answers and audits a request no backend served, mapping
+// the dispatch error to the status that names its cause.
+func (p *Proxy) writeDispatchError(
+	w http.ResponseWriter,
+	r *http.Request,
+	anthropic bool,
+	features *RequestFeatures,
+	decision *MatchResult,
+	err error,
+	elapsed time.Duration,
+) {
+	// The client went away before a backend answered: nothing can be
+	// written to it, and the failed attempt was its cancellation
+	// reaching the upstream, not a backend fault (#2281). net/http
+	// cancels the request context on a disconnect; a deadline on it
+	// is a server-side timeout and takes the paths below.
+	if errors.Is(r.Context().Err(), context.Canceled) {
+		p.audit(*features, *decision, nil, statusClientClosedRequest,
+			"client_cancelled", elapsed, budgetAudit{}, "error", err.Error())
+		return
+	}
+	// ModelPool cold-start hold exceeded its budget: the client's request
+	// outlived the swap window. 503 + Retry-After is the standards-correct
+	// "temporarily unavailable" signal so well-behaved clients back off
+	// deterministically; 429 would wrongly imply rate limiting.
+	// An abandoned swap is the same condition as an expired hold, so the
+	// status here does not depend on which of the two timers fires first.
+	if errors.Is(err, ErrHoldBudgetExceeded) || errors.Is(err, ErrSwapDeadlineExceeded) {
+		w.Header().Set("Retry-After", modelPoolRetryAfterSeconds)
+		writeErrorFor(anthropic, w, http.StatusServiceUnavailable,
+			"model pool activation did not complete within the request budget; retry")
+		p.audit(*features, *decision, nil, http.StatusServiceUnavailable,
+			"pool_activation_timeout", elapsed, budgetAudit{})
+		return
+	}
+	// Every backend in an IfIdle rule skipped because its ModelPool incumbent
+	// was busy: no preferred member is warm right now. This is the same
+	// transient, retryable class as the hold-budget timeout above (the
+	// incumbent will drain and a retry will serve), so give it the same 503 +
+	// Retry-After treatment and its own audit reason rather than a generic
+	// 502 that reads as an upstream outage.
+	if errors.Is(err, ErrIncumbentBusy) {
+		w.Header().Set("Retry-After", modelPoolRetryAfterSeconds)
+		writeErrorFor(anthropic, w, http.StatusServiceUnavailable,
+			"model pool incumbent busy; no preferred member is warm, retry")
+		p.audit(*features, *decision, nil, http.StatusServiceUnavailable,
+			"pool_incumbent_busy", elapsed, budgetAudit{})
+		return
+	}
+	// Runtime fail-closed: when every backend in a fail-closed
+	// rule's pool is unreachable, return 503 with a clear reason
+	// rather than 502. This is the runtime counterpart to the
+	// controller's static fail-closed validation: we refuse the
+	// request instead of letting it spill onto an unmatched
+	// backend (which dispatchWithFallback never does anyway, but
+	// the status code communicates intent — sensitive data did
+	// not egress because policy said so, not because of a generic
+	// upstream outage).
+	if decision.FailClosed {
+		writeErrorFor(anthropic, w, http.StatusServiceUnavailable,
+			"fail-closed: all rule backends unhealthy: "+err.Error())
+		p.audit(*features, *decision, nil, http.StatusServiceUnavailable,
+			"fail_closed_runtime", elapsed, budgetAudit{})
+		p.observeFailClosed(features, decision)
+		return
+	}
+	// The last attempt ran out its header deadline (the rule, backend
+	// or proxy timeout): the backend may be healthy but slow, which a
+	// 502 would misreport as an outage.
+	if errors.Is(err, context.DeadlineExceeded) {
+		writeErrorFor(anthropic, w, http.StatusGatewayTimeout, "backend timed out: "+err.Error())
+		p.audit(*features, *decision, nil, http.StatusGatewayTimeout, "timeout", elapsed, budgetAudit{}, "error", err.Error())
+		return
+	}
+	writeErrorFor(anthropic, w, http.StatusBadGateway, "all backends failed: "+err.Error())
+	p.audit(*features, *decision, nil, http.StatusBadGateway, "all_backends_failed", elapsed, budgetAudit{}, "error", err.Error())
+}
+
+// statusClientClosedRequest is nginx's 499, the status the audit line records
+// for a client that disconnected before any response was written. It is never
+// sent.
+const statusClientClosedRequest = 499
 
 const maxRequestBodyBytes = 32 << 20 // 32 MiB, generous for long prompts
 
@@ -654,6 +695,11 @@ func (p *Proxy) dispatchWithFallback(
 	allIncumbentBusy := true
 	tracer := otel.Tracer("model_router.dispatch")
 	for i, name := range dec.Backends {
+		// A client that went away cancels every remaining attempt: a fallback
+		// would only fail on the cancelled context.
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
 		b := p.matcher.BackendByName(name)
 		if b == nil {
 			lastErr = fmt.Errorf("backend %q not configured", name)
@@ -717,12 +763,13 @@ func (p *Proxy) dispatchWithFallback(
 			err = fmt.Errorf("%w: waiting for response headers from %s", context.DeadlineExceeded, name)
 		}
 		if err != nil {
-			if b.Pool != nil && p.activator != nil {
+			if b.Pool != nil && p.activator != nil && ctx.Err() == nil {
 				// A connection-level failure to a pooled backend almost always
 				// means its pod is gone (an out-of-band residency change the
 				// activator did not drive). Force the next Acquire to re-verify
 				// residency so the pool self-heals instead of serving stale 502s
-				// until the periodic resync or a proxy restart.
+				// until the periodic resync or a proxy restart. A client
+				// cancellation says nothing about the pod.
 				p.activator.InvalidateResident(b.Pool)
 			}
 			if poolRelease != nil {
@@ -820,8 +867,10 @@ func resolveSwapBudget(pool *BackendPool, proxyDefault time.Duration) time.Durat
 // streamResponse copies the upstream response to the client. Returns
 // true if we treated the response as a stream (set SSE-friendly headers
 // and flushed after every chunk). The decision is driven by the
-// request's "stream": true flag and the upstream Content-Type.
-func streamResponse(w http.ResponseWriter, resp *http.Response, requestedStream bool) bool {
+// request's "stream": true flag and the upstream Content-Type. The error
+// is the copy's, wrapped in errClientWrite when writing to the client
+// failed.
+func streamResponse(w http.ResponseWriter, resp *http.Response, requestedStream bool) (bool, error) {
 	upstreamCT := resp.Header.Get("Content-Type")
 	isSSE := strings.HasPrefix(upstreamCT, "text/event-stream")
 	isStream := requestedStream || isSSE
@@ -840,17 +889,44 @@ func streamResponse(w http.ResponseWriter, resp *http.Response, requestedStream 
 	}
 	w.WriteHeader(resp.StatusCode)
 
+	cw := &clientWriter{w: w}
 	if !isStream {
-		_, _ = io.Copy(w, resp.Body)
-		return false
+		_, err := io.Copy(cw, resp.Body)
+		return false, cw.wrap(err)
 	}
 
 	var flush func()
 	if f, ok := w.(http.Flusher); ok {
 		flush = f.Flush
 	}
-	_, _ = PipeBody(w, resp.Body, flush)
-	return true
+	_, err := PipeBody(cw, resp.Body, flush)
+	return true, cw.wrap(err)
+}
+
+// errClientWrite marks a response copy that failed writing to the client,
+// as opposed to reading the upstream body.
+var errClientWrite = errors.New("writing response to client")
+
+// clientWriter records whether a write to the client failed, so a copy error
+// can be attributed to the side that raised it.
+type clientWriter struct {
+	w      io.Writer
+	failed bool
+}
+
+func (c *clientWriter) Write(b []byte) (int, error) {
+	n, err := c.w.Write(b)
+	if err != nil {
+		c.failed = true
+	}
+	return n, err
+}
+
+func (c *clientWriter) wrap(err error) error {
+	if err != nil && c.failed {
+		return fmt.Errorf("%w: %w", errClientWrite, err)
+	}
+	return err
 }
 
 // audit emits one structured log line per request. Sink configuration
@@ -1012,9 +1088,23 @@ func writeError(w http.ResponseWriter, code int, msg string) {
 	_, _ = w.Write(body)
 }
 
-func streamedReason(streamed bool) string {
-	if streamed {
+// responseOutcome names how a response whose headers reached the client
+// ended. A client that leaves mid-response cancels the request context, and
+// the upstream read then fails on that context, so the context is checked
+// before the error's side. ErrStreamIdle is the idle guard aborting an
+// upstream that went silent; any other read error is the upstream breaking
+// off (#2281).
+func responseOutcome(ctx context.Context, streamed bool, copyErr error) string {
+	switch {
+	case copyErr == nil && streamed:
 		return "ok_stream"
+	case copyErr == nil:
+		return "ok"
+	case errors.Is(ctx.Err(), context.Canceled), errors.Is(copyErr, errClientWrite):
+		return "client_cancelled"
+	case errors.Is(copyErr, ErrStreamIdle):
+		return "timeout"
+	default:
+		return "upstream_error"
 	}
-	return "ok"
 }

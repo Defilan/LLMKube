@@ -1445,7 +1445,7 @@ spec:
 			}, 30*time.Second, time.Second).Should(Succeed())
 		})
 
-		It("should honor a tight rule.timeout and surface deadline as 502/503", func() {
+		It("should honor a tight rule.timeout and surface deadline as 504", func() {
 			// Regression test for #458. The rule's timeout overrides
 			// the proxy's default at dispatch time via context.WithTimeout.
 			// We stand up a slow stub (800ms response delay), point a
@@ -1529,8 +1529,10 @@ spec:
 				`{"model":"stub","stream":false,"messages":[{"role":"user","content":"hi"}]}`,
 				3*time.Minute)
 			Expect(err).NotTo(HaveOccurred(), "timeout router never answered")
-			Expect(status).To(SatisfyAny(Equal(502), Equal(503)),
-				"tight-timeout dispatch should surface 502 or 503; got %d", status)
+			// A missed header deadline is a gateway timeout, not the 502 of an
+			// outage (#2281).
+			Expect(status).To(Equal(504),
+				"tight-timeout dispatch should surface 504; got %d", status)
 
 			By("confirming the proxy audit log recorded the resolved timeoutMs")
 			Eventually(func(g Gomega) {
@@ -1545,6 +1547,7 @@ spec:
 				// dispatcher and was applied via context.WithTimeout.
 				g.Expect(out).To(ContainSubstring(`"rule":"tight-budget"`))
 				g.Expect(out).To(ContainSubstring(`"timeoutMs":200`))
+				g.Expect(out).To(ContainSubstring(`"outcome":"timeout"`))
 			}, 30*time.Second, time.Second).Should(Succeed())
 
 			By("immediately POSTing through the SAME backend with no header (lenient implicit rule) and expecting 200")
