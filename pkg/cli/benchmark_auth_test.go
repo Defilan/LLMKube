@@ -278,6 +278,40 @@ func TestBenchmarkSendsAPIKeyFromEnv(t *testing.T) {
 	}
 }
 
+// TestBenchmarkWhitespaceOnlyEnvFallsThroughToTheSecretRef: an exported but
+// empty shell variable (LLMKUBE_API_KEY=" ") is not a key, so the run must not
+// claim that source and must still use the service's Secret.
+func TestBenchmarkWhitespaceOnlyEnvFallsThroughToTheSecretRef(t *testing.T) {
+	c, ns := keyedNamespace(t)
+	srv, calls := keyedServer(t, benchAuthKey)
+	t.Setenv(apiKeyEnv, " \n ")
+
+	createSecret(t, c, ns, "upstream-key", map[string]string{"key": benchAuthKey})
+	createKeyedInferenceService(t, c, ns, "keyed-llm", srv.URL,
+		&corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "upstream-key"}, Key: "key"},
+		nil)
+
+	out, err := runBenchmarkCommand(t, "keyed-llm", "-n", ns,
+		"--port-forward=false", "--warmup", "0", "--iterations", "1", "-o", "json")
+	if err != nil {
+		t.Fatalf("benchmark failed: %v\n%s", err, out)
+	}
+	if got := summaryFromStdout(t, out).SuccessfulRuns; got != 1 {
+		t.Fatalf("successful_runs = %d, want 1: the ref should have applied", got)
+	}
+	if strings.Contains(out, "API key: from "+apiKeyEnv) {
+		t.Fatalf("the empty env var was reported as the key's source:\n%s", out)
+	}
+	if !strings.Contains(out, "API key: from Secret") {
+		t.Fatalf("the ref's key was not used:\n%s", out)
+	}
+	for _, auth := range calls.forPath("/v1/chat/completions") {
+		if auth != "Bearer "+benchAuthKey {
+			t.Fatalf("Authorization = %q, want the Secret's key", auth)
+		}
+	}
+}
+
 func TestBenchmarkAPIKeyFileBeatsEnvAndSecretRef(t *testing.T) {
 	c, ns := keyedNamespace(t)
 	srv, _ := keyedServer(t, "from-file")

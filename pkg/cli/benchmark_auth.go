@@ -57,12 +57,17 @@ func applyExplicitAPIKey(opts *benchmarkOptions) error {
 		return nil
 	}
 
+	// A variable of only whitespace carries no key, so it is treated as unset
+	// rather than reported as a source: an unset shell variable is a common
+	// way to reach here, and the ref should still apply.
 	if raw := os.Getenv(benchmarkAPIKeyEnv); raw != "" {
-		if raw != trimHeaderValue(raw) {
-			warnTrimmedKey(benchmarkAPIKeyEnv)
+		if key := trimHeaderValue(raw); key != "" {
+			if key != raw {
+				warnTrimmedKey(benchmarkAPIKeyEnv)
+			}
+			opts.apiKey = key
+			fmt.Printf("🔑 API key: from %s\n", benchmarkAPIKeyEnv)
 		}
-		opts.apiKey = trimHeaderValue(raw)
-		fmt.Printf("🔑 API key: from %s\n", benchmarkAPIKeyEnv)
 	}
 	return nil
 }
