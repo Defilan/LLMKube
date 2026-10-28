@@ -13,6 +13,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -75,6 +77,14 @@ func (r *ModelRouterReconciler) reconcileRouterDeployment(
 	// server, so dropping the no-surge rule goes back to the default.
 	existing.Spec.Strategy = desired.Spec.Strategy
 	existing.Spec.Template.Spec = desired.Spec.Template.Spec
+	// The merge keeps keys the desired template no longer sets, so first drop
+	// the spec.proxy podLabels / podAnnotations an earlier reconcile applied
+	// and the spec no longer asks for. Keys another tool added are not in the
+	// recorded set and pass through.
+	pruneUnwantedKeys(existing.Spec.Template.Labels,
+		existing.Annotations[routerProxyAppliedPodLabelsAnnotation], desired.Spec.Template.Labels)
+	pruneUnwantedKeys(existing.Spec.Template.Annotations,
+		existing.Annotations[routerProxyAppliedPodAnnotationsAnnotation], desired.Spec.Template.Annotations)
 	existing.Spec.Template.Labels = mergePreservingExternal(
 		existing.Spec.Template.Labels,
 		desired.Spec.Template.Labels,
@@ -89,16 +99,68 @@ func (r *ModelRouterReconciler) reconcileRouterDeployment(
 		// moved to routerPodMonitor must not be scraped twice. Only values
 		// the operator would set are removed.
 		for k, v := range routerProxyScrapeAnnotations() {
+			// A key spec.proxy.podAnnotations sets is the user's, not a leftover.
+			if _, wanted := desired.Spec.Template.Annotations[k]; wanted {
+				continue
+			}
 			if existing.Spec.Template.Annotations[k] == v {
 				delete(existing.Spec.Template.Annotations, k)
 			}
 		}
 	}
 	existing.Labels = mergePreservingExternal(existing.Labels, desired.Labels)
+	for _, k := range []string{routerProxyAppliedPodLabelsAnnotation, routerProxyAppliedPodAnnotationsAnnotation} {
+		if v, ok := desired.Annotations[k]; ok {
+			if existing.Annotations == nil {
+				existing.Annotations = map[string]string{}
+			}
+			existing.Annotations[k] = v
+		} else {
+			delete(existing.Annotations, k)
+		}
+	}
 	if err := setControllerReferenceUnblocked(mr, existing, r.Scheme); err != nil {
 		return fmt.Errorf("set owner ref on existing router Deployment: %w", err)
 	}
 	return r.Update(ctx, existing)
+}
+
+// routerProxyAppliedPodLabelsAnnotation and
+// routerProxyAppliedPodAnnotationsAnnotation record, on the Deployment, which
+// spec.proxy podLabels and podAnnotations keys the operator put on the pod
+// template, so a key later removed from the spec can be removed from the pods
+// without touching keys other tools added. They sit on the Deployment, not the
+// template, so recording them does not roll the pods.
+const (
+	routerProxyAppliedPodLabelsAnnotation      = "inference.llmkube.dev/applied-pod-labels"
+	routerProxyAppliedPodAnnotationsAnnotation = "inference.llmkube.dev/applied-pod-annotations"
+)
+
+// appliedKeys is the sorted, comma-separated list of the keys in user that
+// operator does not own, or "" when there are none. Label and annotation keys
+// cannot contain a comma.
+func appliedKeys(user, operator map[string]string) string {
+	keys := make([]string, 0, len(user))
+	for k := range user {
+		if _, owned := operator[k]; !owned {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, ",")
+}
+
+// pruneUnwantedKeys deletes from live every key in the recorded applied list
+// that desired no longer sets.
+func pruneUnwantedKeys(live map[string]string, applied string, desired map[string]string) {
+	if applied == "" {
+		return
+	}
+	for _, k := range strings.Split(applied, ",") {
+		if _, ok := desired[k]; !ok {
+			delete(live, k)
+		}
+	}
 }
 
 // routerProxyScrapeAnnotations are the annotations --emit-scrape-annotations
@@ -164,7 +226,13 @@ func (r *ModelRouterReconciler) newRouterDeployment(
 
 	envFrom := credentialsEnvFrom(mr)
 
-	podLabels := routerProxySelectorLabels(mr)
+	var userLabels, userAnnotations map[string]string
+	if mr.Spec.Proxy != nil {
+		userLabels = mr.Spec.Proxy.PodLabels
+		userAnnotations = mr.Spec.Proxy.PodAnnotations
+	}
+	selectorLabels := routerProxySelectorLabels(mr)
+	podLabels := mergePodLabels(selectorLabels, userLabels)
 	podAnnotations := map[string]string{
 		// Re-roll pods automatically when the ConfigMap content
 		// changes. controller-runtime's CreateOrUpdate doesn't trigger
@@ -175,6 +243,22 @@ func (r *ModelRouterReconciler) newRouterDeployment(
 		for k, v := range routerProxyScrapeAnnotations() {
 			podAnnotations[k] = v
 		}
+	}
+	var deploymentAnnotations map[string]string
+	if keys := appliedKeys(userLabels, selectorLabels); keys != "" {
+		deploymentAnnotations = map[string]string{routerProxyAppliedPodLabelsAnnotation: keys}
+	}
+	appliedAnnotations := appliedKeys(userAnnotations, podAnnotations)
+	for k, v := range userAnnotations {
+		if _, operatorOwned := podAnnotations[k]; !operatorOwned {
+			podAnnotations[k] = v
+		}
+	}
+	if appliedAnnotations != "" {
+		if deploymentAnnotations == nil {
+			deploymentAnnotations = map[string]string{}
+		}
+		deploymentAnnotations[routerProxyAppliedPodAnnotationsAnnotation] = appliedAnnotations
 	}
 
 	// Proxies that call the API (ModelPool activation, endpoint tracking) run
@@ -189,15 +273,16 @@ func (r *ModelRouterReconciler) newRouterDeployment(
 
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      routerProxyResourceName(mr.Name),
-			Namespace: mr.Namespace,
-			Labels:    routerProxyLabels(mr),
+			Name:        routerProxyResourceName(mr.Name),
+			Namespace:   mr.Namespace,
+			Labels:      routerProxyLabels(mr),
+			Annotations: deploymentAnnotations,
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas:             &replicas,
 			RevisionHistoryLimit: revisionHistoryLimitOrDefault(revisionHistoryLimit),
 			Strategy:             strategy,
-			Selector:             &metav1.LabelSelector{MatchLabels: podLabels},
+			Selector:             &metav1.LabelSelector{MatchLabels: selectorLabels},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels:      podLabels,

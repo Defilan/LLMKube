@@ -1927,6 +1927,27 @@ spec:
                       example a node-local registry) or to co-locate the proxy with its
                       backends. Passthrough to the Pod spec.
                     type: object
+                  podAnnotations:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      PodAnnotations are merged into the router-proxy pod's
+                      metadata.annotations. The operator's own annotations (the config hash,
+                      and the prometheus.io scrape annotations when the operator emits them)
+                      win on collision. An annotation removed here is removed from the pods;
+                      annotations other tools add are kept.
+                    type: object
+                  podLabels:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      PodLabels are merged into the router-proxy pod's metadata.labels, for
+                      example so label-based NetworkPolicies select the proxy. The operator's
+                      own labels (app, inference.llmkube.dev/model-router) win on collision,
+                      and the Deployment and Service selectors use only those, so changing
+                      PodLabels rolls the pods without touching a selector. A label removed
+                      here is removed from the pods; labels other tools add are kept.
+                    type: object
                   quarantineDuration:
                     description: |-
                       QuarantineDuration controls how long the proxy keeps a backend in
