@@ -17,6 +17,7 @@ limitations under the License.
 package metrics
 
 import (
+	"slices"
 	"testing"
 	"time"
 
@@ -42,11 +43,11 @@ func getHistogramMetric(t *testing.T, h *prometheus.HistogramVec, labels []strin
 }
 
 func TestMetricsRegistered(t *testing.T) {
-	if len(AllCollectors) == 0 {
-		t.Fatal("AllCollectors is empty")
+	if len(RouterCollectors) == 0 {
+		t.Fatal("RouterCollectors is empty")
 	}
-	for _, c := range AllCollectors {
-		err := ctrlmetrics.Registry.Register(c)
+	for _, c := range RouterCollectors {
+		err := RouterRegistry.Register(c)
 		if err == nil {
 			t.Errorf("collector %T was not registered by init()", c)
 			continue
@@ -55,6 +56,53 @@ func TestMetricsRegistered(t *testing.T) {
 			t.Errorf("collector %T: unexpected error: %v", c, err)
 		}
 	}
+}
+
+// Every binary that imports this package and serves controller-runtime's
+// registry would export what an import registered there (#2294). Each binary
+// registers its own list; cmd and cmd/foreman-operator test theirs.
+func TestImportRegistersNothingInControllerRuntime(t *testing.T) {
+	for _, c := range slices.Concat(ControllerCollectors, ForemanCollectors, RouterCollectors) {
+		if ctrlmetrics.Registry.Unregister(c) {
+			t.Errorf("collector %T was registered in controller-runtime's registry on import", c)
+		}
+	}
+}
+
+// RouterRegistry is what the router-proxy serves, and the proxy sets none of
+// the controller's collectors, so one there is exported at zero (#2294).
+// Compared by descriptor: a labelled collector with no series is absent from
+// a scrape but not from Describe.
+func TestRouterRegistryHoldsNoControllerCollector(t *testing.T) {
+	served := describedNames(t, RouterRegistry)
+	shared := describedNames(t, ModelPoolResident)
+	for name := range describedNames(t, slices.Concat(ControllerCollectors, ForemanCollectors)...) {
+		if served[name] && !shared[name] {
+			t.Errorf("RouterRegistry holds %s, which only an operator binary sets", name)
+		}
+	}
+}
+
+func describedNames(t *testing.T, collectors ...prometheus.Collector) map[string]bool {
+	t.Helper()
+
+	descs := make(chan *prometheus.Desc)
+	go func() {
+		defer close(descs)
+		for _, c := range collectors {
+			c.Describe(descs)
+		}
+	}()
+
+	names := map[string]bool{}
+	for desc := range descs {
+		m := descFQName.FindStringSubmatch(desc.String())
+		if m == nil {
+			t.Fatalf("no fqName in Desc %s", desc)
+		}
+		names[m[1]] = true
+	}
+	return names
 }
 
 func TestModelDownloadDuration(t *testing.T) {

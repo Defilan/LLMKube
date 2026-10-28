@@ -106,30 +106,14 @@ var (
 )
 
 // declaredNames returns the fqName of every collector this repo registers.
-// AllCollectors is the controller's set; the Metal agent binary registers 19
-// more into its own registry, and *prometheus.Registry is itself a Collector.
+// ControllerCollectors and ForemanCollectors are the operator binaries' sets;
+// the router-proxy and the Metal agent binary register theirs into their own
+// registries, and *prometheus.Registry is itself a Collector.
 func declaredNames(t *testing.T) map[string]bool {
 	t.Helper()
 
-	registered := append(slices.Clone(AllCollectors), agent.AgentRegistry)
-
-	descs := make(chan *prometheus.Desc)
-	go func() {
-		defer close(descs)
-		for _, collector := range registered {
-			collector.Describe(descs)
-		}
-	}()
-
-	names := map[string]bool{}
-	for desc := range descs {
-		m := descFQName.FindStringSubmatch(desc.String())
-		if m == nil {
-			t.Fatalf("no fqName in Desc %s", desc)
-		}
-		names[m[1]] = true
-	}
-	return names
+	return describedNames(t, slices.Concat(ControllerCollectors, ForemanCollectors,
+		[]prometheus.Collector{RouterRegistry, agent.AgentRegistry})...)
 }
 
 // readPrometheusRuleTpl is the raw, un-rendered chart source both
