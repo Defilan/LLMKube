@@ -64,10 +64,10 @@ func TestRouterDeploymentPodLabelsAndAnnotations(t *testing.T) {
 		t.Errorf("config hash = %q, want the operator's value", annotations[routerProxyConfigHashAnnotation])
 	}
 	// The record lists only the keys the user's value landed on.
-	if got := dep.Annotations[routerProxyAppliedPodLabelsAnnotation]; got != "netpol.example.com/apiserver" {
+	if got := dep.Annotations[appliedPodLabelsAnnotation]; got != "netpol.example.com/apiserver" {
 		t.Errorf("applied labels record = %q, want netpol.example.com/apiserver", got)
 	}
-	if got := dep.Annotations[routerProxyAppliedPodAnnotationsAnnotation]; got != "example.com/team" {
+	if got := dep.Annotations[appliedPodAnnotationsAnnotation]; got != "example.com/team" {
 		t.Errorf("applied annotations record = %q, want example.com/team", got)
 	}
 }
@@ -126,10 +126,10 @@ func TestReconcileRouterDeploymentPodMetadataLifecycle(t *testing.T) {
 		dep.Spec.Template.Annotations["kubectl.kubernetes.io/restartedAt"] != "now" {
 		t.Errorf("another tool's keys were dropped: %v / %v", dep.Spec.Template.Labels, dep.Spec.Template.Annotations)
 	}
-	if got := dep.Annotations[routerProxyAppliedPodLabelsAnnotation]; got != "a" {
+	if got := dep.Annotations[appliedPodLabelsAnnotation]; got != "a" {
 		t.Errorf("applied labels record = %q, want a", got)
 	}
-	if _, ok := dep.Annotations[routerProxyAppliedPodAnnotationsAnnotation]; ok {
+	if _, ok := dep.Annotations[appliedPodAnnotationsAnnotation]; ok {
 		t.Errorf("applied annotations record kept after the last annotation was removed: %v", dep.Annotations)
 	}
 
@@ -137,7 +137,7 @@ func TestReconcileRouterDeploymentPodMetadataLifecycle(t *testing.T) {
 	if _, ok := dep.Spec.Template.Labels["a"]; ok {
 		t.Errorf("label a still on the template after podLabels was removed: %v", dep.Spec.Template.Labels)
 	}
-	if _, ok := dep.Annotations[routerProxyAppliedPodLabelsAnnotation]; ok {
+	if _, ok := dep.Annotations[appliedPodLabelsAnnotation]; ok {
 		t.Errorf("applied labels record kept after podLabels was removed: %v", dep.Annotations)
 	}
 	if dep.Spec.Template.Labels["gitops.example.com/sync"] != "yes" {
