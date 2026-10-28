@@ -151,6 +151,7 @@ func (r *ModelPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// (the idle resident is drained like any displaced incumbent). reclaimRequeue
 	// keeps the reconciler polling idle state, which no InferenceService or Pod
 	// event would otherwise surface.
+	restartIdleClockOnReactivation(pool, members, owner)
 	owner, reclaimRequeue := r.applyReclaimOwner(ctx, pool, members, owner)
 
 	// Drain every non-owner. A non-owner that reports Ready could still be
@@ -205,7 +206,7 @@ func (r *ModelPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 				continue
 			}
 		}
-		if err := r.ensureReplicas(ctx, isvc, 0); err != nil {
+		if err := r.drainMember(ctx, isvc); err != nil {
 			return ctrl.Result{}, err
 		}
 		if len(pods) > 0 {
@@ -236,7 +237,7 @@ func (r *ModelPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 				return ctrl.Result{}, err
 			}
 		}
-		if err := r.ensureReplicas(ctx, members[owner], desired); err != nil {
+		if err := r.scaleOwner(ctx, members[owner], desired); err != nil {
 			return ctrl.Result{}, err
 		}
 		if !memberReady(members[owner]) {
@@ -312,10 +313,13 @@ func resolveSlotOwner(pool *inferencev1alpha1.ModelPool, members map[string]*inf
 		}
 	}
 	// newly = scaled-up members other than the current resident: a fresh proxy
-	// activation that wants the slot.
+	// activation that wants the slot. The resident counts too once this
+	// reconciler has drained it and something scaled it back up: at replicas 1
+	// it otherwise looks like steady state, and a pending swap away from it
+	// (a reclaim) would strand the request that re-activated it (#1942).
 	var newly []string
 	for _, name := range requested {
-		if name != resident {
+		if name != resident || drainedByPool(members[name]) {
 			newly = append(newly, name)
 		}
 	}
@@ -503,6 +507,59 @@ func (r *ModelPoolReconciler) ensureReplicas(ctx context.Context, isvc *inferenc
 	}
 	patched := isvc.DeepCopy()
 	patched.Spec.Replicas = ptr.To(desired)
+	return r.Patch(ctx, patched, client.MergeFrom(isvc))
+}
+
+// annotationModelPoolDrained marks a member this reconciler scaled to zero to
+// release the slot. Replicas alone cannot tell the resident's steady state from
+// a re-activation of it after a drain: both read replicas 1. The mark is set in
+// the same patch as the scale-down and cleared in the same patch as the
+// owner's scale-up, so a marked member at replicas 1 was scaled up by someone
+// else, the router's activation, since the drain (#1942).
+const annotationModelPoolDrained = "inference.llmkube.dev/modelpool-drained"
+
+func drainedByPool(isvc *inferencev1alpha1.InferenceService) bool {
+	return isvc != nil && isvc.Annotations[annotationModelPoolDrained] == "true"
+}
+
+// restartIdleClockOnReactivation clears the reclaim idle clock when the owner
+// is a resident re-activated after the pool drained it. It is serving a fresh
+// request, so the idle time that led to the drain no longer counts; left
+// running, the clock would reclaim the slot again on the same pass (#1942).
+func restartIdleClockOnReactivation(pool *inferencev1alpha1.ModelPool, members map[string]*inferencev1alpha1.InferenceService, owner string) {
+	if res := pool.Status.ResidentMember; owner != "" && owner == res && drainedByPool(members[res]) {
+		pool.Status.ResidentIdleSince = nil
+	}
+}
+
+// drainMember scales a displaced member to zero and marks it drained.
+func (r *ModelPoolReconciler) drainMember(ctx context.Context, isvc *inferencev1alpha1.InferenceService) error {
+	if replicasOf(isvc) == 0 && drainedByPool(isvc) {
+		return nil
+	}
+	patched := isvc.DeepCopy()
+	patched.Spec.Replicas = ptr.To(int32(0))
+	if patched.Annotations == nil {
+		patched.Annotations = map[string]string{}
+	}
+	patched.Annotations[annotationModelPoolDrained] = "true"
+	return r.Patch(ctx, patched, client.MergeFrom(isvc))
+}
+
+// scaleOwner sets the slot owner's replicas. Scaling it up also clears its
+// drained mark, in the same patch, so the activation it answers is not read
+// as a fresh one again. Holding it at zero during a swap leaves the mark: the
+// hold is not a drain.
+func (r *ModelPoolReconciler) scaleOwner(ctx context.Context, isvc *inferencev1alpha1.InferenceService, desired int32) error {
+	if desired == 0 {
+		return r.ensureReplicas(ctx, isvc, 0)
+	}
+	if replicasOf(isvc) == desired && !drainedByPool(isvc) {
+		return nil
+	}
+	patched := isvc.DeepCopy()
+	patched.Spec.Replicas = ptr.To(desired)
+	delete(patched.Annotations, annotationModelPoolDrained)
 	return r.Patch(ctx, patched, client.MergeFrom(isvc))
 }
 
