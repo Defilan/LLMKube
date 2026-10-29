@@ -39,6 +39,10 @@ jobs:
     needs: release-please
     if: ${{ always() && (needs.release-please.outputs.release_created == 'true' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
+    # The macOS signing and notary secrets live in the "release" environment,
+    # which only main can deploy to, so a workflow run from any other branch
+    # reads them as empty (docs/contributing/macos-signing.md).
+    environment: release
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -350,6 +354,7 @@ jobs:
     needs: [release-please, goreleaser]
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
     runs-on: ubuntu-latest
+    environment: release
     timeout-minutes: 75
     permissions:
       contents: read

@@ -2,8 +2,8 @@
 
 The release signs every darwin binary it builds, and notarizes them when the
 App Store Connect key is configured (#2084). This page is for maintainers: what
-the pipeline does, the five repository secrets it reads, and how to create
-them.
+the pipeline does, the five secrets it reads from the `release` environment,
+and how to create them.
 
 ## What the release does
 
@@ -61,14 +61,30 @@ binary whose signature does not verify, so the binary is re-signed either way.
 
 ## The secrets
 
-Store them as repository secrets on `defilantech/LLMKube` (Settings, Secrets
-and variables, Actions, Repository secrets). Do not put them in an environment:
-the `goreleaser` and `notarize-macos` jobs have no `environment:` key, so
-environment secrets would read as empty and the release would quietly fall back
-to ad-hoc signing. Moving them into a protected environment later means adding
-`environment: <name>` to both jobs in the same change. The `.p12` and its
-password reach only the GoReleaser step; the three notary values reach only the
-settings check before it and the `notarize-macos` job.
+Store them as secrets of the `release` environment on `defilantech/LLMKube`
+(Settings, Environments, release), never as repository secrets. A repository
+secret is readable by a workflow run on any branch, so anyone who can push a
+branch, or a leaked token that can, could have a workflow read the signing
+certificate. The environment allows deployments from `main` only, so a run
+from any other branch gets empty values. The `goreleaser` and `notarize-macos`
+jobs name it with `environment: release`; a job without that key reads
+environment secrets as empty. The `.p12` and its password reach only the
+GoReleaser step; the three notary values reach only the settings check before
+it and the `notarize-macos` job.
+
+Create the environment once, limited to `main`:
+
+```bash
+gh api -X PUT repos/defilantech/LLMKube/environments/release \
+  -F 'deployment_branch_policy[protected_branches]=false' \
+  -F 'deployment_branch_policy[custom_branch_policies]=true'
+gh api -X POST repos/defilantech/LLMKube/environments/release/deployment-branch-policies \
+  -f name=main -f type=branch
+```
+
+Because the `goreleaser` job uses the environment, a manual `workflow_dispatch`
+dry run has to be started from `main`; GitHub refuses the job on any other
+branch. A dry run signs nothing either way.
 
 Once all five are stored (after the local dry run below), set the repository
 variable `MACOS_SIGNING_REQUIRED` to `true` (Settings, Secrets and
@@ -90,11 +106,18 @@ without the variable keep the ad-hoc fallback.
 
 1. Create a Developer ID Application certificate in Certificates,
    Identifiers & Profiles (Apple reserves this for the account holder unless
-   the account grants admins access). Consider a separate certificate for CI,
-   so revoking it does not affect local signing.
+   the account grants admins access). Choose **G2 Sub-CA**, not "Previous
+   Sub-CA": a certificate under the previous intermediate expires with it on
+   2027-02-01 22:12:15 UTC, however recently it was issued. Use a separate
+   certificate for CI, so revoking it does not affect local signing. Check the
+   expiry after installing it
+   (`security find-certificate -c "Developer ID Application" -p | openssl x509 -noout -issuer -enddate`);
+   the G2 certificate issued 2026-10-29 expires 2027-11-28.
 2. In Keychain Access, find "Developer ID Application: <team>" under My
    Certificates, expand it to confirm the private key is there, and export
-   both as a `.p12` with a strong password.
+   both as a `.p12` with a strong password. Keychain Access writes it with
+   `pbeWithSHA1And40BitRC2-CBC`, which rcodesign reads; OpenSSL 3 opens it only
+   with `-legacy`.
 3. Keep `developer-id.p12` until the dry run below passes.
 
 ### App Store Connect API key
@@ -152,7 +175,7 @@ seem to be an app".
 ### rcodesign rejects the .p12
 
 rcodesign 0.29.0 cannot read a `.p12` encrypted with PBES2/AES-256, the default
-of OpenSSL 3 (and possibly of your Keychain Access export), and reports it as
+of OpenSSL 3, and reports it as
 `Error: incorrect password given when decrypting PFX data` even when the
 password is right; the hook then prints a hint pointing here. Check the format
 with `openssl pkcs12 -in developer-id.p12 -info -noout` (Homebrew `openssl@3`;
@@ -180,20 +203,25 @@ the new password.
 
 ### Store the secrets
 
-When the dry run passes, store the values and delete the files:
+When the dry run passes, store the values:
 
 ```bash
-base64 -i developer-id.p12 | gh secret set MACOS_SIGN_P12 --repo defilantech/LLMKube
-gh secret set MACOS_SIGN_PASSWORD --repo defilantech/LLMKube   # prompts for the value
-base64 -i AuthKey_<KEYID>.p8 | gh secret set MACOS_NOTARY_KEY --repo defilantech/LLMKube
-gh secret set MACOS_NOTARY_KEY_ID --repo defilantech/LLMKube --body <KEYID>
-gh secret set MACOS_NOTARY_ISSUER_ID --repo defilantech/LLMKube --body <issuer-id>
-gh variable set MACOS_SIGNING_REQUIRED --repo defilantech/LLMKube --body true
-rm developer-id.p12 developer-id-legacy.p12 AuthKey_<KEYID>.p8
+base64 -i developer-id.p12 | tr -d '\n' | gh secret set MACOS_SIGN_P12 --env release --repo defilantech/LLMKube
+gh secret set MACOS_SIGN_PASSWORD --env release --repo defilantech/LLMKube   # prompts for the value
+base64 -i AuthKey_<KEYID>.p8 | tr -d '\n' | gh secret set MACOS_NOTARY_KEY --env release --repo defilantech/LLMKube
+gh secret set MACOS_NOTARY_KEY_ID --env release --repo defilantech/LLMKube --body <KEYID>
+gh secret set MACOS_NOTARY_ISSUER_ID --env release --repo defilantech/LLMKube --body <issuer-id>
+gh secret list --env release --repo defilantech/LLMKube   # all five
 ```
 
 Use the `.p12` file that passed the dry run (the `-legacy` one if you
-re-encoded it).
+re-encoded it). GitHub secrets cannot be read back, so keep the `.p12`, its
+password and the `.p8` in a password manager before deleting the local files;
+Apple offers the `.p8` download only once.
+
+Set `MACOS_SIGNING_REQUIRED` only after the change that gives both jobs
+`environment: release` is on `main`; before it, the jobs read the environment
+secrets as empty and the release would fail.
 
 The hook and the notarize step decode the secrets into a private temporary
 directory, pass them to rcodesign as files, never print them, and remove the
@@ -242,5 +270,7 @@ codesign -dv --verbose=4 llmkube-metal-agent            # Identifier=dev.llmkube
   `deployment/macos/` by pattern: a new file there needs a matching pattern.
 - To update rcodesign, change the version and the SHA-256 of the
   `x86_64-unknown-linux-musl` tarball in `hack/install-rcodesign.sh`.
-- A Developer ID certificate is valid for five years. After renewing it,
-  export and store the new `.p12` the same way.
+- Renew the Developer ID certificate before its expiry (see the certificate
+  steps above for how to read it), then run the dry run with the new `.p12`
+  and store it the same way. Signatures made before it expires stay valid:
+  the hook adds a secure timestamp.
