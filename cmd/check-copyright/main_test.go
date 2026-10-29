@@ -390,6 +390,12 @@ func TestRunZeroYearUsesTemplate(t *testing.T) {
 		t.Fatalf("a file copied from the template must pass whatever the year: got %d: %s%s",
 			code, stdout.String(), errOut.String())
 	}
+	// The pass line reports the year it required, so a reader can tell which
+	// year the template asks for without opening the template.
+	wantLine := fmt.Sprintf("Copyright %d.", time.Now().Year()+1)
+	if !strings.Contains(stdout.String(), wantLine) {
+		t.Errorf("the pass line must name the required year %q:\n%s", wantLine, stdout.String())
+	}
 }
 
 // TestRunZeroYearRejectsClockYear is the rollover case in the other direction:
@@ -428,7 +434,7 @@ func TestRunMissingTemplate(t *testing.T) {
 	}
 }
 
-func TestCopyrightYearIgnoresBody(t *testing.T) {
+func TestInspectHeaderIgnoresBody(t *testing.T) {
 	cases := []struct {
 		name string
 		src  string

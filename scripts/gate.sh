@@ -6,10 +6,9 @@
 # checks that every Go file the branch adds carries the copyright year
 # hack/boilerplate.go.txt does, runs go vet, and only then runs lint-all and
 # the full test suite in parallel: nothing after vet regenerates, so lint and
-# tests cannot race the
-# generators. Every step logs to a file under GATE_DIR and the gate exits
-# nonzero if any step failed, so a failing lint is not masked by passing
-# tests or the reverse.
+# tests cannot race the generators. Every step logs to a file under GATE_DIR
+# and the gate exits nonzero if any step failed, so a failing lint is not
+# masked by passing tests or the reverse.
 #
 # The suites run with a pinned GINKGO_SEED (default 4242) instead of make
 # test's per-run seed: go test caches a result only while the environment

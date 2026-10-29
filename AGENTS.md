@@ -70,7 +70,7 @@ contributors share. The human onboarding narrative lives in
 | Regenerate DeepCopy methods         | `make generate`         |
 | Regenerate CRDs into the Helm chart | `make chart-crds`       |
 | Check AGENTS.md references resolve  | `make check-agents-md`  |
-| New Go file headers use the current year | `make check-copyright` |
+| New Go file headers carry the template's year | `make check-copyright` |
 | Go builder images match `go.mod`    | `make check-go-version` |
 | Chart metal-agent RBAC vs manifest  | `make check-metal-agent-rbac` |
 
@@ -163,9 +163,9 @@ A change is not done until all of these hold.
   everything; no Go change selects nothing and exits 0. Excludes `test/e2e`.
 - Once per round, before review: `make gate`. It regenerates manifests and
   DeepCopy and fails on uncommitted regeneration drift, checks gofmt without
-  rewriting, checks that every Go file the branch adds carries the current
-  copyright year, runs `go vet`, then runs `make lint-all` and the full test
-  suite in parallel. Logs land in `${TMPDIR:-/tmp}/llmkube-gate` (override
+  rewriting, checks that every Go file the branch adds carries the copyright
+  year `hack/boilerplate.go.txt` does, runs `go vet`, then runs `make lint-all`
+  and the full test suite in parallel. Logs land in `${TMPDIR:-/tmp}/llmkube-gate` (override
   `GATE_DIR`); it prints one summary line per step and exits nonzero if any
   step failed. One command covers the fmt/vet/lint/test pre-commit gate and
   the lint-all pre-push check. A rerun with no edits reports `(cached)` for
