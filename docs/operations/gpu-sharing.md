@@ -178,6 +178,68 @@ Four conditions report the pool's health:
 | `SwapDeferred` | a swap is being held off rather than performed |
 | `MetalSupported` | whether the members are Kubernetes GPU-gated or Apple-metal backed |
 
+### GitOps: leave `replicas` to the pool
+
+The pool owns its members' `spec.replicas`. It has no other request signal: a
+non-resident member at `replicas: 1` or more *is* a request for the slot, which
+is how the router activates a member and why a manual `kubectl scale` works the
+same way. Any tool that writes a member's `replicas` back on a schedule turns
+every sync into an activation.
+
+Symptoms of a tool fighting the pool:
+
+- the resident member changes at your GitOps sync interval, with nobody sending
+  requests for the other model
+- `kube_pod_created` for the members shows a new pod every interval
+- a request for one model loads the other one first, then swaps, and a large
+  model that takes most of an interval to load rarely serves at all
+
+Leave `replicas` out of every member's manifest:
+
+```yaml
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: InferenceService
+metadata:
+  name: coder-large
+spec:
+  modelRef: coder-large
+  # no replicas: the ModelPool scales this member between 0 and 1
+```
+
+**Flux.** kustomize-controller applies server-side, so once `replicas` is gone
+from the manifest Flux no longer owns the field and stops resetting it. The
+commit that drops it can cause one more swap: when Flux gives up the field, the
+API server fills in the CRD default of `1`, and the pool reads that as an
+activation for a held member. It settles after that. Do not reach for the
+`kustomize.toolkit.fluxcd.io/ssa: IfNotPresent` annotation instead: it stops
+Flux from applying any later change in Git to those objects, not just
+`replicas`.
+
+**Argo CD.** Leave `replicas` out of the manifests, or tell Argo to ignore it.
+`ignoreDifferences` on its own only hides the field from the diff; a sync still
+applies the Git value unless the Application also sets
+`RespectIgnoreDifferences=true`:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+spec:
+  ignoreDifferences:
+    - group: inference.llmkube.dev
+      kind: InferenceService
+      jsonPointers:
+        - /spec/replicas
+  syncPolicy:
+    syncOptions:
+      - RespectIgnoreDifferences=true
+```
+
+**Autoscaling.** Do not set `spec.autoscaling` on a pool member. With it set,
+the HorizontalPodAutoscaler owns the member's Deployment replica count and the
+operator preserves the live value, so the pool's `replicas: 0` never scales the
+member down and the swap waits for Pods that do not go away. LLMKube does not
+reject this combination yet.
+
 ### Sticky is the default policy, and it means what it says
 
 `swapPolicy: sticky` (the default) keeps the incumbent until a *different* member
