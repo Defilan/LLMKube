@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // Command check-copyright fails when a branch adds a Go file whose copyright
-// header is not from hack/boilerplate.go.txt with the current year. A new file
+// header does not carry the year hack/boilerplate.go.txt does. A new file
 // copies its header from a neighboring file rather than from the template, so
 // a stale year spreads unless a check stops it (#2298).
 //
@@ -130,7 +130,7 @@ func run(root, base string, want int, stdout, stderr io.Writer) int {
 			boilerplate, want)
 		return 1
 	}
-	_, _ = fmt.Fprintf(stdout, "copyright headers are the current year in %d added Go file(s)\n", checked)
+	_, _ = fmt.Fprintf(stdout, "copyright headers carry Copyright %d. in %d added Go file(s)\n", want, checked)
 	return 0
 }
 
@@ -147,14 +147,6 @@ func printOffender(w io.Writer, path string, want, got int, any bool) {
 	default:
 		_, _ = fmt.Fprintf(w, "FAIL: %s has no copyright header; want %q\n", path, wantLine)
 	}
-}
-
-// copyrightYear returns the year on the file's copyright line, or 0 when the
-// file has none. Only the leading comment block is read, so a copyright string
-// in a test fixture or a doc comment below the package clause is not a header.
-func copyrightYear(src []byte) int {
-	year, _ := inspectHeader(src)
-	return year
 }
 
 // inspectHeader reads the leading comment block and reports the year on the

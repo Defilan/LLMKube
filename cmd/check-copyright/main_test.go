@@ -452,8 +452,8 @@ func TestCopyrightYearIgnoresBody(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := copyrightYear([]byte(tc.src)); got != tc.want {
-				t.Errorf("copyrightYear = %d, want %d", got, tc.want)
+			if got, _ := inspectHeader([]byte(tc.src)); got != tc.want {
+				t.Errorf("inspectHeader year = %d, want %d", got, tc.want)
 			}
 		})
 	}

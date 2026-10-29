@@ -111,7 +111,7 @@ check-agents-md: ## Drift-check: fail if any make target, repo path, or Go versi
 	@go run ./cmd/check-agents-md --check
 
 .PHONY: check-copyright
-check-copyright: ## Fail when a branch adds a Go file whose copyright header is not the current year (#2298).
+check-copyright: ## Fail when a branch adds a Go file whose copyright header is not the year hack/boilerplate.go.txt carries (#2298).
 	@go run ./cmd/check-copyright -base "$(BASE_REF)"
 
 .PHONY: generate
