@@ -13,8 +13,10 @@ package controller
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -34,6 +36,13 @@ import (
 // deployments override this in production; the default is a development
 // tag for local kind clusters.
 const defaultRouterProxyImage = "ghcr.io/defilantech/llmkube-router-proxy:dev"
+
+// routerProxyDrainGraceMargin is added to spec.proxy.drainTimeout to get the
+// pod's terminationGracePeriodSeconds. The kubelet's countdown starts at
+// SIGTERM and the proxy's own shutdown is bounded by the drain (both servers
+// share one context in cmd/router-proxy), so the margin covers process exit
+// only; this pod has no preStop hook consuming budget.
+const routerProxyDrainGraceMargin = 5 * time.Second
 
 // reconcileRouterDeployment creates or updates the Deployment that runs
 // the router-proxy. The Deployment is owner-referenced to the
@@ -289,14 +298,15 @@ func (r *ModelRouterReconciler) newRouterDeployment(
 					Annotations: podAnnotations,
 				},
 				Spec: corev1.PodSpec{
-					ServiceAccountName:        serviceAccountName,
-					SecurityContext:           routerProxyPodSecurityContext(),
-					ImagePullSecrets:          imagePullSecrets,
-					NodeSelector:              nodeSelector,
-					Tolerations:               tolerations,
-					RuntimeClassName:          runtimeClassName,
-					Affinity:                  affinity,
-					TopologySpreadConstraints: topologySpread,
+					ServiceAccountName:            serviceAccountName,
+					SecurityContext:               routerProxyPodSecurityContext(),
+					ImagePullSecrets:              imagePullSecrets,
+					NodeSelector:                  nodeSelector,
+					Tolerations:                   tolerations,
+					RuntimeClassName:              runtimeClassName,
+					Affinity:                      affinity,
+					TopologySpreadConstraints:     topologySpread,
+					TerminationGracePeriodSeconds: proxyDrainGraceSeconds(mr),
 					Containers: []corev1.Container{
 						{
 							Name:            routerProxyContainerName,
@@ -463,10 +473,37 @@ func routerProxyArgs(mr *inferencev1alpha1.ModelRouter, hasPools bool) []string 
 		args = append(args, "--stream-idle-timeout",
 			mr.Spec.Proxy.StreamIdleTimeout.Duration.String())
 	}
+	if d, ok := proxyDrainTimeout(mr); ok {
+		args = append(args, "--shutdown-timeout", d.String())
+	}
 	if hasPools {
 		args = append(args, "--enable-activation")
 	}
 	return args
+}
+
+// proxyDrainTimeout reports spec.proxy.drainTimeout when it is set. Both the
+// proxy flag and the pod grace period read this one accessor, so the drain
+// window and the kubelet's budget cannot disagree.
+func proxyDrainTimeout(mr *inferencev1alpha1.ModelRouter) (time.Duration, bool) {
+	if mr.Spec.Proxy == nil || mr.Spec.Proxy.DrainTimeout == nil {
+		return 0, false
+	}
+	return mr.Spec.Proxy.DrainTimeout.Duration, true
+}
+
+// proxyDrainGraceSeconds is the pod's terminationGracePeriodSeconds: the drain
+// plus routerProxyDrainGraceMargin, or nil when the router sets no drain so
+// the pod template is unchanged and existing proxies do not roll. Round up,
+// never truncate: the kubelet's countdown starts at SIGTERM, so a short budget
+// is the failure mode that cuts streams.
+func proxyDrainGraceSeconds(mr *inferencev1alpha1.ModelRouter) *int64 {
+	d, ok := proxyDrainTimeout(mr)
+	if !ok {
+		return nil
+	}
+	budget := d + routerProxyDrainGraceMargin
+	return ptr.To(int64(math.Ceil(budget.Seconds())))
 }
 
 // routerProxyImage returns the image the reconciler will set on the

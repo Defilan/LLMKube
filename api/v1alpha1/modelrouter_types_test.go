@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"reflect"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -140,6 +141,7 @@ func fullyPopulatedModelRouter() *ModelRouter {
 				ImagePullSecrets: []corev1.LocalObjectReference{
 					{Name: "ghcr-creds"},
 				},
+				DrainTimeout: &metav1.Duration{Duration: 600 * time.Second},
 			},
 			MCPServer: &MCPServerSpec{
 				Enabled: false,

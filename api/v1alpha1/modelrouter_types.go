@@ -831,6 +831,22 @@ type RouterProxySpec struct {
 	// +optional
 	StreamIdleTimeout *metav1.Duration `json:"streamIdleTimeout,omitempty"`
 
+	// DrainTimeout is how long a router-proxy replica keeps serving its
+	// in-flight requests after SIGTERM, so a rollout finishes the streams
+	// it holds instead of cutting them at the proxy's own default. It
+	// sets the proxy's --shutdown-timeout and the pod's
+	// terminationGracePeriodSeconds, which is this value plus a fixed
+	// 5s margin so the kubelet does not SIGKILL before the drain ends.
+	// A stream longer than this still ends at the drain deadline. The
+	// proxy's default of 30s applies when unset, and nothing is rendered
+	// on the pod template, so an operator upgrade does not roll existing
+	// proxies. Changing it changes the pod template, so it rolls the
+	// proxy pods, and a replica that drains stays Terminating for up to
+	// this long, delaying that roll. Must be between 1s and 1h.
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('1s') && duration(self) <= duration('1h')",message="drainTimeout must be between 1s and 1h"
+	// +optional
+	DrainTimeout *metav1.Duration `json:"drainTimeout,omitempty"`
+
 	// NodeSelector pins the router-proxy pod to nodes matching these labels.
 	// Use it when the proxy image is only present on specific nodes (for
 	// example a node-local registry) or to co-locate the proxy with its
