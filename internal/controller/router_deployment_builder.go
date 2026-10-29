@@ -14,8 +14,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"sort"
-	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -90,10 +88,10 @@ func (r *ModelRouterReconciler) reconcileRouterDeployment(
 	// the spec.proxy podLabels / podAnnotations an earlier reconcile applied
 	// and the spec no longer asks for. Keys another tool added are not in the
 	// recorded set and pass through.
-	pruneUnwantedKeys(existing.Spec.Template.Labels,
-		existing.Annotations[routerProxyAppliedPodLabelsAnnotation], desired.Spec.Template.Labels)
-	pruneUnwantedKeys(existing.Spec.Template.Annotations,
-		existing.Annotations[routerProxyAppliedPodAnnotationsAnnotation], desired.Spec.Template.Annotations)
+	existing.Spec.Template.Labels = withoutUnwantedKeys(existing.Spec.Template.Labels,
+		existing.Annotations[appliedPodLabelsAnnotation], desired.Spec.Template.Labels)
+	existing.Spec.Template.Annotations = withoutUnwantedKeys(existing.Spec.Template.Annotations,
+		existing.Annotations[appliedPodAnnotationsAnnotation], desired.Spec.Template.Annotations)
 	existing.Spec.Template.Labels = mergePreservingExternal(
 		existing.Spec.Template.Labels,
 		desired.Spec.Template.Labels,
@@ -118,58 +116,11 @@ func (r *ModelRouterReconciler) reconcileRouterDeployment(
 		}
 	}
 	existing.Labels = mergePreservingExternal(existing.Labels, desired.Labels)
-	for _, k := range []string{routerProxyAppliedPodLabelsAnnotation, routerProxyAppliedPodAnnotationsAnnotation} {
-		if v, ok := desired.Annotations[k]; ok {
-			if existing.Annotations == nil {
-				existing.Annotations = map[string]string{}
-			}
-			existing.Annotations[k] = v
-		} else {
-			delete(existing.Annotations, k)
-		}
-	}
+	syncAppliedKeyRecords(&existing.Annotations, desired.Annotations)
 	if err := setControllerReferenceUnblocked(mr, existing, r.Scheme); err != nil {
 		return fmt.Errorf("set owner ref on existing router Deployment: %w", err)
 	}
 	return r.Update(ctx, existing)
-}
-
-// routerProxyAppliedPodLabelsAnnotation and
-// routerProxyAppliedPodAnnotationsAnnotation record, on the Deployment, which
-// spec.proxy podLabels and podAnnotations keys the operator put on the pod
-// template, so a key later removed from the spec can be removed from the pods
-// without touching keys other tools added. They sit on the Deployment, not the
-// template, so recording them does not roll the pods.
-const (
-	routerProxyAppliedPodLabelsAnnotation      = "inference.llmkube.dev/applied-pod-labels"
-	routerProxyAppliedPodAnnotationsAnnotation = "inference.llmkube.dev/applied-pod-annotations"
-)
-
-// appliedKeys is the sorted, comma-separated list of the keys in user that
-// operator does not own, or "" when there are none. Label and annotation keys
-// cannot contain a comma.
-func appliedKeys(user, operator map[string]string) string {
-	keys := make([]string, 0, len(user))
-	for k := range user {
-		if _, owned := operator[k]; !owned {
-			keys = append(keys, k)
-		}
-	}
-	sort.Strings(keys)
-	return strings.Join(keys, ",")
-}
-
-// pruneUnwantedKeys deletes from live every key in the recorded applied list
-// that desired no longer sets.
-func pruneUnwantedKeys(live map[string]string, applied string, desired map[string]string) {
-	if applied == "" {
-		return
-	}
-	for _, k := range strings.Split(applied, ",") {
-		if _, ok := desired[k]; !ok {
-			delete(live, k)
-		}
-	}
 }
 
 // routerProxyScrapeAnnotations are the annotations --emit-scrape-annotations
@@ -253,21 +204,11 @@ func (r *ModelRouterReconciler) newRouterDeployment(
 			podAnnotations[k] = v
 		}
 	}
-	var deploymentAnnotations map[string]string
-	if keys := appliedKeys(userLabels, selectorLabels); keys != "" {
-		deploymentAnnotations = map[string]string{routerProxyAppliedPodLabelsAnnotation: keys}
-	}
-	appliedAnnotations := appliedKeys(userAnnotations, podAnnotations)
+	deploymentAnnotations := appliedKeyRecords(userLabels, selectorLabels, userAnnotations, podAnnotations)
 	for k, v := range userAnnotations {
 		if _, operatorOwned := podAnnotations[k]; !operatorOwned {
 			podAnnotations[k] = v
 		}
-	}
-	if appliedAnnotations != "" {
-		if deploymentAnnotations == nil {
-			deploymentAnnotations = map[string]string{}
-		}
-		deploymentAnnotations[routerProxyAppliedPodAnnotationsAnnotation] = appliedAnnotations
 	}
 
 	// Proxies that call the API (ModelPool activation, endpoint tracking) run

@@ -1183,8 +1183,16 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 	// sync labels survive operator reconciles. Operator-owned keys
 	// still win on collision. Same fix as the router-proxy reconciler
 	// in router_deployment_builder.go; see #456.
-	existingTemplateLabels := existingDeployment.Spec.Template.Labels
-	existingTemplateAnnotations := existingDeployment.Spec.Template.Annotations
+	//
+	// The merge keeps keys the desired template no longer sets, so first drop
+	// the spec.podLabels / spec.podAnnotations keys an earlier reconcile
+	// applied that the spec no longer asks for (#2287). Done before the hash
+	// below, so a removal counts as a template change and goes through the
+	// RolloutPolicy gate like any other.
+	existingTemplateLabels := withoutUnwantedKeys(existingDeployment.Spec.Template.Labels,
+		existingDeployment.Annotations[appliedPodLabelsAnnotation], deployment.Spec.Template.Labels)
+	existingTemplateAnnotations := withoutUnwantedKeys(existingDeployment.Spec.Template.Annotations,
+		existingDeployment.Annotations[appliedPodAnnotationsAnnotation], deployment.Spec.Template.Annotations)
 
 	// Compute the desired merged template so we can compare against the
 	// live Deployment before gating on idle checks.
@@ -1283,8 +1291,10 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 	readyReplicas := existingDeployment.Status.ReadyReplicas
 	observedReplicas := existingDeployment.Status.Replicas
 	updateErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		liveTemplateLabels := existingDeployment.Spec.Template.Labels
-		liveTemplateAnnotations := existingDeployment.Spec.Template.Annotations
+		liveTemplateLabels := withoutUnwantedKeys(existingDeployment.Spec.Template.Labels,
+			existingDeployment.Annotations[appliedPodLabelsAnnotation], deployment.Spec.Template.Labels)
+		liveTemplateAnnotations := withoutUnwantedKeys(existingDeployment.Spec.Template.Annotations,
+			existingDeployment.Annotations[appliedPodAnnotationsAnnotation], deployment.Spec.Template.Annotations)
 		liveReplicas := existingDeployment.Spec.Replicas
 
 		existingDeployment.Spec = deployment.Spec
@@ -1298,6 +1308,7 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 			existingDeployment.Annotations = make(map[string]string)
 		}
 		existingDeployment.Annotations[AnnotationDesiredTemplateHash] = desiredHash
+		syncAppliedKeyRecords(&existingDeployment.Annotations, deployment.Annotations)
 		// When autoscaling is enabled the HPA owns the replica count: preserve
 		// the live value rather than overwriting it with the operator's desired
 		// count. Setting it to nil does not work here: a plain Update with a nil

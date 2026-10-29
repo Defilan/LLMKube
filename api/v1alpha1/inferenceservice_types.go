@@ -547,8 +547,9 @@ type InferenceServiceSpec struct {
 	// PodAnnotations are merged into the inference Pod's metadata.annotations.
 	// Use this to tag Pods for downstream tooling (cost attribution, service
 	// mesh routing, custom admission controllers) without those tools needing
-	// to know about LLMKube's CRD schema. Pure passthrough; the operator
-	// itself does not set any annotations on inference Pods today.
+	// to know about LLMKube's CRD schema. A value set here wins over an
+	// annotation the operator sets (karpenter.sh/do-not-disrupt, the
+	// prometheus.io scrape hints). A key removed here is removed from the Pods.
 	// +optional
 	PodAnnotations map[string]string `json:"podAnnotations,omitempty"`
 
@@ -557,7 +558,8 @@ type InferenceServiceSpec struct {
 	// `inference.llmkube.dev/service`). Operator-managed keys take precedence
 	// on collision so the Deployment selector stays in sync with the Pods it
 	// owns. The Deployment selector itself uses only the operator-managed
-	// labels and is immutable, so changing PodLabels later is safe.
+	// labels and is immutable, so changing PodLabels later is safe. A key
+	// removed here is removed from the Pods.
 	// +optional
 	PodLabels map[string]string `json:"podLabels,omitempty"`
 

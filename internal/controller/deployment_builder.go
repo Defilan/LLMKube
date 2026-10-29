@@ -652,6 +652,9 @@ func (r *InferenceServiceReconciler) constructDeployment(
 			Name:      isvc.Name,
 			Namespace: isvc.Namespace,
 			Labels:    labels,
+			// Operator labels win over spec.podLabels; spec.podAnnotations win
+			// over the operator's annotations, so all of them are recorded.
+			Annotations: appliedKeyRecords(isvc.Spec.PodLabels, labels, isvc.Spec.PodAnnotations, nil),
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas:             &replicas,
