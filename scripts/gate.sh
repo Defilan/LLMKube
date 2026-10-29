@@ -3,6 +3,7 @@
 # The agent gate: one command per round. It regenerates manifests and DeepCopy
 # and fails if that changed files the working tree did not already have
 # modified (uncommitted regeneration drift), checks gofmt without rewriting,
+# checks that every Go file the branch adds carries the current copyright year,
 # runs go vet, and only then runs lint-all and the full test suite in
 # parallel: nothing after vet regenerates, so lint and tests cannot race the
 # generators. Every step logs to a file under GATE_DIR and the gate exits

@@ -165,6 +165,18 @@ func ciBlockingChecks(t *testing.T) map[string]string {
 	return found
 }
 
+// gateOutOfLoopChecks are make targets the gate Job runs after the
+// `make <check>` loop, against the merge base it resolves there. They
+// count as gate coverage for TestDefaultGateChecksCoverCI but cannot
+// move into DefaultGateChecks: the loop runs against a `--depth 1` clone
+// with no base ref yet, so a base-diffing check placed there fails every
+// run. TestGateJobCopyrightCheckRunsAfterBaseResolution pins each one's
+// position in the rendered Job.
+var gateOutOfLoopChecks = map[string]string{
+	"check-copyright": "diffs against a base ref, and the Job's clone is --depth 1 " +
+		"until the merge base is resolved below the checks loop",
+}
+
 // TestDefaultGateChecksCoverCI pins the Foreman gate against the
 // make-invoked subset of CI. A GATE-PASS is read by operators, and by the
 // verdict machinery, as "this branch is expected to pass CI"; that is
@@ -184,6 +196,12 @@ func TestDefaultGateChecksCoverCI(t *testing.T) {
 		if reason, ok := gateExemptCIChecks[target]; ok {
 			if strings.TrimSpace(reason) == "" {
 				t.Errorf("%q is exempt from DefaultGateChecks with an empty reason; state why", target)
+			}
+			continue
+		}
+		if reason, ok := gateOutOfLoopChecks[target]; ok {
+			if strings.TrimSpace(reason) == "" {
+				t.Errorf("%q is marked as an out-of-loop gate check with an empty reason; state why", target)
 			}
 			continue
 		}
@@ -210,6 +228,21 @@ func TestGateExemptionsAreLive(t *testing.T) {
 	for target := range gateExemptCIChecks {
 		if _, ok := ci[target]; !ok {
 			t.Errorf("gateExemptCIChecks has %q but no workflow runs it; drop the stale exemption", target)
+		}
+	}
+}
+
+// TestGateOutOfLoopChecksAreLive stops gateOutOfLoopChecks from excusing a
+// target the template no longer runs. An entry that names nothing is a hole
+// disguised as coverage, the same failure TestGateExemptionsAreLive guards
+// against for the other map.
+func TestGateOutOfLoopChecksAreLive(t *testing.T) {
+	args := renderGateArgsForTest(t, map[string]any{
+		"repo": "defilantech/LLMKube", "branch": "foreman/x", "baseBranch": "main",
+	})
+	for target := range gateOutOfLoopChecks {
+		if !strings.Contains(args, "make "+target) {
+			t.Errorf("gateOutOfLoopChecks lists %q but the gate Job never runs it; drop the entry", target)
 		}
 	}
 }

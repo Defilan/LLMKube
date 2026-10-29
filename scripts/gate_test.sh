@@ -67,7 +67,7 @@ expect_rc 1 "test failure must fail the gate when lint passes"
 expect_line 'gate: lint +PASS' "summary must report the passing lint"
 expect_line 'gate: test +FAIL' "summary must report the test failure"
 
-# Everything green: exit zero, all six steps PASS.
+# Everything green: exit zero, all seven steps PASS.
 repo=$(new_repo)
 run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_FMT_CMD=true GATE_COPYRIGHT_CMD=true GATE_VET_CMD=true \
 	GATE_LINT_CMD=true GATE_TEST_CMD=true
@@ -137,8 +137,6 @@ expect_line 'gate: vet +SKIPPED' "a copyright failure must skip the vet step"
 expect_line 'gate: lint +SKIPPED' "a copyright failure must skip the lint step"
 expect_line 'gate: test +SKIPPED' "a copyright failure must skip the test step"
 [ ! -e "$GATE_LOG_DIR/vet.log" ] || fail "the skipped vet step must not write a log"
-
-
 
 # Regeneration drift: a stub regen that creates a file must fail the gate and
 # name the file.

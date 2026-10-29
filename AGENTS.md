@@ -107,8 +107,9 @@ A change is not done until all of these hold.
 - Idiomatic Go: `gofmt`, wrapped errors (`fmt.Errorf("...: %w", err)`), table-driven tests.
 - A new Go file takes its header from `hack/boilerplate.go.txt`, not from a
   neighboring file, so the year on its copyright line is the current one.
-  `make check-copyright` fails a branch that adds a file with any other year,
-  so copying a header from an older file turns the gate red.
+  `make check-copyright` fails a branch that adds a Go file with a different
+  year, a year range, or no copyright header at all, so copying a header from
+  an older file (or copying a headerless one) turns the gate red.
 - Comments explain *why*, not *what*. Do not add docstrings or decorative
   comments to hit a quota.
 - Controller code follows controller-runtime conventions: reconcilers are

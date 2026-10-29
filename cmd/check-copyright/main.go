@@ -52,6 +52,11 @@ const boilerplate = "hack/boilerplate.go.txt"
 // copyrightLine matches the template's copyright line exactly.
 var copyrightLine = regexp.MustCompile(`^Copyright (\d{4})\.$`)
 
+// anyCopyright matches a copyright line in any other form, so a header that is
+// present but not the template's (a year range, a slash-style comment, a
+// missing period) is reported as what it is rather than as missing.
+var anyCopyright = regexp.MustCompile(`Copyright\s+\S`)
+
 // packageClause matches the start of the Go source after the leading comment
 // block, which bounds where a header may appear.
 var packageClause = regexp.MustCompile(`^package\s`)
@@ -103,12 +108,12 @@ func run(root, base string, want int, stdout, stderr io.Writer) int {
 			_, _ = fmt.Fprintf(stderr, "check-copyright: %v\n", err)
 			return 1
 		}
-		got := copyrightYear(src)
+		got, any := inspectHeader(src)
 		if got == want {
 			continue
 		}
 		failed++
-		printOffender(stderr, path, want, got)
+		printOffender(stderr, path, want, got, any)
 	}
 
 	if failed > 0 {
@@ -123,14 +128,17 @@ func run(root, base string, want int, stdout, stderr io.Writer) int {
 }
 
 // printOffender writes the one-line reason a file's header is rejected.
-func printOffender(w io.Writer, path string, want, got int) {
-	switch got {
-	case 0:
-		_, _ = fmt.Fprintf(w, "FAIL: %s has no copyright header; want %q\n",
-			path, fmt.Sprintf("Copyright %d.", want))
-	default:
+func printOffender(w io.Writer, path string, want, got int, any bool) {
+	wantLine := fmt.Sprintf("Copyright %d.", want)
+	switch {
+	case got != 0:
 		_, _ = fmt.Fprintf(w, "FAIL: %s has %q; want %q\n",
-			path, fmt.Sprintf("Copyright %d.", got), fmt.Sprintf("Copyright %d.", want))
+			path, fmt.Sprintf("Copyright %d.", got), wantLine)
+	case any:
+		_, _ = fmt.Fprintf(w, "FAIL: %s has a copyright line that is not the template's form; want %q\n",
+			path, wantLine)
+	default:
+		_, _ = fmt.Fprintf(w, "FAIL: %s has no copyright header; want %q\n", path, wantLine)
 	}
 }
 
@@ -138,19 +146,30 @@ func printOffender(w io.Writer, path string, want, got int) {
 // file has none. Only the leading comment block is read, so a copyright string
 // in a test fixture or a doc comment below the package clause is not a header.
 func copyrightYear(src []byte) int {
+	year, _ := inspectHeader(src)
+	return year
+}
+
+// inspectHeader reads the leading comment block and reports the year on the
+// template's copyright line, plus whether any copyright line at all was found.
+func inspectHeader(src []byte) (year int, any bool) {
 	for _, line := range strings.Split(string(src), "\n") {
 		if packageClause.MatchString(line) {
-			return 0
+			return 0, any
 		}
-		if m := copyrightLine.FindStringSubmatch(strings.TrimSpace(line)); m != nil {
-			year, err := strconv.Atoi(m[1])
+		trimmed := strings.TrimSpace(line)
+		if m := copyrightLine.FindStringSubmatch(trimmed); m != nil {
+			y, err := strconv.Atoi(m[1])
 			if err != nil {
-				return 0
+				return 0, true
 			}
-			return year
+			return y, true
+		}
+		if anyCopyright.MatchString(trimmed) {
+			any = true
 		}
 	}
-	return 0
+	return 0, any
 }
 
 // zeroRef reports whether base is the all-zero SHA a forge sends as
@@ -176,44 +195,70 @@ func exempt(path string) bool {
 // root: committed since the merge base, staged, and untracked. The gate runs
 // on a worktree before the commit exists, so the last two belong here.
 //
-// The committed diff carries no pathspec. A pathspec makes git pair renames
-// only among the listed paths, which turns a rename into a pair of additions
-// and a deletion; filtering .go in Go leaves rename detection intact so a moved
-// file is not reported as added. A staged rename is named by its old path,
-// which exists nowhere and is dropped below.
+// --diff-filter=A is what keeps a moved file out: git reports a rename as a
+// single renames entry, never as an addition, whether or not a pathspec
+// narrows the diff, so `git mv` does not fail the check. .go is filtered in Go
+// rather than by a pathspec so the filter reads the same for all three specs.
 func addedGoFiles(top, base string) ([]string, error) {
 	if zeroRef(base) {
 		return nil, nil
 	}
+	// The diff base is the merge base, never the base tip. A tree diff against
+	// a tip also lists every file the base deleted after the fork, which this
+	// branch never touched; there is no fallback, because every narrowed
+	// version of one answered the wrong question instead.
 	mb, err := git(top, "merge-base", base, "HEAD")
 	if err != nil {
 		return nil, fmt.Errorf("merge-base with %s: %w", base, err)
 	}
-	specs := [][]string{
-		{"diff", "--name-only", "--diff-filter=A", mb, "HEAD"},
-		{"diff", "--cached", "--name-only", "--diff-filter=A"},
-		{"ls-files", "--others", "--exclude-standard"},
+	if mb == "" {
+		return nil, fmt.Errorf("merge-base with %s: no common ancestor (shallow or unrelated history)", base)
 	}
+	out, err := git(top, "diff", "--name-only", "--diff-filter=A", mb, "HEAD")
+	if err != nil {
+		return nil, err
+	}
+
 	seen := map[string]bool{}
 	files := make([]string, 0, 8)
-	for _, spec := range specs {
+	add := func(f string) {
+		if f == "" || seen[f] || !strings.HasSuffix(f, ".go") {
+			return
+		}
+		seen[f] = true
+		files = append(files, f)
+	}
+	for _, f := range strings.Split(out, "\n") {
+		add(f)
+	}
+	// Staged and untracked files are additions by definition, whatever the
+	// base says, so they bypass the merge-base diff.
+	for _, spec := range [][]string{
+		{"diff", "--cached", "--name-only", "--diff-filter=A"},
+		{"ls-files", "--others", "--exclude-standard"},
+	} {
 		out, err := git(top, spec...)
 		if err != nil {
 			return nil, err
 		}
 		for _, f := range strings.Split(out, "\n") {
-			if f == "" || seen[f] || !strings.HasSuffix(f, ".go") {
-				continue
-			}
-			seen[f] = true
-			files = append(files, f)
+			add(f)
 		}
 	}
 	return files, nil
 }
 
+// gitConfig pins the settings this check's decisions rest on, so they hold
+// regardless of the caller's git config: rename detection is what keeps a
+// moved file out of the added set, and unquoted paths are what makes the
+// listed path usable by os.ReadFile.
+var gitConfig = []string{
+	"-c", "diff.renames=true",
+	"-c", "core.quotePath=false",
+}
+
 func git(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
+	cmd := exec.Command("git", append(append([]string{}, gitConfig...), args...)...)
 	cmd.Dir = dir
 	var out, errOut bytes.Buffer
 	cmd.Stdout = &out

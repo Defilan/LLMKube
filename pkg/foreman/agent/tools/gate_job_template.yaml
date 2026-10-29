@@ -214,6 +214,23 @@ spec:
                 fi
               fi
 
+              # --- copyright headers -------------------------------------------------
+              # Runs after base resolution for the same reason the two below do. It
+              # needs a real merge base and not a base tip: a tree diff against a
+              # tip also lists files the base deleted, and every narrowed variant of
+              # that comparison reported either the wrong files or none. The freeform
+              # path resolves a tip and never deepens, so it is skipped loudly rather
+              # than handed a base the check would misread. CI's lint.yml enforces it
+              # there with a full-history checkout.
+              if [ -z "$MB" ]; then
+                base_warn "copyright header check skipped, no usable base to diff against"
+              elif ! CMB=$(git merge-base HEAD "$MB" 2>/dev/null) || [ -z "$CMB" ]; then
+                base_warn "copyright header check skipped, $MB is not a merge base of HEAD"
+              else
+                echo "=== make check-copyright BASE_REF=$CMB ==="
+                make check-copyright BASE_REF="$CMB" || rc=1
+              fi
+
               # --- non-Go lint -------------------------------------------------------
               # A diff that is entirely non-Go (CI YAML, shell, Ruby) otherwise reaches
               # GATE PASS with nothing meaningful checked (#1072). Each checker is scoped
