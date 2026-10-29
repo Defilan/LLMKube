@@ -41,7 +41,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 )
 
 // boilerplate is the header every new Go file starts from. Only the copyright
@@ -64,7 +63,7 @@ var packageClause = regexp.MustCompile(`^package\s`)
 func main() {
 	root := flag.String("root", ".", "repo root to check")
 	base := flag.String("base", "upstream/main", "base ref to diff against")
-	year := flag.Int("year", 0, "copyright year to require (0: the current year)")
+	year := flag.Int("year", 0, "copyright year to require (0: the year in "+boilerplate+")")
 	flag.Parse()
 
 	if code := run(*root, *base, *year, os.Stdout, os.Stderr); code != 0 {
@@ -73,15 +72,23 @@ func main() {
 }
 
 // run reports every file added since base whose header does not carry want.
-// A want of 0 means the year at run time.
+// A want of 0 means the year hack/boilerplate.go.txt carries, which is the
+// single source of truth: AGENTS.md tells contributors to copy that header, so
+// the check must accept exactly what the template produces. Reading the clock
+// instead would fail every new file from 1 January until someone bumped the
+// template, and controller-gen output with it.
 func run(root, base string, want int, stdout, stderr io.Writer) int {
-	if want == 0 {
-		want = time.Now().Year()
-	}
 	top, err := git(root, "rev-parse", "--show-toplevel")
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "check-copyright: %v\n", err)
 		return 1
+	}
+	if want == 0 {
+		want, err = templateYear(top)
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "check-copyright: %v\n", err)
+			return 1
+		}
 	}
 	if _, err := git(top, "rev-parse", "--verify", base); err != nil {
 		_, _ = fmt.Fprintf(stderr,
@@ -178,6 +185,21 @@ func inspectHeader(src []byte) (year int, any bool) {
 // compare against, and the check has nothing to say.
 func zeroRef(base string) bool {
 	return base != "" && strings.Trim(base, "0") == ""
+}
+
+// templateYear returns the year on the copyright line of boilerplate. A
+// template whose line does not parse is an error, not a zero year: silently
+// accepting every header would turn the check off.
+func templateYear(top string) (int, error) {
+	src, err := os.ReadFile(filepath.Join(top, boilerplate))
+	if err != nil {
+		return 0, fmt.Errorf("reading %s: %w", boilerplate, err)
+	}
+	year, ok := inspectHeader(src)
+	if !ok || year == 0 {
+		return 0, fmt.Errorf("%s has no parsable `Copyright <year>.` line", boilerplate)
+	}
+	return year, nil
 }
 
 // exempt reports whether a file is excluded from the check. A testdata file is

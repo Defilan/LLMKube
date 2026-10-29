@@ -106,10 +106,12 @@ A change is not done until all of these hold.
   Do not introduce a different style for new code.
 - Idiomatic Go: `gofmt`, wrapped errors (`fmt.Errorf("...: %w", err)`), table-driven tests.
 - A new Go file takes its header from `hack/boilerplate.go.txt`, not from a
-  neighboring file, so the year on its copyright line is the current one.
-  `make check-copyright` fails a branch that adds a Go file with a different
-  year, a year range, or no copyright header at all, so copying a header from
-  an older file (or copying a headerless one) turns the gate red.
+  neighboring file. That template's year is what `make check-copyright`
+  requires, so the check accepts exactly what AGENTS.md tells you to copy, and
+  bumping the template in January is the one edit the rollover needs. A branch
+  that adds a Go file with a different year, a year range, or no copyright
+  header at all turns the gate red, and so does an untracked scratch `.go` file
+  in the worktree, since the gate reads the working tree before you commit.
 - Comments explain *why*, not *what*. Do not add docstrings or decorative
   comments to hit a quota.
 - Controller code follows controller-runtime conventions: reconcilers are

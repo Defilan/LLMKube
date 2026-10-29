@@ -366,21 +366,65 @@ func TestRunNoMergeBaseFails(t *testing.T) {
 	}
 }
 
-func TestRunZeroYearUsesClock(t *testing.T) {
-	src := []byte(header("Copyright 2026."))
-	if got := copyrightYear(src); got != 2026 {
-		t.Errorf("copyrightYear = %d, want 2026", got)
-	}
-	// run's want==0 path resolves the current year, so the fixture carries the
-	// clock's year too: a hardcoded one turns this red on the next 1 January
-	// with no code change.
+// writeTemplate puts a boilerplate template in dir with the given year, so the
+// required year comes from a file the test controls.
+func writeTemplate(t *testing.T, dir string, year int) {
+	t.Helper()
+	writeFile(t, dir, boilerplate, header(fmt.Sprintf("Copyright %d.", year)))
+}
+
+// TestRunZeroYearUsesTemplate pins the template as the source of truth for the
+// required year. The check must accept exactly what AGENTS.md tells a
+// contributor to copy, whatever the calendar says: reading the clock instead
+// fails every new file, and controller-gen output with it, from 1 January
+// until someone bumps the template.
+func TestRunZeroYearUsesTemplate(t *testing.T) {
 	dir, base := newRepo(t)
-	writeFile(t, dir, "pkg/current.go",
-		header(fmt.Sprintf("Copyright %d.", time.Now().Year())))
-	commit(t, dir, "add new")
+	writeTemplate(t, dir, time.Now().Year()+1)
+	writeFile(t, dir, "pkg/from_template.go",
+		header(fmt.Sprintf("Copyright %d.", time.Now().Year()+1)))
+	commit(t, dir, "template and file agree")
+
 	var stdout, errOut bytes.Buffer
 	if code := run(dir, base, 0, &stdout, &errOut); code != 0 {
-		t.Fatalf("want exit 0 with the clock year, got %d: %s", code, errOut.String())
+		t.Fatalf("a file copied from the template must pass whatever the year: got %d: %s%s",
+			code, stdout.String(), errOut.String())
+	}
+}
+
+// TestRunZeroYearRejectsClockYear is the rollover case in the other direction:
+// a file carrying this year while the template carries next year fails, and
+// the message names the template year, so the fix is visible.
+func TestRunZeroYearRejectsClockYear(t *testing.T) {
+	dir, base := newRepo(t)
+	writeTemplate(t, dir, time.Now().Year()+1)
+	writeFile(t, dir, "pkg/from_clock.go",
+		header(fmt.Sprintf("Copyright %d.", time.Now().Year())))
+	commit(t, dir, "file follows the clock, template moved on")
+
+	var stdout, errOut bytes.Buffer
+	code := run(dir, base, 0, &stdout, &errOut)
+	if code != 1 {
+		t.Fatalf("want exit 1 when the header and the template disagree, got %d", code)
+	}
+	if !strings.Contains(errOut.String(), fmt.Sprintf("Copyright %d.", time.Now().Year()+1)) {
+		t.Errorf("the message must name the template's year:\n%s", errOut.String())
+	}
+}
+
+// TestRunMissingTemplate fails loudly when the template is gone or unparsable,
+// rather than treating every header as acceptable.
+func TestRunMissingTemplate(t *testing.T) {
+	dir, base := newRepo(t)
+	writeFile(t, dir, "pkg/plain.go", header("Copyright 2026."))
+	commit(t, dir, "add a file, no template")
+
+	var stdout, errOut bytes.Buffer
+	if code := run(dir, base, 0, &stdout, &errOut); code != 1 {
+		t.Fatalf("a missing template must fail the check, got %d", code)
+	}
+	if !strings.Contains(errOut.String(), boilerplate) {
+		t.Errorf("the message must name the template:\n%s", errOut.String())
 	}
 }
 
