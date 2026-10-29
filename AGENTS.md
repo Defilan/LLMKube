@@ -70,6 +70,7 @@ contributors share. The human onboarding narrative lives in
 | Regenerate DeepCopy methods         | `make generate`         |
 | Regenerate CRDs into the Helm chart | `make chart-crds`       |
 | Check AGENTS.md references resolve  | `make check-agents-md`  |
+| New Go file headers carry the template's year | `make check-copyright` |
 | Go builder images match `go.mod`    | `make check-go-version` |
 | Chart metal-agent RBAC vs manifest  | `make check-metal-agent-rbac` |
 
@@ -104,6 +105,13 @@ A change is not done until all of these hold.
 - Match the surrounding code: naming, error handling, comment density, layout.
   Do not introduce a different style for new code.
 - Idiomatic Go: `gofmt`, wrapped errors (`fmt.Errorf("...: %w", err)`), table-driven tests.
+- A new Go file takes its header from `hack/boilerplate.go.txt`, not from a
+  neighboring file. That template's year is what `make check-copyright`
+  requires, so the check accepts exactly what AGENTS.md tells you to copy, and
+  bumping the template in January is the one edit the rollover needs. A branch
+  that adds a Go file with a different year, a year range, or no copyright
+  header at all turns the gate red, and so does an untracked scratch `.go` file
+  in the worktree, since the gate reads the working tree before you commit.
 - Comments explain *why*, not *what*. Do not add docstrings or decorative
   comments to hit a quota.
 - Controller code follows controller-runtime conventions: reconcilers are
@@ -155,8 +163,9 @@ A change is not done until all of these hold.
   everything; no Go change selects nothing and exits 0. Excludes `test/e2e`.
 - Once per round, before review: `make gate`. It regenerates manifests and
   DeepCopy and fails on uncommitted regeneration drift, checks gofmt without
-  rewriting, runs `go vet`, then runs `make lint-all` and the full test suite
-  in parallel. Logs land in `${TMPDIR:-/tmp}/llmkube-gate` (override
+  rewriting, checks that every Go file the branch adds carries the copyright
+  year `hack/boilerplate.go.txt` does, runs `go vet`, then runs `make lint-all`
+  and the full test suite in parallel. Logs land in `${TMPDIR:-/tmp}/llmkube-gate` (override
   `GATE_DIR`); it prints one summary line per step and exits nonzero if any
   step failed. One command covers the fmt/vet/lint/test pre-commit gate and
   the lint-all pre-push check. A rerun with no edits reports `(cached)` for
@@ -165,14 +174,17 @@ A change is not done until all of these hold.
   separately when `api/v1alpha1` types change. If
   staticcheck panics under your Go toolchain, set
   `LINT_GOTOOLCHAIN=<version>` (for example go1.27.3).
+  The copyright step diffs against `BASE_REF` (default `upstream/main`,
+  override with `BASE_REF=origin/main` in a fork clone, the same knob
+  `make test-affected` uses), so an unresolvable base fails the gate.
 - Full suite (what CI and the Foreman gate run): `make test`, random seed and
   coverage profile, unchanged.
 - Editing `scripts/gate.sh`, `scripts/test-affected.sh`,
   `scripts/check-ginkgo-seed_test.sh`, `scripts/check-envtest-sharing_test.sh`
   or `cmd/affected-packages` requires `make test-scripts`: go test never runs
   the shell regression suites. CI runs the same target.
-- The gate short-circuits: a failed regen, drift, fmt or vet step skips
-  lint and tests (marked SKIPPED in the summary), so that round gets no
+- The gate short-circuits: a failed regen, drift, fmt or copyright step skips
+  vet, lint and tests (marked SKIPPED in the summary), so that round gets no
   lint or test signal until the failure is fixed and the gate reruns.
   After an `api/v1alpha1` type change, the first `make gate` fails the drift
   step by design: regeneration rewrote committed files. Commit the

@@ -53,7 +53,7 @@ $GATE_OUT"
 # A lint failure must fail the gate even when tests pass, and both steps must
 # have run: neither masks the other.
 repo=$(new_repo)
-run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_FMT_CMD=true GATE_VET_CMD=true \
+run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_FMT_CMD=true GATE_COPYRIGHT_CMD=true GATE_VET_CMD=true \
 	GATE_LINT_CMD=false GATE_TEST_CMD=true
 expect_rc 1 "lint failure must fail the gate when tests pass"
 expect_line 'gate: lint +FAIL' "summary must report the lint failure"
@@ -61,24 +61,24 @@ expect_line 'gate: test +PASS' "summary must report the passing tests"
 
 # The reverse: a test failure with passing lint.
 repo=$(new_repo)
-run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_FMT_CMD=true GATE_VET_CMD=true \
+run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_FMT_CMD=true GATE_COPYRIGHT_CMD=true GATE_VET_CMD=true \
 	GATE_LINT_CMD=true GATE_TEST_CMD=false
 expect_rc 1 "test failure must fail the gate when lint passes"
 expect_line 'gate: lint +PASS' "summary must report the passing lint"
 expect_line 'gate: test +FAIL' "summary must report the test failure"
 
-# Everything green: exit zero, all six steps PASS.
+# Everything green: exit zero, all seven steps PASS.
 repo=$(new_repo)
-run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_FMT_CMD=true GATE_VET_CMD=true \
+run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_FMT_CMD=true GATE_COPYRIGHT_CMD=true GATE_VET_CMD=true \
 	GATE_LINT_CMD=true GATE_TEST_CMD=true
 expect_rc 0 "a fully passing gate must exit zero"
-for s in regen drift fmt vet lint test; do
+for s in regen drift fmt copyright vet lint test; do
 	expect_line "gate: $s +PASS" "summary must report $s PASS"
 done
 
 # A sequential failure must skip the parallel phase, not run it.
 repo=$(new_repo)
-run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_FMT_CMD=true GATE_VET_CMD=false \
+run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_FMT_CMD=true GATE_COPYRIGHT_CMD=true GATE_VET_CMD=false \
 	GATE_LINT_CMD=true GATE_TEST_CMD=true
 expect_rc 1 "vet failure must fail the gate"
 expect_line 'gate: vet +FAIL' "summary must report the vet failure"
@@ -88,7 +88,7 @@ expect_line 'gate: test +SKIPPED' "vet failure must skip the test step"
 
 # A fmt failure must short-circuit the parallel phase the same way.
 repo=$(new_repo)
-run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_FMT_CMD=false GATE_VET_CMD=true \
+run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_FMT_CMD=false GATE_COPYRIGHT_CMD=true GATE_VET_CMD=true \
 	GATE_LINT_CMD=true GATE_TEST_CMD=true
 expect_rc 1 "fmt failure must fail the gate"
 expect_line 'gate: fmt +FAIL' "summary must report the fmt failure"
@@ -97,7 +97,7 @@ expect_line 'gate: test +SKIPPED' "fmt failure must skip the test step"
 
 # A regen failure must skip drift and everything after it.
 repo=$(new_repo)
-run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=false GATE_FMT_CMD=true GATE_VET_CMD=true \
+run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=false GATE_FMT_CMD=true GATE_COPYRIGHT_CMD=true GATE_VET_CMD=true \
 	GATE_LINT_CMD=true GATE_TEST_CMD=true
 expect_rc 1 "regen failure must fail the gate"
 expect_line 'gate: regen +FAIL' "summary must report the regen failure"
@@ -108,7 +108,7 @@ expect_line 'gate: drift +SKIPPED' "regen failure must skip the drift step"
 # unformatted file and name it, without rewriting anything.
 repo=$(new_repo)
 printf 'package t\n\nfunc F( ) {}\n' >"$repo/unfmt.go"
-run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_VET_CMD=true \
+run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_COPYRIGHT_CMD=true GATE_VET_CMD=true \
 	GATE_LINT_CMD=true GATE_TEST_CMD=true
 expect_rc 1 "the built-in fmt check must fail on an unformatted file"
 expect_line 'gate: fmt +FAIL' "summary must report the fmt failure"
@@ -119,16 +119,30 @@ $(cat "$GATE_LOG_DIR/fmt.log")"
 # The formatted counterpart passes.
 repo=$(new_repo)
 printf 'package t\n\nfunc F() {}\n' >"$repo/fmt.go"
-run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_VET_CMD=true \
+run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_COPYRIGHT_CMD=true GATE_VET_CMD=true \
 	GATE_LINT_CMD=true GATE_TEST_CMD=true
 expect_rc 0 "the built-in fmt check must pass a formatted file"
 expect_line 'gate: fmt +PASS' "summary must report the fmt pass"
+
+# A copyright failure must sit in the gate's sequential chain before vet: vet
+# is skipped, so a bad header never pays for a vet, lint and test round first.
+# GATE_VET_CMD=true matters here: if vet ran, it would pass and this case would
+# not tell a vet-before-copyright order from a copyright-before-vet one.
+repo=$(new_repo)
+run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_FMT_CMD=true GATE_COPYRIGHT_CMD=false \
+	GATE_VET_CMD=true GATE_LINT_CMD=true GATE_TEST_CMD=true
+expect_rc 1 "a copyright failure must fail the gate"
+expect_line 'gate: copyright +FAIL' "summary must report the copyright failure"
+expect_line 'gate: vet +SKIPPED' "a copyright failure must skip the vet step"
+expect_line 'gate: lint +SKIPPED' "a copyright failure must skip the lint step"
+expect_line 'gate: test +SKIPPED' "a copyright failure must skip the test step"
+[ ! -e "$GATE_LOG_DIR/vet.log" ] || fail "the skipped vet step must not write a log"
 
 # Regeneration drift: a stub regen that creates a file must fail the gate and
 # name the file.
 repo=$(new_repo)
 run_gate GATE_ROOT="$repo" GATE_REGEN_CMD='touch new-gen.yaml' GATE_FMT_CMD=true \
-	GATE_VET_CMD=true GATE_LINT_CMD=true GATE_TEST_CMD=true
+	GATE_COPYRIGHT_CMD=true GATE_VET_CMD=true GATE_LINT_CMD=true GATE_TEST_CMD=true
 expect_rc 1 "regeneration drift must fail the gate"
 expect_line 'gate: drift +FAIL' "summary must report the drift failure"
 grep -q 'new-gen.yaml' "$GATE_LOG_DIR/drift.log" || fail "drift log must name the drifted file
@@ -139,7 +153,7 @@ expect_line 'gate: test +SKIPPED' "drift must skip the test step"
 # A pre-existing untracked file is not drift.
 repo=$(new_repo)
 echo gen >"$repo/gen.yaml"
-run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_FMT_CMD=true GATE_VET_CMD=true \
+run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_FMT_CMD=true GATE_COPYRIGHT_CMD=true GATE_VET_CMD=true \
 	GATE_LINT_CMD=true GATE_TEST_CMD=true
 expect_rc 0 "a pre-existing untracked file is not drift"
 
@@ -151,14 +165,14 @@ git -C "$repo" add gen.yaml
 git -C "$repo" commit -q --no-verify -m gen
 echo v2 >"$repo/gen.yaml"
 run_gate GATE_ROOT="$repo" GATE_REGEN_CMD='echo v2 >gen.yaml' GATE_FMT_CMD=true \
-	GATE_VET_CMD=true GATE_LINT_CMD=true GATE_TEST_CMD=true
+	GATE_COPYRIGHT_CMD=true GATE_VET_CMD=true GATE_LINT_CMD=true GATE_TEST_CMD=true
 expect_rc 0 "an already-modified tracked file that regeneration rewrites identically is not drift"
 
 # Lint and tests must overlap in time: the stubs record their start and end
 # epochs, and each step must still be running when the other finishes.
 repo=$(new_repo)
 stamp="$(mktemp -d)"
-run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_FMT_CMD=true GATE_VET_CMD=true \
+run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_FMT_CMD=true GATE_COPYRIGHT_CMD=true GATE_VET_CMD=true \
 	GATE_LINT_CMD='date +%s >"$STAMP/lint_start"; sleep 3; date +%s >"$STAMP/lint_end"' \
 	GATE_TEST_CMD='date +%s >"$STAMP/test_start"; sleep 3; date +%s >"$STAMP/test_end"' \
 	STAMP="$stamp"
@@ -171,7 +185,7 @@ lint_start=$(cat "$stamp/lint_start")
 [ "$test_end" -gt "$lint_start" ] || fail "lint and test did not run in parallel (test ended $test_end, lint started $lint_start)"
 
 # Every executed step logs under GATE_DIR and its summary line names the log.
-for s in regen drift fmt vet lint test; do
+for s in regen drift fmt copyright vet lint test; do
 	expect_line "gate: $s +PASS" "summary must report $s"
 	printf '%s\n' "$GATE_OUT" | grep -qF "log=$GATE_LOG_DIR/$s.log" || fail "summary must name the $s log"
 	[ -e "$GATE_LOG_DIR/$s.log" ] || fail "$s step must write its log file"
@@ -179,15 +193,22 @@ done
 
 # The gate pins the default seed and honors an override.
 repo=$(new_repo)
-run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_FMT_CMD=true GATE_VET_CMD=true \
+run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_FMT_CMD=true GATE_COPYRIGHT_CMD=true GATE_VET_CMD=true \
 	GATE_LINT_CMD=true GATE_TEST_CMD='echo seed=$GINKGO_SEED'
 expect_line 'seed=4242' "the gate must pin the default seed"
-run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_FMT_CMD=true GATE_VET_CMD=true \
+run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_FMT_CMD=true GATE_COPYRIGHT_CMD=true GATE_VET_CMD=true \
 	GATE_LINT_CMD=true GATE_TEST_CMD='echo seed=$GINKGO_SEED' GINKGO_SEED=7
 expect_line 'seed=7' "the gate must honor the caller's seed"
 
 # The Makefile must wire both scripts in.
 make -C "$ROOT" -n gate | grep -q 'scripts/gate.sh' || fail "make gate must run scripts/gate.sh"
 make -C "$ROOT" -n test-affected | grep -q 'scripts/test-affected.sh' || fail "make test-affected must run scripts/test-affected.sh"
+
+# The gate's default copyright step must be the Make target, and that target
+# must check against BASE_REF rather than a hardcoded remote.
+grep -q 'else make check-copyright; fi' "$GATE" || fail "the gate's default copyright step must be make check-copyright"
+make -C "$ROOT" -n check-copyright BASE_REF=origin/main | grep -q -- '-base "origin/main"' ||
+	fail "make check-copyright must pass BASE_REF through to the check
+$(make -C "$ROOT" -n check-copyright BASE_REF=origin/main)"
 
 echo "PASS: gate script contract holds"

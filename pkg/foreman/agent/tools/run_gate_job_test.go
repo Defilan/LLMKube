@@ -1,5 +1,5 @@
 /*
-Copyright 2025.
+Copyright 2026.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -494,6 +494,76 @@ func renderGateArgsForTest(t *testing.T, in map[string]any) string {
 		t.Fatalf("renderGateJob: %v", err)
 	}
 	return strings.Join(job.Spec.Template.Spec.Containers[0].Args, "\n")
+}
+
+// TestGateJobCopyrightCheckRunsAfterBaseResolution pins the ordering the
+// copyright check depends on. The clone is `--depth 1` of the coder branch,
+// so no base ref exists while the `make <check>` loop runs; a copyright check
+// placed there with BASE_REF=origin/<base> fails every gate Job run instead of
+// checking anything. It must therefore run after the merge base is resolved,
+// and take that resolved value.
+func TestGateJobCopyrightCheckRunsAfterBaseResolution(t *testing.T) {
+	args := renderGateArgsForTest(t, map[string]any{
+		"repo":        "defilantech/LLMKube",
+		"branch":      "foreman/issue-2298",
+		"baseBranch":  "main",
+		"upstreamURL": "https://github.com/defilantech/llmkube.git",
+	})
+
+	checkAt := strings.Index(args, "make check-copyright")
+	if checkAt < 0 {
+		t.Fatalf("the gate Job must run the copyright check:\n%s", args)
+	}
+	// The base-resolution block assigns MB from the merge base; the check has
+	// to come after it, and must consume that resolved value.
+	resolveAt := strings.Index(args, "MB=$(git merge-base HEAD")
+	if resolveAt < 0 {
+		t.Fatalf("the gate Job template no longer resolves a merge base; the ordering this test pins has moved:\n%s", args)
+	}
+	if checkAt < resolveAt {
+		t.Errorf("the copyright check runs at byte %d, before base resolution at %d: the shallow clone has no base ref there",
+			checkAt, resolveAt)
+	}
+	// The checks loop runs before base resolution, so the target must not be
+	// in DefaultGateChecks, or the loop would run it there anyway.
+	for _, c := range DefaultGateChecks {
+		if c == "check-copyright" {
+			t.Errorf("check-copyright must not be in DefaultGateChecks: the checks loop runs before base resolution")
+		}
+	}
+}
+
+// TestGateJobCopyrightCheckProbesForMergeBase pins the guard the freeform path
+// needs. There MB is a base tip rather than a merge base, and a tree diff
+// against a tip cannot answer "what did this branch add": it also lists files
+// the base deleted, and every narrowed variant of it reported either the wrong
+// files or none. So the Job probes before it runs, and skips loudly when the
+// probe fails.
+func TestGateJobCopyrightCheckProbesForMergeBase(t *testing.T) {
+	args := renderGateArgsForTest(t, map[string]any{
+		"repo":       "defilantech/LLMKube",
+		"branch":     "foreman/issue-2298",
+		"baseBranch": "main",
+	})
+
+	probeAt := strings.Index(args, `CMB=$(git merge-base HEAD "$MB"`)
+	if probeAt < 0 {
+		t.Fatalf("the Job must probe $MB for a merge base before running the check:\n%s", args)
+	}
+	skipAt := strings.Index(args, "copyright header check skipped, $MB is not a merge base")
+	if skipAt < 0 {
+		t.Fatalf("the Job must skip loudly when $MB is not a merge base:\n%s", args)
+	}
+	checkAt := strings.Index(args, "make check-copyright")
+	if checkAt < 0 {
+		t.Fatalf("the gate Job must still run the copyright check on the upstream path:\n%s", args)
+	}
+	if !(probeAt < skipAt && skipAt < checkAt) {
+		t.Errorf("order must be probe (%d), skip (%d), run (%d)", probeAt, skipAt, checkAt)
+	}
+	if !strings.Contains(args[checkAt:], `BASE_REF="$CMB"`) {
+		t.Errorf("the check must run against the probed merge base, not $MB:\n%s", args[checkAt:])
+	}
 }
 
 // TestGateJobBiteCheckUsesUpstreamMergeBase asserts that when upstreamURL is
@@ -1078,12 +1148,16 @@ func TestRenderGateJob_BaseBranchEnv(t *testing.T) {
 			if err != nil {
 				t.Fatalf("renderGateJob: %v", err)
 			}
-			var got string
-			found := false
+			var got, gotRef string
+			found, foundRef := false, false
 			for _, e := range job.Spec.Template.Spec.Containers[0].Env {
 				if e.Name == "BASE_BRANCH" {
 					got = e.Value
 					found = true
+				}
+				if e.Name == "BASE_REF" {
+					gotRef = e.Value
+					foundRef = true
 				}
 			}
 			if !found {
@@ -1091,6 +1165,12 @@ func TestRenderGateJob_BaseBranchEnv(t *testing.T) {
 			}
 			if got != tc.want {
 				t.Errorf("BASE_BRANCH = %q, want %q", got, tc.want)
+			}
+			// check-copyright needs the resolved merge base, so it is run after
+			// base resolution rather than through the checks loop; no env var
+			// carries it.
+			if foundRef {
+				t.Errorf("BASE_REF env var = %q; the copyright check takes its base from the resolved merge base", gotRef)
 			}
 		})
 	}
