@@ -59,6 +59,23 @@ The controller compiles `ModelRouter.spec` into a JSON config, writes it to a `C
 
 Since every spec change re-rolls the pods, set `spec.proxy.revisionHistoryLimit` to cap how many old `ReplicaSet`s are kept (`0` keeps none); unset keeps 3. `InferenceService` has the same knob at `spec.revisionHistoryLimit`.
 
+### Draining in-flight streams on a rollout
+
+A proxy replica keeps serving the requests it already holds after `SIGTERM`, for its `--shutdown-timeout`: 30s by default. A streamed completion can run far longer, so a roll cuts any stream still open at that deadline. `spec.proxy.drainTimeout` raises it:
+
+```yaml
+spec:
+  proxy:
+    replicas: 2
+    drainTimeout: 600s
+```
+
+It sets the proxy's `--shutdown-timeout` and the pod's `terminationGracePeriodSeconds`, which is the drain plus a fixed 5s margin so the kubelet does not SIGKILL before the drain ends. The margin covers process exit only: this pod has no `preStop` hook, and the proxy bounds its own shutdown by the drain. Values run from `1s` to `1h`; a fractional value rounds the grace period up to the next whole second.
+
+A replica that drains stays `Terminating` until its drain ends, so a roll waits up to `drainTimeout` per replica before that pod goes. `replicas: 2` keeps new requests flowing on the other replica while one drains, but it does nothing for the requests already streaming on the replica that rolls, which is what this field bounds. A stream longer than `drainTimeout` still ends at the deadline.
+
+Unset keeps the 30s default and renders nothing on the pod template, so upgrading the operator does not roll existing proxies. Setting or changing it does roll them once.
+
 ### Exposing the proxy and sandboxing its pod
 
 These `spec.endpoint` and `spec.proxy` options apply to `dataPlane: Proxy`, the default.

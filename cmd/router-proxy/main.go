@@ -60,8 +60,7 @@ func main() {
 			"resolve to the same address as --listen.")
 	logFormat := flag.String("log-format", "json",
 		"Structured log format: json or text.")
-	shutdownTimeout := flag.Duration("shutdown-timeout", 30*time.Second,
-		"How long to wait for in-flight requests on SIGTERM before forcing a close.")
+	shutdownTimeout := registerShutdownTimeout(flag.CommandLine)
 	quarantineDuration := flag.Duration("quarantine-duration", 15*time.Second,
 		"How long a backend stays in the quarantined (skip) state after a "+
 			"5xx / network error (two in a row for a pod of an endpoint "+
@@ -288,6 +287,20 @@ func newLogger(format string) *slog.Logger {
 	default:
 		return slog.New(slog.NewJSONHandler(os.Stdout, opts))
 	}
+}
+
+// defaultShutdownTimeout is the drain window a proxy uses when its command
+// line carries no --shutdown-timeout, which is what the controller renders
+// for a ModelRouter that sets no spec.proxy.drainTimeout.
+const defaultShutdownTimeout = 30 * time.Second
+
+// registerShutdownTimeout registers --shutdown-timeout on fs and returns the
+// value the flag will parse into. Extracted from main so a test can assert the
+// flag's name, type and default on the real registration, which is the half of
+// the controller's rendered arg this binary owns.
+func registerShutdownTimeout(fs *flag.FlagSet) *time.Duration {
+	return fs.Duration("shutdown-timeout", defaultShutdownTimeout,
+		"How long to wait for in-flight requests on SIGTERM before forcing a close.")
 }
 
 // newEndpointWatcher builds the EndpointSlice watcher when the config has an
