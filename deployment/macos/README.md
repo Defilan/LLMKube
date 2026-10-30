@@ -71,6 +71,13 @@ codesign -dv --verbose=4 llmkube-metal-agent   # Identifier=dev.llmkube.metal-ag
 spctl --assess --type install -vv llmkube-metal-agent   # accepted, source=Notarized Developer ID
 ```
 
+System Settings > General > Login Items & Extensions lists a Developer ID
+signed agent as "Defilan Technologies LLC", the name on the signing
+certificate, because the agent is not part of an app. The troubleshooting
+section of the
+[macOS Metal guide](https://llmkube.com/docs/guides/macos-metal#troubleshooting)
+shows how to confirm that row is LLMKube's.
+
 A bare executable cannot carry a stapled notarization ticket, so Gatekeeper
 checks it online the first time a downloaded copy runs. A release built
 without the secrets is ad-hoc signed: it runs once copied into place, but if

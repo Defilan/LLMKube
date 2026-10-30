@@ -1041,6 +1041,28 @@ wrong, or, if the model really is that large, raise
 "`--max-download-size` flag (download cap)" in
 [`deployment/macos/README.md`](https://github.com/defilantech/LLMKube/blob/main/deployment/macos/README.md#--max-download-size-flag-download-cap).
 
+**Login Items lists the agent as "Defilan Technologies LLC"**
+System Settings > General > Login Items & Extensions lists a release
+agent under the name of the company that signs LLMKube's releases, not
+as "LLMKube". macOS names a background item after the app it belongs
+to. The agent is a plain executable that launchd starts, with no app
+around it, so macOS uses the developer name on its Developer ID
+certificate instead, and every agent the project signs shares that
+one row. An agent you built yourself (`make install-metal-agent`) is
+not Developer ID signed and shows under its executable name. After an
+upgrade from a build like that, the old row can stay under that name
+until macOS refreshes its records. Leave the toggle on: turning it off
+stops macOS from starting the agent. To confirm the row is LLMKube's:
+
+```bash
+codesign -dv --verbose=4 "$(launchctl print gui/$(id -u)/com.llmkube.metal-agent | sed -n 's/^[[:space:]]*program = //p')" 2>&1 | grep -E '^(Identifier|Authority|TeamIdentifier)='
+# Identifier=dev.llmkube.metal-agent
+# Authority=Developer ID Application: Defilan Technologies LLC (SSJ3D786N9)
+# Authority=Developer ID Certification Authority
+# Authority=Apple Root CA
+# TeamIdentifier=SSJ3D786N9
+```
+
 **macOS firewall prompt on first run**
 The Metal Agent listens on `127.0.0.1:9090` for its own
 health/metrics and serves its TLS ingress on `--ingress-port`
