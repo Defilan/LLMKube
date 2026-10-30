@@ -144,6 +144,9 @@ func (r *ModelPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// baseline; taken after the mutation it would diff the idle clock away, so
 	// the clock would never persist and the reclaim would never fire.
 	statusBefore := pool.DeepCopy()
+	// After the baseline, before the reclaim logic reads the resident: a
+	// departed resident must not be named, and must not hold a reclaim.
+	clearDepartedResident(pool, members)
 
 	// Reclaim policy: once the resident non-default member has been idle for
 	// spec.reclaimAfter, return the slot to spec.default. This overrides the
@@ -304,6 +307,13 @@ func resolveSlotOwner(pool *inferencev1alpha1.ModelPool, members map[string]*inf
 	resident := pool.Status.ResidentMember
 	pending := pool.Status.PendingMember
 
+	// A resident that left spec.members takes its residency with it: the pool
+	// no longer resolves it, so members[resident] would be nil downstream, and
+	// the slot resolves the way a cold pool resolves it (#2309).
+	if _, ok := members[resident]; !ok && resident != "" {
+		resident = ""
+	}
+
 	// requested = members currently scaled up, in declaration order.
 	var requested []string
 	for _, m := range pool.Spec.Members {
@@ -373,6 +383,20 @@ func resolveSlotOwner(pool *inferencev1alpha1.ModelPool, members map[string]*inf
 		}
 	}
 	return resident
+}
+
+// clearDepartedResident drops a resident that left spec.members. Status is the
+// only record of the old owner, and the pool can no longer drain or scale a
+// member it does not list, so status stops naming it (#2309). The caller must
+// already have captured its patch baseline: a baseline taken after this call
+// diffs the clear away.
+func clearDepartedResident(pool *inferencev1alpha1.ModelPool, members map[string]*inferencev1alpha1.InferenceService) {
+	if pool.Status.ResidentMember == "" {
+		return
+	}
+	if _, ok := members[pool.Status.ResidentMember]; !ok {
+		pool.Status.ResidentMember = ""
+	}
 }
 
 // applyReclaimOwner implements the "reclaim" swap policy. When a non-default

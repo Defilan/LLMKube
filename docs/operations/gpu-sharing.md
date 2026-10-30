@@ -240,6 +240,70 @@ operator preserves the live value, so the pool's `replicas: 0` never scales the
 member down and the swap waits for Pods that do not go away. LLMKube does not
 reject this combination yet.
 
+### Removing a member: stop it yourself
+
+Removing a member from `spec.members` takes effect on the next reconcile. If the
+member that left was the resident, status stops naming it in that same pass, and
+the slot resolves the way a cold pool resolves it. A swap already in flight
+continues first. Otherwise, when no remaining member is scaled up, `spec.default`
+warms if it names one, and the pool stays cold if it does not. When members are
+scaled up, `spec.default` takes the slot if it is one of them, else the first
+scaled-up member in declaration order.
+
+The pool does not stop the departing member, and it does not wait for its Pods.
+Every replica write it makes targets a current member, so once the member is no
+longer listed the pool leaves its `spec.replicas` alone. That cuts both ways for
+a resident:
+
+- **Scaling a listed resident to zero does not stop it.** The pool owns its
+  members' replicas and scales its resident back up on the next reconcile.
+- **Scaling it to zero after the removal does stop it.** Nothing writes to a
+  member the pool no longer lists.
+
+There are two safe orders, and the GPU mode decides which one to use.
+
+**Remove it, then stop it.** The next owner is picked in the same pass that drops
+the resident, so whenever `spec.default` is set or another member is scaled up,
+that owner starts while the departing member is still running:
+
+```sh
+# 1. Remove the member from spec.members in your manifest and apply it.
+# 2. Stop the member the pool no longer manages.
+kubectl scale isvc coder-large --replicas=0
+```
+
+**Delete it, then remove it.** If the member is not `spec.default`, delete its
+`InferenceService` while it is still listed, wait for its Pod to exit, then
+remove it from `spec.members`. While the reference does not resolve the pool sits
+`Degraded` with `MembersValid=False` / `MissingMembers`, makes no replica changes,
+and rechecks every few seconds, so nothing new starts until the departing Pod is
+gone. Deleting the `InferenceService` garbage-collects its Deployment and Pods.
+
+The overlap in the first order is safe only on discrete GPUs under `exclusive`
+(whole devices) or `partitioned` (MIG). There the incoming Pod either waits
+`Pending` for the device the departing Pod holds, so the pool looks stuck rather
+than oversubscribed, or lands on a free one. Use the second order everywhere
+else:
+
+- **`shared` (time-sliced).** Both Pods run and share device memory, which is
+  the co-residence the pool exists to prevent.
+- **Unified-memory nodes** (an AMD APU, a GB10), in any mode. The device plugin
+  frees the GPU when the departing Pod starts terminating, before its process
+  has released the memory, so the incoming Pod can start in that window and the
+  two briefly co-reside. The pool closes this window for its own members by
+  waiting until their Pods are gone, and the second order gets the same wait
+  from you.
+
+Two edits belong in the same apply:
+
+- **`spec.default`.** If it names the departing member, repoint or clear it.
+  Reclaiming to a default that is not a member stops, and a cold pool has no
+  default to warm. On-demand activation still works, because the pool falls back
+  to the first scaled-up member.
+- **The `ModelRouter` rule.** A backend counts as pooled only while the pool
+  lists it. Until the router's config catches up it can still scale the member
+  to one, and once it is gone from the pool nothing scales it back down.
+
 ### Sticky is the default policy, and it means what it says
 
 `swapPolicy: sticky` (the default) keeps the incumbent until a *different* member
