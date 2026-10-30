@@ -240,6 +240,55 @@ operator preserves the live value, so the pool's `replicas: 0` never scales the
 member down and the swap waits for Pods that do not go away. LLMKube does not
 reject this combination yet.
 
+### Removing a member: stop it yourself
+
+Removing a member from `spec.members` takes effect on the next reconcile. If the
+member that left was the resident, status stops naming it in that same pass, and
+the slot resolves the way a cold pool resolves it: a swap already in flight, then
+`spec.default` when it is among the scaled-up members, then the first scaled-up
+member, then nothing.
+
+The pool does not stop the departing member, and it does not wait for its Pods.
+Every replica write it makes targets a current member, so once the member is
+listed the pool leaves its `spec.replicas` alone. That cuts both ways for a
+resident:
+
+- **Scaling a listed resident to zero does not stop it.** The pool owns its
+  members' replicas and scales its resident back up on the next reconcile.
+- **Scaling it to zero after the removal does stop it.** Nothing writes to a
+  member the pool no longer lists.
+
+So remove the member first, then stop it:
+
+```sh
+# 1. Remove the member from spec.members in your manifest and apply it.
+# 2. Stop the member it no longer manages.
+kubectl scale isvc coder-large --replicas=0
+```
+
+The other order works too if the member is not `spec.default`: delete its
+`InferenceService` while it is still listed, wait for its Pod to exit, then
+remove it from `spec.members`. While the reference does not resolve the pool sits
+`Degraded` with `MembersValid=False` / `MissingMembers`, makes no replica changes,
+and rechecks every few seconds. Deleting the `InferenceService` garbage-collects
+its Deployment and Pods.
+
+What happens to the GPU while both are up depends on the mode. Under `exclusive`
+(one whole device per slot) the incoming Pod stays `Pending` until the departing
+Pod releases the device, so the pool looks stuck rather than oversubscribed.
+Under `shared` (time-sliced) both Pods run and share device memory, which is the
+co-residence the pool exists to prevent.
+
+Two edits belong in the same apply:
+
+- **`spec.default`.** If it names the departing member, repoint or clear it.
+  Reclaiming to a default that is not a member stops, and a cold pool has no
+  default to warm. On-demand activation still works, because the pool falls back
+  to the first scaled-up member.
+- **The `ModelRouter` rule.** A backend counts as pooled only while the pool
+  lists it. Until the router's config catches up it can still scale the member
+  to one, and once it is gone from the pool nothing scales it back down.
+
 ### Sticky is the default policy, and it means what it says
 
 `swapPolicy: sticky` (the default) keeps the incumbent until a *different* member
