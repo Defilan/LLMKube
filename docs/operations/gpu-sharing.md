@@ -279,13 +279,20 @@ remove it from `spec.members`. While the reference does not resolve the pool sit
 and rechecks every few seconds, so nothing new starts until the departing Pod is
 gone. Deleting the `InferenceService` garbage-collects its Deployment and Pods.
 
-The overlap in the first order only matters when the two Pods can share device
-memory. Under `exclusive` (whole devices) and `partitioned` (MIG) they cannot:
-the incoming Pod either waits `Pending` for the device the departing Pod holds,
-so the pool looks stuck rather than oversubscribed, or lands on a free one.
-Either order is safe there. Under `shared` (time-sliced) both Pods run and share
-device memory, which is the co-residence the pool exists to prevent, so use the
-second order.
+The overlap in the first order is safe only on discrete GPUs under `exclusive`
+(whole devices) or `partitioned` (MIG). There the incoming Pod either waits
+`Pending` for the device the departing Pod holds, so the pool looks stuck rather
+than oversubscribed, or lands on a free one. Use the second order everywhere
+else:
+
+- **`shared` (time-sliced).** Both Pods run and share device memory, which is
+  the co-residence the pool exists to prevent.
+- **Unified-memory nodes** (an AMD APU, a GB10), in any mode. The device plugin
+  frees the GPU when the departing Pod starts terminating, before its process
+  has released the memory, so the incoming Pod can start in that window and the
+  two briefly co-reside. The pool closes this window for its own members by
+  waiting until their Pods are gone, and the second order gets the same wait
+  from you.
 
 Two edits belong in the same apply:
 
