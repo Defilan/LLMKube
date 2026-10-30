@@ -108,12 +108,87 @@ func TestResolveSlotOwner(t *testing.T) {
 			members: map[string]int32{"coder": 1, "judge": 0},
 			want:    "coder",
 		},
+		{
+			name:    "resident left the pool, nothing scaled, no default stays cold",
+			pool:    mpoolFor("coder", "", "", "judge"),
+			members: map[string]int32{"judge": 0},
+			want:    "",
+		},
+		{
+			name:    "resident left the pool, a fresh activation takes the slot",
+			pool:    mpoolFor("coder", "", "", "judge", "gemma"),
+			members: map[string]int32{"judge": 1, "gemma": 0},
+			want:    "judge",
+		},
+		{
+			name:    "resident left the pool, spec.default warms",
+			pool:    mpoolFor("coder", "", "judge", "judge"),
+			members: map[string]int32{"judge": 0},
+			want:    "judge",
+		},
+		{
+			name:    "resident left the pool, the pending swap continues first",
+			pool:    mpoolFor("coder", "judge", "", "judge", "gemma"),
+			members: map[string]int32{"judge": 0, "gemma": 1},
+			want:    "judge",
+		},
+		{
+			name:    "resident left the pool and spec.default names it, stays cold",
+			pool:    mpoolFor("coder", "", "coder", "judge"),
+			members: map[string]int32{"judge": 0},
+			want:    "",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := resolveSlotOwner(tc.pool, membersMap(tc.members))
+			members := membersMap(tc.members)
+			got := resolveSlotOwner(tc.pool, members)
 			if got != tc.want {
 				t.Errorf("resolveSlotOwner = %q, want %q", got, tc.want)
+			}
+			// Reconcile dereferences members[owner] without a check, so an
+			// owner that is not a resolved member panics the pool (#2309).
+			if _, ok := members[got]; got != "" && !ok {
+				t.Fatalf("resolveSlotOwner = %q, which is not a resolved member: Reconcile would dereference a nil entry", got)
+			}
+		})
+	}
+}
+
+// A resident that left spec.members is dropped from status, so the next owner
+// can load and the pool stops naming a member it no longer tracks (#2309).
+func TestClearDepartedResident(t *testing.T) {
+	tests := []struct {
+		name     string
+		resident string
+		members  map[string]int32
+		want     string
+	}{
+		{
+			name:     "resident no longer a member is cleared",
+			resident: "coder",
+			members:  map[string]int32{"judge": 0},
+			want:     "",
+		},
+		{
+			name:     "cold pool stays empty",
+			resident: "",
+			members:  map[string]int32{"judge": 0},
+			want:     "",
+		},
+		{
+			name:     "resident still a member is kept",
+			resident: "judge",
+			members:  map[string]int32{"judge": 1},
+			want:     "judge",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := mpoolFor(tc.resident, "", "", "judge")
+			clearDepartedResident(pool, membersMap(tc.members))
+			if got := pool.Status.ResidentMember; got != tc.want {
+				t.Errorf("ResidentMember = %q, want %q", got, tc.want)
 			}
 		})
 	}
