@@ -1,0 +1,142 @@
+suite: metal-agent write policy
+# llmkube-metal-* ServiceAccounts may write only the Services, EndpointSlices
+# and Endpoints the agent manages (#2081). The policy needs a cluster that
+# serves ValidatingAdmissionPolicy, so cases that expect it declare that API
+# in capabilities.apiVersions, as a real install gets it from discovery. The
+# CEL itself is pinned to deployment/macos/metal-agent-write-policy.yaml by
+# make check-metal-agent-rbac and exercised against a real API server in
+# pkg/agent/write_policy_envtest_test.go.
+templates:
+  - metal-agent-write-policy.yaml
+
+tests:
+  - it: renders the policy and a Deny binding by default
+    capabilities:
+      apiVersions:
+        - admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy
+    release:
+      name: rel
+      namespace: llmkube-system
+    asserts:
+      - hasDocuments:
+          count: 2
+      - isKind:
+          of: ValidatingAdmissionPolicy
+        documentIndex: 0
+      - equal:
+          path: metadata.name
+          value: rel-llmkube-metal-agent-writes
+        documentIndex: 0
+      - equal:
+          path: spec.failurePolicy
+          value: Fail
+        documentIndex: 0
+      - equal:
+          path: spec.matchConstraints.resourceRules
+          value:
+            - apiGroups: [""]
+              apiVersions: ["v1"]
+              operations: ["CREATE", "UPDATE", "DELETE"]
+              resources: ["services", "endpoints"]
+            - apiGroups: ["discovery.k8s.io"]
+              apiVersions: ["v1"]
+              operations: ["CREATE", "UPDATE", "DELETE"]
+              resources: ["endpointslices"]
+        documentIndex: 0
+      - equal:
+          path: spec.matchConditions[0].name
+          value: metal-agent-identity
+        documentIndex: 0
+      - equal:
+          path: spec.matchConditions[0].expression
+          value: request.userInfo.username.matches('^system:serviceaccount:[a-z0-9]([-a-z0-9]*[a-z0-9])?:llmkube-metal-[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
+        documentIndex: 0
+      - lengthEqual:
+          path: spec.validations
+          count: 2
+        documentIndex: 0
+      - matchRegex:
+          path: spec.validations[0].expression
+          pattern: ^request.operation == 'DELETE' \|\|
+        documentIndex: 0
+      - matchRegex:
+          path: spec.validations[1].expression
+          pattern: ^request.operation == 'CREATE' \|\|
+        documentIndex: 0
+      - isKind:
+          of: ValidatingAdmissionPolicyBinding
+        documentIndex: 1
+      - equal:
+          path: spec.policyName
+          value: rel-llmkube-metal-agent-writes
+        documentIndex: 1
+      - equal:
+          path: spec.validationActions
+          value: [Deny]
+        documentIndex: 1
+      # All namespaces: Macs join any namespace.
+      - notExists:
+          path: spec.matchResources
+        documentIndex: 1
+
+  # A release whose name starts with llmkube-metal- gives the controller a
+  # ServiceAccount the identity condition matches; without the exclusion the
+  # controller's own Service writes would be held to the agent's rule.
+  - it: excludes the controller's own ServiceAccount
+    capabilities:
+      apiVersions:
+        - admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy
+    release:
+      name: llmkube-metal-prod
+      namespace: ops
+    asserts:
+      - lengthEqual:
+          path: spec.matchConditions
+          count: 2
+        documentIndex: 0
+      - equal:
+          path: spec.matchConditions[1]
+          value:
+            name: not-llmkube-controller
+            expression: request.userInfo.username != 'system:serviceaccount:ops:llmkube-metal-prod-controller-manager'
+        documentIndex: 0
+
+  - it: excludes an overridden controller ServiceAccount
+    capabilities:
+      apiVersions:
+        - admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy
+    release:
+      name: rel
+      namespace: ops
+    set:
+      serviceAccount.name: llmkube-metal-controller
+    asserts:
+      - equal:
+          path: spec.matchConditions[1].expression
+          value: request.userInfo.username != 'system:serviceaccount:ops:llmkube-metal-controller'
+        documentIndex: 0
+
+  - it: renders independently of metalAgent.rbac
+    capabilities:
+      apiVersions:
+        - admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy
+    set:
+      metalAgent.rbac.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 2
+
+  - it: renders nothing when disabled
+    capabilities:
+      apiVersions:
+        - admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy
+    set:
+      metalAgent.writePolicy.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders nothing on a cluster without ValidatingAdmissionPolicy
+    asserts:
+      - hasDocuments:
+          count: 0

@@ -655,6 +655,14 @@
               }
             }
           }
+        },
+        "writePolicy": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "ValidatingAdmissionPolicy that limits llmkube-metal-* ServiceAccounts' Service, EndpointSlice and Endpoints writes to objects labeled llmkube.ai/managed-by=metal-agent (#2081).",
+          "properties": {
+            "enabled": { "type": "boolean" }
+          }
         }
       }
     },

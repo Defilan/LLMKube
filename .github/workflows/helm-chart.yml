@@ -11,6 +11,7 @@ on:
       - 'api/**'
       - 'pkg/**'
       - 'deployment/macos/metal-agent-rbac.yaml'
+      - 'deployment/macos/metal-agent-write-policy.yaml'
       - 'Dockerfile'
       - 'go.mod'
       - 'go.sum'
@@ -26,6 +27,7 @@ on:
       - 'api/**'
       - 'pkg/**'
       - 'deployment/macos/metal-agent-rbac.yaml'
+      - 'deployment/macos/metal-agent-write-policy.yaml'
       - 'Dockerfile'
       - 'go.mod'
       - 'go.sum'
@@ -583,8 +585,9 @@ jobs:
       - name: Set up Helm
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
 
-      # The chart renders a second copy of the agent's identity. This fails when
-      # its rules drift from the standalone manifest in either direction (#2152).
+      # The chart renders a second copy of the agent's identity and of its write
+      # policy. This fails when either drifts from its standalone manifest
+      # (#2152, #2081).
       - name: Verify Chart metal-agent RBAC Matches the Manifest
         run: make check-metal-agent-rbac
 

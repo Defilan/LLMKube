@@ -87,6 +87,12 @@ func ownedByAgent(labels map[string]string) bool {
 // InferenceService ran on a CUDA Model; after a switch to a Metal Model the
 // agent takes it over instead of refusing a legitimate migration. Deletion
 // does not use this: deleteIfOwned stays label-only.
+//
+// deployment/macos/metal-agent-write-policy.yaml enforces the same rule at
+// admission for the agent's ServiceAccounts (#2081), but for Services only:
+// a write the agent makes outside it (an unlabeled object, or an
+// EndpointSlice taken over by ownerReference) is denied there.
+// write_policy_envtest_test.go drives this registry through that policy.
 func ownedFor(obj metav1.Object, isvcUID types.UID) bool {
 	if ownedByAgent(obj.GetLabels()) {
 		return true
