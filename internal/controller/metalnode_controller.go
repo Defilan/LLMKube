@@ -85,6 +85,15 @@ const (
 	// metalNodeRenewGap is a renewal gap that means the agent was away (it
 	// renews every 15 s), so the update reconciles at once.
 	metalNodeRenewGap = 45 * time.Second
+	// metalNodeMaxResultAge is how long a True Reachable stands without a
+	// newer check finishing. An unchanged Mac is re-checked after
+	// metalNodeRecheckInterval and that check ends, one way or the other,
+	// within metalNodeVerifierTimeout; the resync interval is slack for
+	// when the reconcile that reads it runs. Only a check that keeps being
+	// cut short (inputs that keep changing, a verifier pod that never goes
+	// away) reaches the bound, and then the result is too old to stand for
+	// the address.
+	metalNodeMaxResultAge = metalNodeRecheckInterval + metalNodeVerifierTimeout + metalNodeResyncInterval
 )
 
 // metalNodeLeaseUpdateMatters reports whether a Lease update should
@@ -384,6 +393,11 @@ func (r *MetalNodeReconciler) reconcileDialBack(ctx context.Context, mn *inferen
 				"the agent's pin, port or addresses changed since the last check; a new check is due")
 		}
 	}
+	if verifiedResultExpired(mn, now) {
+		r.setReachable(mn, metav1.ConditionUnknown, inferencev1alpha1.MetalNodeReasonVerificationPending,
+			fmt.Sprintf("the last check that reached this Mac finished more than %s ago and none has finished since; a new check is due",
+				metalNodeMaxResultAge))
+	}
 
 	pods, err := r.ownedVerifiers(ctx, mn)
 	if err != nil {
@@ -491,6 +505,20 @@ func verifiedResultStale(st *inferencev1alpha1.MetalNodeStatus, report *metalnod
 		return true
 	}
 	return !slices.Contains(dialableAddresses(st.Candidates), st.HostIP)
+}
+
+// verifiedResultExpired reports whether a True Reachable is older than
+// metalNodeMaxResultAge. A result carried across changed inputs (only grown,
+// see verifiedResultStale) stands until a check for the new inputs lands,
+// and a verifier whose inputs change again is deleted without a result: a
+// Mac that keeps changing its report would otherwise keep an old success,
+// and the hostIP it names, for good.
+func verifiedResultExpired(mn *inferencev1alpha1.MetalNode, now time.Time) bool {
+	if !meta.IsStatusConditionTrue(mn.Status.Conditions, inferencev1alpha1.MetalNodeConditionReachable) {
+		return false
+	}
+	v := mn.Status.Verification
+	return v == nil || v.LastCheckTime == nil || now.Sub(v.LastCheckTime.Time) > metalNodeMaxResultAge
 }
 
 // specHostIP returns spec.hostIP in canonical form and whether it is usable

@@ -205,3 +205,57 @@ func TestMetalNodeBoundCertificateIsVerified(t *testing.T) {
 	wantCondition(t, f.get("mac-bind"), inferencev1alpha1.MetalNodeConditionReachable, metav1.ConditionTrue,
 		inferencev1alpha1.MetalNodeReasonDialBackSucceeded)
 }
+
+// TestMetalNodeReachableExpiresWhileChecksArePreempted is #2265's second
+// scenario. X is verified; the Mac keeps X, its pin and port, but alternates
+// a second candidate, so each new check is deleted (its inputs changed)
+// before it finishes and none ever records a result. Reachable=True and
+// hostIP=X must not outlive metalNodeMaxResultAge without a newer check.
+func TestMetalNodeReachableExpiresWhileChecksArePreempted(t *testing.T) {
+	f := newMetalNodeFixture(t)
+	t.Cleanup(func() { f.releaseVerifiers("mac-alt") })
+	f.verifyMetalNode("mac-alt", tailnetCandidate)
+	verifiedAt := f.now
+
+	withSecond := encodeReport(t, testReport(tailnetCandidate, metalnode.Candidate{Address: "192.168.1.47", Source: metalnode.SourceLAN}))
+	alone := encodeReport(t, testReport(tailnetCandidate))
+	started := 0
+	seen := map[types.UID]bool{}
+	for step := 1; step <= 40; step++ {
+		f.now = f.now.Add(31 * time.Second)
+		report := alone
+		if step%2 == 1 {
+			report = withSecond
+		}
+		f.putLease("mac-alt", f.now, report)
+		f.reconcile("mac-alt")
+		for _, p := range f.verifierPods("mac-alt") {
+			if !seen[p.UID] {
+				seen[p.UID] = true
+				started++
+			}
+		}
+		f.holdVerifiers("mac-alt")
+		f.releaseVerifiers("mac-alt")
+
+		mn := f.get("mac-alt")
+		c := condition(t, mn, inferencev1alpha1.MetalNodeConditionReachable)
+		age := f.now.Sub(verifiedAt)
+		if age <= metalNodeRecheckInterval && (c.Status != metav1.ConditionTrue || mn.Status.HostIP != "100.64.0.2") {
+			t.Fatalf("step %d (%s after the check): Reachable %s/%s hostIP %q; a result carried across grown inputs "+
+				"stands until it is %s old", step, age, c.Status, c.Reason, mn.Status.HostIP, metalNodeMaxResultAge)
+		}
+		if age > metalNodeMaxResultAge {
+			if c.Status == metav1.ConditionTrue || mn.Status.HostIP != "" {
+				t.Fatalf("step %d (%s after the only check that finished): Reachable %s hostIP %q, want neither True nor "+
+					"an address once the result is older than %s", step, age, c.Status, mn.Status.HostIP, metalNodeMaxResultAge)
+			}
+			if c.Reason != inferencev1alpha1.MetalNodeReasonVerificationPending {
+				t.Errorf("step %d: Reachable reason %s, want %s", step, c.Reason, inferencev1alpha1.MetalNodeReasonVerificationPending)
+			}
+		}
+	}
+	if started < 10 {
+		t.Errorf("%d verifiers started over 40 alternations, want the scenario to keep starting and preempting checks", started)
+	}
+}
