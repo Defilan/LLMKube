@@ -95,6 +95,7 @@ type AgentConfig struct {
 	AllowedDownloadHosts      string
 	MaxDownloadSize           string
 	AllowUnsafeExtraArgs      bool
+	EngineEnvPassthrough      string
 	IngressPort               int
 	StateDir                  string
 	LegacyDirectEndpoints     bool
@@ -128,6 +129,17 @@ func splitCSV(s string) []string {
 		return nil
 	}
 	return out
+}
+
+// parseEngineEnvPassthrough parses --engine-env-passthrough: comma-separated
+// exact environment variable names. An invalid name is an error, so a typo or
+// a NAME=value entry fails startup instead of silently passing nothing.
+func parseEngineEnvPassthrough(s string) ([]string, error) {
+	names := splitCSV(s)
+	if err := agent.ValidateEngineEnvPassthrough(names); err != nil {
+		return nil, fmt.Errorf("--engine-env-passthrough: %w", err)
+	}
+	return names, nil
 }
 
 // validateMetalNodeFlags checks --metal-node and --metal-node-lease: both are
@@ -665,6 +677,10 @@ func main() {
 			inferencev1alpha1.LabelModelSourceCredentials+"=true label, with a SourceSecretUnlabeled Warning "+
 			"Event on each start that relies on it. Only to keep existing Models working while their Secrets are "+
 			"labeled. The relay token Secret is refused either way.")
+	flag.StringVar(&cfg.EngineEnvPassthrough, "engine-env-passthrough", "",
+		"Comma-separated exact names of environment variables the agent copies into every engine it "+
+			"starts, in addition to PATH, HOME, USER, LOGNAME, TMPDIR, LANG, TZ, HF_HOME, HF_HUB_CACHE and LC_*. "+
+			"Every other variable in the agent's environment stays with the agent. Default: none.")
 	showVersion := flag.Bool("version", false, "Show version information")
 	flag.Parse()
 
@@ -717,6 +733,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	engineEnvPassthrough, err := parseEngineEnvPassthrough(cfg.EngineEnvPassthrough)
+	if err != nil {
+		logger.Errorw("invalid engine environment passthrough", "error", err)
+		os.Exit(1)
+	}
+
 	// TODO: Wire this logger into controller-runtime via ctrl.SetLogger(...) so
 	// Kubernetes client/controller-runtime logs share the same configuration.
 
@@ -756,6 +778,7 @@ func main() {
 		"legacyDirectEndpoints", cfg.LegacyDirectEndpoints,
 		"hostIP", hostIP,
 		"logLevel", cfg.LogLevel,
+		"engineEnvPassthrough", engineEnvPassthrough,
 	)
 
 	// Verify Metal support
@@ -888,6 +911,7 @@ func main() {
 		AllowedDownloadHosts:      splitCSV(cfg.AllowedDownloadHosts),
 		MaxDownloadBytes:          maxDownloadBytes,
 		AllowUnsafeExtraArgs:      cfg.AllowUnsafeExtraArgs,
+		EngineEnvPassthrough:      engineEnvPassthrough,
 		IngressPort:               cfg.IngressPort,
 		StateDir:                  cfg.StateDir,
 		LegacyDirectEndpoints:     cfg.LegacyDirectEndpoints,
