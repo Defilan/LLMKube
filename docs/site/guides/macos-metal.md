@@ -255,7 +255,10 @@ A private source needs credentials in a Secret named by the Model's
 Face repository). The agent reads that Secret only when its owner has
 labeled it for this use, and never reads the relay token Secret
 `llmkube-metal-relay`; any other Secret refuses the start with
-`SourceSecretNotAllowed`:
+`SourceSecretNotAllowed`. The agent re-checks a refused service on a
+backoff (5 seconds, doubling to once a minute), so once the Secret is
+labeled the service starts within about a minute, with no change to
+the InferenceService:
 
 ```bash
 kubectl label secret <name> -n <namespace> inference.llmkube.dev/model-source-credentials=true
@@ -358,6 +361,9 @@ The agent estimates each model's memory cost (weights + KV cache +
 overhead) before spawning `llama-server`. If the model won't fit
 in the configured budget, the agent refuses to start it and marks
 the InferenceService with `status.schedulingStatus: InsufficientMemory`.
+Like every refusal, it is re-checked on a backoff of up to a minute,
+so the service starts once memory frees up; a refusal that holds
+produces one Warning Event, not one per re-check.
 
 The KV-cache term is sized from the model's GGUF attention shape
 (KV head count and key/value length, i.e. grouped-query attention)

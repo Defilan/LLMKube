@@ -199,8 +199,11 @@ func (a *MetalAgent) failModelEstimate(
 	}
 	failingFor, failures := a.sizeProbes.note(key, model.Spec.Source, a.clock())
 	if failingFor >= sizeProbeRetryWindow {
-		return a.failMemoryCheck(ctx, isvc, fmt.Sprintf("%s (the remote size probe has failed for %s, %d attempts)",
-			reason, failingFor.Round(time.Second), failures))
+		// The message names the window, not the elapsed time or the attempt
+		// count, so a re-check that finds the probe still failing repeats it
+		// exactly and adds no Event.
+		return a.failMemoryCheck(ctx, isvc, fmt.Sprintf("%s (the remote size probe has kept failing for %s)",
+			reason, sizeProbeRetryWindow))
 	}
 	a.logger.Warnw("remote model size probe failed transiently, retrying on the next poll",
 		"namespace", isvc.Namespace, "name", isvc.Name, "reason", reason,
@@ -228,6 +231,13 @@ func (a *MetalAgent) retryIfTransient(isvc *inferencev1alpha1.InferenceService, 
 func (a *MetalAgent) requeue(key string) {
 	if a.watcher != nil {
 		a.watcher.Requeue(key)
+	}
+}
+
+// requeueAt is requeue for the first poll at or after at.
+func (a *MetalAgent) requeueAt(key string, at time.Time) {
+	if a.watcher != nil {
+		a.watcher.RequeueAt(key, at)
 	}
 }
 
