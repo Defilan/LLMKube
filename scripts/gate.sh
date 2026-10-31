@@ -4,11 +4,11 @@
 # and fails if that changed files the working tree did not already have
 # modified (uncommitted regeneration drift), checks gofmt without rewriting,
 # checks that every Go file the branch adds carries the copyright year
-# hack/boilerplate.go.txt does, runs the optional GATE_PROBE_CMD, runs go vet,
-# and only then runs lint-all and the full test suite in parallel: nothing
-# after vet regenerates, so lint and tests cannot race the generators. Every
-# step logs to a file under GATE_DIR and the gate exits nonzero if any step
-# failed, so a failing lint is not masked by passing tests or the reverse.
+# hack/boilerplate.go.txt does, runs go vet, and only then runs lint-all and
+# the full test suite in parallel: nothing after vet regenerates, so lint and
+# tests cannot race the generators. Every step logs to a file under GATE_DIR
+# and the gate exits nonzero if any step failed, so a failing lint is not
+# masked by passing tests or the reverse.
 #
 # The suites run with a pinned GINKGO_SEED (default 4242) instead of make
 # test's per-run seed: go test caches a result only while the environment
@@ -28,8 +28,6 @@
 #   ENVTEST_BIN, BIN_DIR, ENVTEST_K8S_VERSION
 #                     setup-envtest binary, local bin dir and k8s version;
 #                     the Makefile passes these, standalone runs derive them
-#   GATE_PROBE_CMD    an extra check run after the copyright step and before
-#                     vet, e.g. "go test ./internal/controller/ -run TestX"
 #   GATE_REGEN_CMD, GATE_FMT_CMD, GATE_COPYRIGHT_CMD, GATE_VET_CMD,
 #   GATE_LINT_CMD, GATE_TEST_CMD
 #                     step command overrides; scripts/gate_test.sh drives the
@@ -49,7 +47,6 @@ export GINKGO_SEED
 
 LINT_GOTOOLCHAIN="${LINT_GOTOOLCHAIN:-}"
 
-GATE_PROBE_CMD="${GATE_PROBE_CMD:-}"
 GATE_REGEN_CMD="${GATE_REGEN_CMD:-make manifests generate}"
 GATE_FMT_CMD="${GATE_FMT_CMD:-}"
 GATE_COPYRIGHT_CMD="${GATE_COPYRIGHT_CMD:-}"
@@ -115,7 +112,6 @@ step_copyright() {
 	if [ -n "$GATE_COPYRIGHT_CMD" ]; then eval "$GATE_COPYRIGHT_CMD"; else make check-copyright; fi
 }
 step_vet() { eval "$GATE_VET_CMD"; }
-step_probe() { eval "$GATE_PROBE_CMD"; }
 step_lint() {
 	if [ -n "$GATE_LINT_CMD" ]; then eval "$GATE_LINT_CMD"; else lint_default; fi
 }
@@ -166,14 +162,10 @@ if [ "$failed" -eq 0 ]; then
 else
 	rc_fmt=""
 fi
-rc_probe=""
 if [ "$failed" -eq 0 ]; then
 	if run_logged copyright step_copyright; then rc_copyright=0; else rc_copyright=$?; failed=1; fi
 else
 	rc_copyright=""
-fi
-if [ -n "$GATE_PROBE_CMD" ] && [ "$failed" -eq 0 ]; then
-	if run_logged probe step_probe; then rc_probe=0; else rc_probe=$?; failed=1; fi
 fi
 if [ "$failed" -eq 0 ]; then
 	if run_logged vet step_vet; then rc_vet=0; else rc_vet=$?; failed=1; fi
@@ -214,7 +206,6 @@ summary_line regen "$rc_regen"
 summary_line drift "$rc_drift"
 summary_line fmt "$rc_fmt"
 summary_line copyright "$rc_copyright"
-if [ -n "$GATE_PROBE_CMD" ]; then summary_line probe "$rc_probe"; fi
 summary_line vet "$rc_vet"
 summary_line lint "$rc_lint"
 summary_line test "$rc_test"

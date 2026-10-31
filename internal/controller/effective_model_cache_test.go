@@ -133,6 +133,9 @@ func TestResolveEffectiveModelCache(t *testing.T) {
 // The inherited block must be a copy: the Model is read on every reconcile of
 // every service, and a shared pointer would let one service's use of the value
 // mutate the Model.
+// The inherited block must be a copy: the Model is read on every reconcile of
+// every service, and a shared pointer would let one service's use of the value
+// mutate the Model.
 func TestResolveEffectiveModelCacheCopiesTheModelBlock(t *testing.T) {
 	model := &inferencev1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "default"}}
 	model.Spec.ModelCache = &inferencev1alpha1.ModelCacheSpec{ClaimName: "from-model", Prefetch: true, StorageClassName: "fast"}
@@ -143,6 +146,23 @@ func TestResolveEffectiveModelCacheCopiesTheModelBlock(t *testing.T) {
 	}
 	if model.Spec.ModelCache.Prefetch != true {
 		t.Error("clearing prefetch on the resolved copy must not touch the Model's own block")
+	}
+}
+
+// The service's own block is copied as well, so the type comment's claim that
+// a status write cannot change the value is literally true: the write decodes
+// the stored object back into the same pointer, so a held pointer to the
+// service's spec would change under a reader.
+func TestResolveEffectiveModelCacheCopiesTheServiceBlock(t *testing.T) {
+	isvc := &inferencev1alpha1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"}}
+	isvc.Spec.ModelCache = &inferencev1alpha1.ModelCacheSpec{ClaimName: "own", StorageClassName: "fast"}
+
+	got := resolveEffectiveModelCache(isvc, nil)
+	if got.spec == isvc.Spec.ModelCache {
+		t.Fatal("the resolved value aliases isvc.Spec.ModelCache; it must be a copy")
+	}
+	if got.claimName() != "own" || got.storageClassName() != "fast" {
+		t.Errorf("the copy must keep the service's own values, got claim %q class %q", got.claimName(), got.storageClassName())
 	}
 }
 

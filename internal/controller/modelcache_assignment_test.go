@@ -68,22 +68,73 @@ func TestNoProductionModelCacheAssignment(t *testing.T) {
 		})
 	}
 	if len(offenders) > 0 {
-		t.Fatalf("production code assigns .Spec.ModelCache, which a status write undoes mid-reconcile; "+
+		t.Fatalf("production code assigns .Spec.ModelCache or a field of it, which a status write undoes mid-reconcile; "+
 			"pass the value from resolveEffectiveModelCache instead (#2142):\n  %s",
 			strings.Join(offenders, "\n  "))
 	}
 }
 
-// isModelCacheSelector reports whether expr ends in .Spec.ModelCache or
-// .Spec.ModelCache[<key>], whatever the receiver is called.
+// isModelCacheSelector reports whether expr is rooted at .Spec.ModelCache,
+// whatever the receiver is called and however the block is reached: the whole
+// block (x.Spec.ModelCache), a field of it (x.Spec.ModelCache.ClaimName), or
+// the block dereferenced (*x.Spec.ModelCache).
 func isModelCacheSelector(expr ast.Expr) bool {
-	sel, ok := expr.(*ast.SelectorExpr)
-	if !ok {
-		return false
+	for {
+		switch e := expr.(type) {
+		case *ast.ParenExpr:
+			expr = e.X
+		case *ast.StarExpr:
+			expr = e.X
+		case *ast.SelectorExpr:
+			if e.Sel.Name == "ModelCache" {
+				base, ok := e.X.(*ast.SelectorExpr)
+				if ok && base.Sel.Name == "Spec" {
+					return true
+				}
+				return false
+			}
+			// A field selected through the block: walk down to the root.
+			expr = e.X
+		default:
+			return false
+		}
 	}
-	if sel.Sel.Name != "ModelCache" {
-		return false
+}
+
+// TestIsModelCacheSelector pins the forms the guard matches, so widening it
+// does not silently narrow it: the whole block, a field written through it,
+// and the block dereferenced all assign the structure a status write undoes.
+func TestIsModelCacheSelector(t *testing.T) {
+	cases := []struct {
+		expr string
+		want bool
+	}{
+		{"isvc.Spec.ModelCache", true},
+		{"isvc.Spec.ModelCache.ClaimName", true},
+		{"isvc.Spec.ModelCache.Persistence", true},
+		{"*isvc.Spec.ModelCache", true},
+		{"(isvc.Spec.ModelCache).ClaimName", true},
+		{"m.Spec.ModelCache", true},
+		{"isvc.Spec.Env", false},
+		{"isvc.Spec.ModelCache", true},
+		{"isvc.Status.Phase", false},
+		{"model.Spec.ModelCache", true},
+		{"cache.spec", false},
+		{"cache.claimName()", false},
+		{"isvc.Spec", false},
+		{"spec.ModelCache", false},
+		{"counts", false},
 	}
-	base, ok := sel.X.(*ast.SelectorExpr)
-	return ok && base.Sel.Name == "Spec"
+	fset := token.NewFileSet()
+	for _, tc := range cases {
+		t.Run(tc.expr, func(t *testing.T) {
+			expr, err := parser.ParseExprFrom(fset, "probe.go", tc.expr, 0)
+			if err != nil {
+				t.Fatalf("parsing %q: %v", tc.expr, err)
+			}
+			if got := isModelCacheSelector(expr); got != tc.want {
+				t.Errorf("isModelCacheSelector(%q) = %v, want %v", tc.expr, got, tc.want)
+			}
+		})
+	}
 }

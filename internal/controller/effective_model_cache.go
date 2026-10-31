@@ -43,7 +43,7 @@ func resolveEffectiveModelCache(isvc *inferencev1alpha1.InferenceService, model 
 	if isvc != nil {
 		cache.serviceName = isvc.Name
 		if isvc.Spec.ModelCache != nil {
-			cache.spec = isvc.Spec.ModelCache
+			cache.spec = isvc.Spec.ModelCache.DeepCopy()
 			return cache
 		}
 	}

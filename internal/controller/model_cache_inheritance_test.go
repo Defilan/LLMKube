@@ -204,65 +204,54 @@ var _ = Describe("Model.spec.modelCache inheritance (#2142)", func() {
 		}
 	})
 
-	It("renders the same cache surface for an inherited block as for the same block written out", func() {
-		// The parity claim: a service that inherits the Model's block must get
-		// the pod base gave it, so the rendered cache surface has to match a
-		// service that carries that block explicitly. Neither block asks for a
-		// prefetch: prefetch is the service's own request, so neither side is
-		// held for a staging, and both download at serve time as base did.
-		createCachePVC("parity-cache")
-		model := readyModel("parity-model", "https://example.com/models/llama.gguf", func(m *inferencev1alpha1.Model) {
-			m.Spec.ModelCache = &inferencev1alpha1.ModelCacheSpec{ClaimName: "parity-cache"}
-		})
-		newService("parity-inherited", model.Name, nil)
-		newService("parity-explicit", model.Name, model.Spec.ModelCache.DeepCopy())
-
-		r := reconciler()
-		read := func(name string) (*appsv1.Deployment, *inferencev1alpha1.InferenceService) {
-			reconcileOnce(r, name)
-			dep := &appsv1.Deployment{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, dep)).To(Succeed())
-			svc := &inferencev1alpha1.InferenceService{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, svc)).To(Succeed())
-			return dep, svc
-		}
-		inheritedDep, inheritedSvc := read("parity-inherited")
-		explicitDep, _ := read("parity-explicit")
-
-		Expect(inheritedSvc.Spec.ModelCache).To(BeNil(),
-			"inheritance is never written back to the service's spec")
-		Expect(claimOf(&inheritedDep.Spec.Template.Spec)).To(Equal("parity-cache"))
-		Expect(claimOf(&explicitDep.Spec.Template.Spec)).To(Equal("parity-cache"))
-		Expect(initContainerNames(&inheritedDep.Spec.Template.Spec)).To(Equal(initContainerNames(&explicitDep.Spec.Template.Spec)))
-		Expect(cacheDirEnv(inheritedDep)).To(Equal(cacheDirEnv(explicitDep)))
-		Expect(hasModelDownloader(inheritedDep)).To(BeTrue(),
-			"the service asked for no prefetch of its own, so it downloads at serve time as base did")
-	})
-})
-
-// cacheDirEnv reads CACHE_DIR off the model-downloader init container, the
-// directory the storage builder told the downloader to write.
-func cacheDirEnv(dep *appsv1.Deployment) string {
-	for _, c := range dep.Spec.Template.Spec.InitContainers {
-		if c.Name != "model-downloader" {
-			continue
-		}
-		for _, e := range c.Env {
-			if e.Name == "CACHE_DIR" {
-				return e.Value
+	// The upgrade property: a service that inherits the Model's block and one
+	// that carries the same block on its own spec render the same pod, so
+	// making the inherited block explicit rolls nothing. The pod is read back
+	// from the API server after each pass, and the two passes share one
+	// service in one namespace: the emptyDir path names the model file
+	// /models/<namespace>-<model>.gguf, so a second namespace would compare
+	// two different paths.
+	//
+	// Prefetch is false in both cases: it is the service's own request, and
+	// neither the inherited nor the written-out block asks for it.
+	DescribeTable("writes an inherited block onto the service's own spec without rolling a pod (#2142)",
+		func(svcName string, block *inferencev1alpha1.ModelCacheSpec) {
+			if block.ClaimName != "" {
+				createCachePVC(block.ClaimName)
 			}
-		}
-	}
-	return ""
-}
+			model := readyModel(svcName+"-model", "https://example.com/models/llama.gguf", func(m *inferencev1alpha1.Model) {
+				m.Spec.ModelCache = block.DeepCopy()
+			})
+			isvc := newService(svcName, model.Name, nil)
+			key := types.NamespacedName{Name: isvc.Name, Namespace: ns}
+			r := reconciler()
 
-// hasModelDownloader reports whether the pod downloads at serve time, which a
-// service that asked for no prefetch of its own still does.
-func hasModelDownloader(dep *appsv1.Deployment) bool {
-	for _, c := range dep.Spec.Template.Spec.InitContainers {
-		if c.Name == "model-downloader" {
-			return true
-		}
-	}
-	return false
-}
+			By("resolving the block from the Model")
+			reconcileOnce(r, isvc.Name)
+			dep := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, key, dep)).To(Succeed())
+			hashBefore := dep.Annotations[AnnotationDesiredTemplateHash]
+			Expect(hashBefore).NotTo(BeEmpty(), "the create path stamps the desired-template hash")
+			templateBefore := dep.Spec.Template.DeepCopy()
+
+			By("writing the same block onto the service's own spec")
+			stored := &inferencev1alpha1.InferenceService{}
+			Expect(k8sClient.Get(ctx, key, stored)).To(Succeed())
+			Expect(stored.Spec.ModelCache).To(BeNil(), "inheritance is never written back to the service's spec")
+			stored.Spec.ModelCache = model.Spec.ModelCache.DeepCopy()
+			Expect(k8sClient.Update(ctx, stored)).To(Succeed())
+
+			By("rendering the same pod for the explicit block")
+			reconcileOnce(r, isvc.Name)
+			after := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, key, after)).To(Succeed())
+			Expect(after.Annotations[AnnotationDesiredTemplateHash]).To(Equal(hashBefore),
+				"the template hash must not move when the inherited block is made explicit")
+			Expect(after.Spec.Template).To(Equal(*templateBefore))
+		},
+		Entry("an inherited claimName", "explicit-claim", &inferencev1alpha1.ModelCacheSpec{ClaimName: "explicit-block-cache"}),
+		Entry("an inherited ephemeral opt-out", "explicit-ephemeral", &inferencev1alpha1.ModelCacheSpec{
+			Persistence: inferencev1alpha1.ModelCachePersistenceEphemeral,
+		}),
+	)
+})
