@@ -258,6 +258,13 @@ type MetalAgentConfig struct {
 	// refused. Logged at Warn on startup; removed in a future release.
 	AllowUnlabeledSourceSecrets bool
 
+	// EngineEnvPassthrough names variables, beyond the fixed engine
+	// allowlist (see buildEngineEnv), that every engine the agent starts
+	// inherits from the agent's environment (--engine-env-passthrough).
+	// Exact names only; cmd/metal-agent validates them. Nil passes nothing
+	// extra through.
+	EngineEnvPassthrough []string
+
 	// IngressPort is the TLS port of the authenticated ingress that
 	// in-cluster relays use to reach engines. The ingress listens on all
 	// interfaces; engines listen on 127.0.0.1 only. Must differ from Port and
@@ -635,6 +642,7 @@ func (a *MetalAgent) buildExecutors() {
 		metalExec.SetStartupTimeout(a.config.LlamaServerStartupTimeout)
 	}
 	metalExec.SetPort(a.config.LlamaServerPort)
+	metalExec.SetEngineEnvPassthrough(a.config.EngineEnvPassthrough)
 	a.executors[runtimeLlamaServer] = metalExec
 	a.executors[runtimeLlamaCPP] = metalExec
 
@@ -652,6 +660,7 @@ func (a *MetalAgent) buildExecutors() {
 		if a.config.OMLXStartupTimeout > 0 {
 			omlxExec.SetStartupTimeout(a.config.OMLXStartupTimeout)
 		}
+		omlxExec.SetEngineEnvPassthrough(a.config.EngineEnvPassthrough)
 		a.executors[runtimeOMLX] = omlxExec
 	}
 	if a.config.OllamaPort != 0 || a.config.Runtime == runtimeOllama {
@@ -673,6 +682,7 @@ func (a *MetalAgent) buildExecutors() {
 		if a.config.VLLMSwiftStartupTimeout > 0 {
 			vllmSwiftExec.SetStartupTimeout(a.config.VLLMSwiftStartupTimeout)
 		}
+		vllmSwiftExec.SetEngineEnvPassthrough(a.config.EngineEnvPassthrough)
 		a.executors[runtimeVLLMSwift] = vllmSwiftExec
 	}
 	if a.config.MLXServerBin != "" {
@@ -689,6 +699,7 @@ func (a *MetalAgent) buildExecutors() {
 		if a.config.MLXServerStartupTimeout > 0 {
 			mlxServerExec.SetStartupTimeout(a.config.MLXServerStartupTimeout)
 		}
+		mlxServerExec.SetEngineEnvPassthrough(a.config.EngineEnvPassthrough)
 		a.executors[runtimeMLXServer] = mlxServerExec
 	}
 	if a.config.TensorFoldBin != "" || a.config.Runtime == runtimeTensorFold {
@@ -704,6 +715,7 @@ func (a *MetalAgent) buildExecutors() {
 		if a.config.TensorFoldStartupTimeout > 0 {
 			tensorFoldExec.SetStartupTimeout(a.config.TensorFoldStartupTimeout)
 		}
+		tensorFoldExec.SetEngineEnvPassthrough(a.config.EngineEnvPassthrough)
 		a.executors[runtimeTensorFold] = tensorFoldExec
 	}
 }
