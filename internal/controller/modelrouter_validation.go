@@ -12,6 +12,7 @@ package controller
 
 import (
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -51,6 +52,8 @@ func (e ModelRouterValidationError) String() string {
 //   - Backend names must be unique.
 //   - DefaultRoute, if set, names an existing backend.
 //   - Every rule's route.backends entries reference existing backends.
+//   - A weighted rule names at least one backend that can take traffic
+//     (positive weight, every required capability).
 //   - Rules matching sensitive classifications (pii/phi by default, or
 //     whatever policy.classification.sensitiveClassifications says) must
 //     have failClosed=true AND route only to local-tier backends. This is
@@ -225,6 +228,7 @@ func validateRules(
 			ruleNames[rule.Name] = true
 		}
 		errs = append(errs, validateRuleRoute(rule, path, nameSet)...)
+		errs = append(errs, validateRuleWeights(rule, path, byName)...)
 		errs = append(errs, validateRuleSensitiveData(rule, path, sensitiveSet, byName)...)
 		errs = append(errs, validateRuleTimeout(rule, path)...)
 	}
@@ -281,6 +285,49 @@ func validateRuleRoute(
 		}
 	}
 	return errs
+}
+
+// validateRuleWeights rejects a weighted rule none of whose backends can take
+// traffic: every backend it names has weight 0 or lacks a capability the rule
+// requires. Both data planes would serve such a rule nothing (a zero weight
+// carries no traffic on either), so it fails here instead of at request time.
+// Undefined backend names are validateRuleRoute's to report.
+func validateRuleWeights(
+	rule *inferencev1alpha1.RouterRule,
+	path string,
+	byName map[string]*inferencev1alpha1.RouterBackend,
+) []ModelRouterValidationError {
+	if rule.Route.Strategy != weightedStrategy {
+		return nil
+	}
+	var required []string
+	if rule.Match != nil {
+		required = rule.Match.RequiredCapabilities
+	}
+	for _, name := range rule.Route.Backends {
+		b := byName[name]
+		if b == nil || (b.Weight != nil && *b.Weight == 0) {
+			continue
+		}
+		if hasEveryCapability(b.Capabilities, required) {
+			return nil
+		}
+	}
+	return []ModelRouterValidationError{{
+		Field: path + ".route.backends",
+		Message: "strategy weighted needs at least one backend with a positive weight " +
+			"(unset means 1) that advertises every required capability",
+	}}
+}
+
+// hasEveryCapability reports whether have lists every entry of want.
+func hasEveryCapability(have, want []string) bool {
+	for _, w := range want {
+		if !slices.Contains(have, w) {
+			return false
+		}
+	}
+	return true
 }
 
 // validateRuleSensitiveData enforces the fail-closed gate: rules matching

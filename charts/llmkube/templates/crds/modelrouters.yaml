@@ -504,7 +504,11 @@ spec:
                       description: |-
                         Weight is used for the "weighted" routing strategy. Higher values
                         receive proportionally more traffic. Ignored for other strategies.
-                        Default 1 when unset.
+                        Default 1 when unset. 0 drains the backend from weighted rules: it
+                        receives no traffic from them, even while every other backend in the
+                        rule is unavailable (the Gateway API meaning of a zero weight, which
+                        both data planes follow). A weighted rule needs at least one backend
+                        with a positive weight.
                       format: int32
                       minimum: 0
                       type: integer
@@ -2468,7 +2472,15 @@ spec:
                         strategy:
                           default: primary-fallback
                           description: |-
-                            Strategy selects how multiple backends are used. On dataPlane:
+                            Strategy selects how multiple backends are used. On dataPlane: Proxy,
+                            weighted picks a backend per request in proportion to its weight among
+                            the rule's backends that are healthy, not quarantined and advertise
+                            every required capability; a request that fails on it fails over to
+                            another backend of the rule picked the same way, never the same one
+                            twice. A weighted rule there cannot name two members of one ModelPool,
+                            since they share one GPU slot and would swap on every other request.
+                            shadow is not implemented by the Proxy yet and dispatches as
+                            primary-fallback; dataPlane: Gateway rejects it. On dataPlane:
                             AgentGateway only primary-fallback compiles, and a rule routes to its
                             first healthy backend: when that backend's InferenceService has no
                             ready replica, the next reconcile moves the rule to the next backend.

@@ -143,9 +143,12 @@ type Backend struct {
 	// Rules can require capabilities to filter candidates.
 	Capabilities []string `json:"capabilities,omitempty"`
 
-	// Weight informs the "weighted" routing strategy (#432). Currently
-	// unused; the MVP strategy is primary-fallback.
-	Weight int `json:"weight,omitempty"`
+	// Weight is this backend's share of a "weighted" rule's traffic. Nil
+	// (absent) means 1, the CRD default. 0 drains the backend from weighted
+	// rules: it takes no traffic from them, even when the rule's other
+	// backends are all down, the Gateway API meaning of a zero weight. Other
+	// strategies ignore it. Compiled from ModelRouter.spec.backends[].weight.
+	Weight *int32 `json:"weight,omitempty"`
 
 	// CredentialsEnv names an environment variable holding the bearer or
 	// API key for this backend. The proxy reads the value at request time
@@ -330,8 +333,11 @@ type RuleRoute struct {
 	Backends []string `json:"backends"`
 
 	// Strategy is "primary-fallback" (default), "weighted", or "shadow".
-	// Only primary-fallback is implemented in the MVP; the other two land
-	// in #432.
+	// primary-fallback tries Backends in declared order. weighted draws a
+	// backend per request in proportion to Backend.Weight among the ones
+	// that can serve now, and on a failure fails over to another drawn the
+	// same way (see weightedOrder). shadow is not implemented by the proxy
+	// yet and dispatches as primary-fallback.
 	Strategy string `json:"strategy,omitempty"`
 
 	// PoolActivation is "Wait" (default) or "IfIdle". Under IfIdle a pooled
@@ -474,6 +480,9 @@ func (c *Config) Validate() error {
 		if err := validateBalancing(i, b); err != nil {
 			return err
 		}
+		if b.Weight != nil && *b.Weight < 0 {
+			return fmt.Errorf("backends[%d] %s: weight must not be negative, got %d", i, b.Name, *b.Weight)
+		}
 	}
 	if c.DefaultRoute != "" && !names[c.DefaultRoute] {
 		return fmt.Errorf("defaultRoute %q does not name an existing backend", c.DefaultRoute)
@@ -505,11 +514,32 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("rules[%d] %s: route.poolActivation %q must be %q or %q",
 				i, r.Name, r.Route.PoolActivation, PoolActivationWait, PoolActivationIfIdle)
 		}
+		if err := c.validateRuleStrategy(i, &c.Rules[i]); err != nil {
+			return err
+		}
 	}
 	if err := c.Policy.AuditLog.validate(); err != nil {
 		return err
 	}
 	return c.validateBudgets(ruleNames)
+}
+
+// validateRuleStrategy checks a rule's route.strategy, and a weighted rule's
+// backends (see validateWeightedRule).
+func (c *Config) validateRuleStrategy(i int, r *Rule) error {
+	switch r.Route.Strategy {
+	case "", strategyPrimaryFallback, strategyShadow:
+		return nil
+	case strategyWeighted:
+		byName := make(map[string]*Backend, len(c.Backends))
+		for j := range c.Backends {
+			byName[c.Backends[j].Name] = &c.Backends[j]
+		}
+		return validateWeightedRule(i, r, byName)
+	default:
+		return fmt.Errorf("rules[%d] %s: route.strategy %q must be %q, %q or %q",
+			i, r.Name, r.Route.Strategy, strategyPrimaryFallback, strategyWeighted, strategyShadow)
+	}
 }
 
 // validate checks the client attribution settings. The controller rejects

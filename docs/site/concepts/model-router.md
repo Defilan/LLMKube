@@ -239,6 +239,40 @@ Headers that change routing:
 | `x-llmkube-task-complexity: complex` | Matches `complex-to-cloud` rule; tries Opus first, falls back to Qwen on 5xx. |
 | (no headers) | Falls through to `defaultRoute: local-qwen`. |
 
+## Rule strategies
+
+`route.strategy` decides how a matched rule uses the backends it lists:
+
+- **`primary-fallback`** (default) tries `route.backends` in order. The first backend serves; the next one is tried only when it fails.
+- **`weighted`** splits the rule's traffic across its backends in proportion to each backend's `weight` (default `1`). Use it to keep two kinds of hardware warm behind one model name.
+- **`shadow`** is not implemented by the router-proxy yet: a `shadow` rule dispatches like `primary-fallback`. `dataPlane: Gateway` and `dataPlane: AgentGateway` reject it.
+
+```yaml
+spec:
+  backends:
+    - name: mac-m5
+      inferenceServiceRef:
+        name: qwen38-metal
+      weight: 1
+    - name: nvidia-gb10
+      inferenceServiceRef:
+        name: qwen38-cuda
+      weight: 3
+  rules:
+    - name: qwen38
+      match:
+        models: ["qwen38-27b"]
+      route:
+        strategy: weighted
+        backends: ["mac-m5", "nvidia-gb10"]
+```
+
+On the Proxy data plane, a weighted rule picks a backend for each request at random, weighted by `weight`, among the backends that can serve it right now. A backend that is quarantined after failures, that lacks a capability the rule's `requiredCapabilities` lists, or (under `poolActivation: IfIdle`) whose ModelPool incumbent is busy is skipped, and the pick falls on the others in proportion to their weights. If the picked backend fails the way a primary fails over under `primary-fallback` (a 5xx, a connection error, a header timeout, a ModelPool activation that does not complete), the request moves to another backend of the rule, picked the same way, and never back to one it already tried. A weighted rule is therefore as available as a `primary-fallback` rule over the same backends. The audit line's `backend` field and the `llmkube_router_requests_total` `backend` label show which backend served each request, and budgets charge the backend that served.
+
+`weight: 0` drains a backend from weighted rules: it gets none of their traffic, even while every other backend in the rule is down. This is the Gateway API meaning of a zero weight, which `dataPlane: Gateway` also follows (Envoy Gateway drops a zero-weight `backendRef`), so the same spec splits the same way on both data planes. To keep a backend as a standby for when the others fail, list it in a `primary-fallback` rule instead. A weighted rule needs at least one backend with a positive weight that has every required capability; the controller rejects one that has none.
+
+A weighted rule on the Proxy data plane cannot list two different members of one ModelPool. The members share one GPU slot, so splitting traffic between them would drain one and cold-load the other on a large share of requests. The controller reports this as `Available=False` with reason `CompileFailed` and keeps serving the previous config. Splitting across a pooled backend and a backend outside the pool is fine: picking the pooled one activates it as `primary-fallback` would. `dataPlane: AgentGateway` compiles only `primary-fallback`.
+
 ## Default-route strategy
 
 `defaultRouteStrategy` controls what happens to a request that matches no rule, before the `defaultRoute` fallback applies:
@@ -513,7 +547,7 @@ When you specify `provider: anthropic` or `provider: openai` without `url`, the 
 **In scope:**
 
 - Routing rules: data classification, task complexity, required capabilities, model glob, header match
-- Strategies: primary-fallback (MVP), weighted and shadow (roadmap)
+- Strategies: primary-fallback and weighted; shadow (roadmap)
 - Fail-closed gate, both static (apply-time) and runtime
 - OpenAI-compatible request / response, including streaming SSE
 - Structured audit log to stdout (other sinks roadmap)
