@@ -2473,8 +2473,10 @@ func (e *NativeAgentLoopExecutor) rewriteHostFromEndpoints(
 // carried in its llmkube.ai/agent-engine-port annotation. ok is false
 // whenever that does not yield a usable port: no such slice (older agent),
 // none of them has a ready endpoint and a fresh heartbeat (agentSliceFresh),
-// or the annotation is missing or not a
-// valid positive integer. The caller then falls back to the older "<svcName>"
+// or the annotation is missing or not a TCP port (1 to 65535). The agent
+// writes the annotation, so it is bounds-checked rather than trusted: a
+// larger value would otherwise wrap to an unrelated port in the int32
+// conversion. The caller then falls back to the older "<svcName>"
 // slice lookup, so a List error here is logged at debug and never fails
 // resolution outright.
 func (e *NativeAgentLoopExecutor) enginePortFromAgentSlice(
@@ -2502,11 +2504,11 @@ func (e *NativeAgentLoopExecutor) enginePortFromAgentSlice(
 		if !ok {
 			continue
 		}
-		port, err := strconv.Atoi(raw)
-		if err != nil || port <= 0 {
+		port, err := strconv.ParseUint(raw, 10, 16)
+		if err != nil || port == 0 {
 			continue
 		}
-		return int32(port), true //nolint:gosec // G115: TCP ports fit in int32
+		return int32(port), true //nolint:gosec // G115: ParseUint's bitSize 16 bounds port to 1..65535
 	}
 	return 0, false
 }

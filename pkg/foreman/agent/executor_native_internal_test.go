@@ -517,6 +517,31 @@ func TestResolveInferenceBaseURL(t *testing.T) {
 			want: "http://127.0.0.1:60177/v1",
 		},
 		{
+			name: "host override: <isvc>-agent slice with an annotation above 65535 falls back to the <isvc> slice",
+			executor: NativeAgentLoopExecutor{
+				InferenceBaseURLHostOverride: "127.0.0.1",
+			},
+			seedObjects: []any{
+				mkISvc("test-svc", "http://test-svc.default.svc.cluster.local:80/v1/chat/completions"),
+				mkEndpoints("test-svc", 60177, true),
+				mkAgentSlice("test-svc", "65536", true),
+			},
+			want: "http://127.0.0.1:60177/v1",
+		},
+		{
+			// 2^32 + 80: an int32 conversion without a bound would wrap it to 80.
+			name: "host override: <isvc>-agent slice with an annotation that would wrap in int32 falls back to the <isvc> slice",
+			executor: NativeAgentLoopExecutor{
+				InferenceBaseURLHostOverride: "127.0.0.1",
+			},
+			seedObjects: []any{
+				mkISvc("test-svc", "http://test-svc.default.svc.cluster.local:80/v1/chat/completions"),
+				mkEndpoints("test-svc", 60177, true),
+				mkAgentSlice("test-svc", "4294967376", true),
+			},
+			want: "http://127.0.0.1:60177/v1",
+		},
+		{
 			name: "host override: <isvc>-agent slice with no ready endpoint falls back to the <isvc> slice",
 			executor: NativeAgentLoopExecutor{
 				InferenceBaseURLHostOverride: "127.0.0.1",
