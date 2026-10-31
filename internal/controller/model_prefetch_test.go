@@ -148,6 +148,21 @@ var _ = Describe("Model Prefetch", func() {
 			Expect(job.Spec.Template.Spec.Tolerations).To(BeEmpty())
 		})
 
+		// The claim is the Job's target, not a default to resolve: the shared
+		// cache stays the shared cache even when the Model names its own
+		// default claim for services. Staging into the Model's claim while
+		// recording the shared one leaves the services that mount the shared
+		// cache downloading at serve time (#2142).
+		It("stages the shared claim into the shared cache, not the Model's default claim", func() {
+			m := newPrefetchModel("shared-target")
+			m.Spec.ModelCache = &inferencev1alpha1.ModelCacheSpec{ClaimName: "model-default-claim"}
+			seedPrefetchCacheKey(m)
+			job, err := prefetchReconciler().buildPrefetchJob(context.Background(), m, ModelCachePVCName, "")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(job.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim.ClaimName).To(Equal(ModelCachePVCName))
+			Expect(job.Annotations[annotationPrefetchClaim]).To(Equal(ModelCachePVCName))
+		})
+
 		// #1964: a node-pinned claim (#1676) binds wherever the prefetch pod
 		// schedules, so the prefetch placement has to be steerable.
 		It("carries the Model's nodeSelector onto the Job pod", func() {
@@ -1857,6 +1872,16 @@ var _ = Describe("Model Prefetch", func() {
 	})
 
 	Describe("prefetchTargets", func() {
+		// referenced wraps services with the cache the Model controller
+		// resolves for each, as referencingServices does.
+		referenced := func(list ...*inferencev1alpha1.InferenceService) []referencedService {
+			out := make([]referencedService, 0, len(list))
+			for _, svc := range list {
+				out = append(out, referencedService{svc: svc, cache: resolveEffectiveModelCache(svc, nil)})
+			}
+			return out
+		}
+
 		It("skips a service request its pods could not consume", func() {
 			r := prefetchReconciler()
 			m := newPrefetchModel("targets-model")
@@ -1869,7 +1894,7 @@ var _ = Describe("Model Prefetch", func() {
 						ModelCache: &inferencev1alpha1.ModelCacheSpec{ClaimName: name + "-cache", Prefetch: true}},
 				}
 			}
-			targets, _ := r.prefetchTargets(m, []*inferencev1alpha1.InferenceService{svc("tgi-svc", "tgi"), svc("llama-svc", "")}, nil, "")
+			targets, _ := r.prefetchTargets(m, referenced(svc("tgi-svc", "tgi"), svc("llama-svc", "")), nil, "")
 			claims := make([]string, 0, len(targets))
 			for _, t := range targets {
 				claims = append(claims, t.claim)
@@ -1877,7 +1902,7 @@ var _ = Describe("Model Prefetch", func() {
 			Expect(claims).To(Equal([]string{"llama-svc-cache"}), "a runtime the operator does not stage gets no Job")
 
 			r.ModelCachePath = ""
-			targets, _ = r.prefetchTargets(m, []*inferencev1alpha1.InferenceService{svc("llama-svc", "")}, nil, "")
+			targets, _ = r.prefetchTargets(m, referenced(svc("llama-svc", "")), nil, "")
 			Expect(targets).To(BeEmpty(), "with caching disabled no claim is ever mounted")
 		})
 	})

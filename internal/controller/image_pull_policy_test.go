@@ -32,8 +32,9 @@ func TestImagePullPolicyReachesRuntimeContainer(t *testing.T) {
 			isvc := imagePullPolicyTripwireISvc()
 			isvc.Spec.ImagePullPolicy = policy
 
-			dep := imagePullPolicyTripwireReconciler().
-				constructDeployment(isvc, imagePullPolicyTripwireModel(), nil, 1, "", "")
+			mdl := imagePullPolicyTripwireModel()
+			dep := imagePullPolicyTripwireReconciler().constructDeploymentForCache(isvc, mdl,
+				resolveEffectiveModelCache(isvc, mdl), nil, 1, "", "")
 
 			if got := dep.Spec.Template.Spec.Containers[0].ImagePullPolicy; got != policy {
 				t.Errorf("runtime container imagePullPolicy = %q, want %q", got, policy)
@@ -61,8 +62,9 @@ func TestImagePullPolicyInitContainersUnchanged(t *testing.T) {
 			isvc := imagePullPolicyTripwireISvc()
 			isvc.Spec.ImagePullPolicy = tc.policy
 
-			dep := imagePullPolicyTripwireReconciler().
-				constructDeployment(isvc, imagePullPolicyTripwireModel(), nil, 1, "", "")
+			mdl := imagePullPolicyTripwireModel()
+			dep := imagePullPolicyTripwireReconciler().constructDeploymentForCache(isvc, mdl,
+				resolveEffectiveModelCache(isvc, mdl), nil, 1, "", "")
 
 			initContainers := dep.Spec.Template.Spec.InitContainers
 			if len(initContainers) == 0 {
@@ -87,8 +89,8 @@ func TestImagePullPolicyChangesTemplateHash(t *testing.T) {
 	set := imagePullPolicyTripwireISvc()
 	set.Spec.ImagePullPolicy = corev1.PullAlways
 
-	unsetHash := desiredTemplateHash(r.constructDeployment(unset, model, nil, 1, "", "").Spec.Template)
-	setHash := desiredTemplateHash(r.constructDeployment(set, model, nil, 1, "", "").Spec.Template)
+	unsetHash := desiredTemplateHash(r.constructDeploymentForCache(unset, model, resolveEffectiveModelCache(unset, model), nil, 1, "", "").Spec.Template)
+	setHash := desiredTemplateHash(r.constructDeploymentForCache(set, model, resolveEffectiveModelCache(set, model), nil, 1, "", "").Spec.Template)
 
 	if unsetHash == setHash {
 		t.Errorf("pod template hash did not change when imagePullPolicy was set (%s); the pods would never roll", unsetHash)
@@ -103,8 +105,9 @@ func TestImagePullPolicyWithoutSpecImage(t *testing.T) {
 	isvc.Spec.Image = ""
 	isvc.Spec.ImagePullPolicy = corev1.PullAlways
 
-	dep := imagePullPolicyTripwireReconciler().
-		constructDeployment(isvc, imagePullPolicyTripwireModel(), nil, 1, "", "")
+	mdl := imagePullPolicyTripwireModel()
+	dep := imagePullPolicyTripwireReconciler().constructDeploymentForCache(isvc, mdl,
+		resolveEffectiveModelCache(isvc, mdl), nil, 1, "", "")
 
 	c := dep.Spec.Template.Spec.Containers[0]
 	if c.Image == "" {
@@ -125,7 +128,7 @@ func TestMultiNodeMemberPodsInheritImagePullPolicy(t *testing.T) {
 	isvc.Spec.ImagePullPolicy = corev1.PullAlways
 	r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
 
-	pods, _, err := r.constructMemberPods(isvc, model, nil, "", "")
+	pods, _, err := r.constructMemberPods(isvc, model, resolveEffectiveModelCache(isvc, model), nil, "", "")
 	if err != nil {
 		t.Fatalf("constructMemberPods: %v", err)
 	}
@@ -139,11 +142,11 @@ func TestMultiNodeMemberPodsInheritImagePullPolicy(t *testing.T) {
 	}
 
 	unsetIsvc, _ := multiNodeFixture()
-	_, unsetHash, err := r.constructMemberPods(unsetIsvc, model, nil, "", "")
+	_, unsetHash, err := r.constructMemberPods(unsetIsvc, model, resolveEffectiveModelCache(unsetIsvc, model), nil, "", "")
 	if err != nil {
 		t.Fatalf("constructMemberPods: %v", err)
 	}
-	_, setHash, err := r.constructMemberPods(isvc, model, nil, "", "")
+	_, setHash, err := r.constructMemberPods(isvc, model, resolveEffectiveModelCache(isvc, model), nil, "", "")
 	if err != nil {
 		t.Fatalf("constructMemberPods: %v", err)
 	}

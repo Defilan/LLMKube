@@ -59,7 +59,7 @@ func isvcWithEphemeralCache(storage string) *inferencev1alpha1.InferenceService 
 }
 
 func TestEphemeralCacheSizeLimit_SetFromResources(t *testing.T) {
-	got := ephemeralCacheSizeLimit(isvcWithEphemeralCache("40Gi"))
+	got := ephemeralCacheSizeLimit(isvcWithEphemeralCache("40Gi"), resolveEffectiveModelCache(isvcWithEphemeralCache("40Gi"), nil))
 	if got == nil {
 		t.Fatal("expected a sizeLimit when resources.ephemeralStorage is set")
 	}
@@ -74,10 +74,10 @@ func TestEphemeralCacheSizeLimit_SetFromResources(t *testing.T) {
 // read, which only runs for remote http(s) sources), so inventing a limit would
 // evict Pods for exceeding a number the user never chose.
 func TestEphemeralCacheSizeLimit_UnsetWithoutBudget(t *testing.T) {
-	if got := ephemeralCacheSizeLimit(isvcWithEphemeralCache("")); got != nil {
+	if got := ephemeralCacheSizeLimit(isvcWithEphemeralCache(""), resolveEffectiveModelCache(isvcWithEphemeralCache(""), nil)); got != nil {
 		t.Errorf("sizeLimit = %v, want nil when no ephemeralStorage is declared", got)
 	}
-	if got := ephemeralCacheSizeLimit(nil); got != nil {
+	if got := ephemeralCacheSizeLimit(nil, resolveEffectiveModelCache(nil, nil)); got != nil {
 		t.Errorf("sizeLimit = %v, want nil for a nil isvc", got)
 	}
 }
@@ -92,7 +92,7 @@ func TestEphemeralCacheSizeLimit_OnlyWhenEphemeral(t *testing.T) {
 			Resources: &inferencev1alpha1.InferenceResourceRequirements{EphemeralStorage: "40Gi"},
 		},
 	}
-	if got := ephemeralCacheSizeLimit(cached); got != nil {
+	if got := ephemeralCacheSizeLimit(cached, resolveEffectiveModelCache(cached, nil)); got != nil {
 		t.Errorf("sizeLimit = %v, want nil when persistence is not Ephemeral", got)
 	}
 }

@@ -46,7 +46,7 @@ import (
 // ModelCachePVCName is the name of the shared, cluster-single model cache PVC.
 // It is used in the default shared mode (ModelCacheModeShared); the opt-in
 // per-InferenceService mode names each cache PVC after its InferenceService
-// (see modelCachePVCName).
+// (see effectiveModelCache.pvcName).
 const ModelCachePVCName = "llmkube-model-cache"
 
 // Model cache provisioning modes. shared (the default) keeps a single,
@@ -155,26 +155,6 @@ func resolveCacheMode(mode string) string {
 	return ModelCacheModeShared
 }
 
-// userModelCacheClaimName returns the user-supplied cache PVC name from
-// spec.modelCache.claimName, or "" when the InferenceService does not override
-// the operator-global cache mode.
-func userModelCacheClaimName(isvc *inferencev1alpha1.InferenceService) string {
-	if isvc == nil || isvc.Spec.ModelCache == nil {
-		return ""
-	}
-	return isvc.Spec.ModelCache.ClaimName
-}
-
-// userModelCacheStorageClassName returns the user-supplied cache storage class
-// from spec.modelCache.storageClassName, or "" when the InferenceService does
-// not override the operator-global --model-cache-storage-class.
-func userModelCacheStorageClassName(isvc *inferencev1alpha1.InferenceService) string {
-	if isvc == nil || isvc.Spec.ModelCache == nil {
-		return ""
-	}
-	return isvc.Spec.ModelCache.StorageClassName
-}
-
 // warnIgnoredModelCacheClaim emits a ModelCacheClaimIgnored warning event when
 // spec.modelCache.claimName is set but has no effect. The field targets the
 // download-into-cache path, so it is meaningless whenever that path is
@@ -186,12 +166,13 @@ func userModelCacheStorageClassName(isvc *inferencev1alpha1.InferenceService) st
 //     cache key (local file:// source, or a remote model whose fingerprint has
 //     not landed in Status.CacheKey yet), the pod falls back to an ephemeral
 //     emptyDir and re-downloads on every restart (this mirrors the useCache
-//     gate in constructDeployment).
+//     gate in servingStorage).
 func (r *InferenceServiceReconciler) warnIgnoredModelCacheClaim(
 	isvc *inferencev1alpha1.InferenceService,
 	model *inferencev1alpha1.Model,
+	cache effectiveModelCache,
 ) {
-	if r.Recorder == nil || userModelCacheClaimName(isvc) == "" {
+	if r.Recorder == nil || cache.claimName() == "" {
 		return
 	}
 	switch {
@@ -228,8 +209,9 @@ func (r *InferenceServiceReconciler) warnIgnoredModelCacheClaim(
 // starts evicting by QoS class, potentially removing unrelated workloads first.
 func (r *InferenceServiceReconciler) warnUnboundedEphemeralCache(
 	isvc *inferencev1alpha1.InferenceService,
+	cache effectiveModelCache,
 ) {
-	if r.Recorder == nil || !modelCacheIsEphemeral(isvc) {
+	if r.Recorder == nil || !cache.isEphemeral() {
 		return
 	}
 	if isvc.Spec.Resources != nil && isvc.Spec.Resources.EphemeralStorage != "" {
@@ -251,12 +233,13 @@ func (r *InferenceServiceReconciler) warnUnboundedEphemeralCache(
 // claim is deleted. Neither case may pass silently (#1963).
 func (r *InferenceServiceReconciler) warnIgnoredModelCacheStorageClass(
 	isvc *inferencev1alpha1.InferenceService,
+	cache effectiveModelCache,
 	existing *corev1.PersistentVolumeClaim,
 ) {
 	if r.Recorder == nil {
 		return
 	}
-	requested := userModelCacheStorageClassName(isvc)
+	requested := cache.storageClassName()
 	if requested == "" {
 		return
 	}
@@ -283,10 +266,10 @@ func (r *InferenceServiceReconciler) warnIgnoredModelCacheStorageClass(
 // the provisioning side agree on both pre-staged schemes.
 func modelNeedsCachePVC(
 	model *inferencev1alpha1.Model,
-	isvc *inferencev1alpha1.InferenceService,
+	cache effectiveModelCache,
 	modelCachePath string,
 ) bool {
-	return modelWantsCacheVolume(model, isvc, modelCachePath) &&
+	return modelWantsCacheVolume(model, cache, modelCachePath) &&
 		!isPVCSource(model.Spec.Source) &&
 		!isOCISource(model.Spec.Source)
 }
@@ -303,12 +286,12 @@ func modelNeedsCachePVC(
 // which never consult this.
 func modelWantsCacheVolume(
 	model *inferencev1alpha1.Model,
-	isvc *inferencev1alpha1.InferenceService,
+	cache effectiveModelCache,
 	modelCachePath string,
 ) bool {
 	return modelCachePath != "" &&
 		effectiveModelCacheKey(model) != "" &&
-		!modelCacheIsEphemeral(isvc)
+		!cache.isEphemeral()
 }
 
 // ephemeralCacheSizeLimit returns the sizeLimit to put on the emptyDir that
@@ -326,8 +309,8 @@ func modelWantsCacheVolume(
 // GGUF metadata range read, which only runs for remote http(s) sources, so it
 // is absent for s3:// among others), and a guess that lands under the real size
 // evicts the Pod for exceeding a number nobody chose.
-func ephemeralCacheSizeLimit(isvc *inferencev1alpha1.InferenceService) *resource.Quantity {
-	if !modelCacheIsEphemeral(isvc) || isvc.Spec.Resources == nil {
+func ephemeralCacheSizeLimit(isvc *inferencev1alpha1.InferenceService, cache effectiveModelCache) *resource.Quantity {
+	if isvc == nil || !cache.isEphemeral() || isvc.Spec.Resources == nil {
 		return nil
 	}
 	if isvc.Spec.Resources.EphemeralStorage == "" {
@@ -342,33 +325,6 @@ func ephemeralCacheSizeLimit(isvc *inferencev1alpha1.InferenceService) *resource
 		return nil
 	}
 	return &q
-}
-
-// modelCacheIsEphemeral reports whether the InferenceService declined the cache
-// (#1451). Only an explicit Ephemeral opts out: a nil isvc, an absent
-// modelCache block, and an empty persistence all resolve to Cached, so the
-// default behaviour is unchanged.
-func modelCacheIsEphemeral(isvc *inferencev1alpha1.InferenceService) bool {
-	return isvc != nil && isvc.Spec.ModelCache != nil &&
-		isvc.Spec.ModelCache.Persistence == inferencev1alpha1.ModelCachePersistenceEphemeral
-}
-
-// modelCachePVCName returns the name of the model cache PVC for the given mode.
-// A per-InferenceService spec.modelCache.claimName override (#928) wins over
-// the operator-global mode: that user-owned PVC becomes the cache volume for
-// this workload only. Otherwise, in shared mode (the default, and the
-// resolution of an empty mode) this is the single cluster-wide PVC; in
-// perService mode it is the per-InferenceService PVC "<isvc>-model-cache". A
-// nil isvc (unit tests that exercise the builder directly) falls back to the
-// shared name.
-func modelCachePVCName(isvc *inferencev1alpha1.InferenceService, mode string) string {
-	if claim := userModelCacheClaimName(isvc); claim != "" {
-		return claim
-	}
-	if resolveCacheMode(mode) == ModelCacheModeShared || isvc == nil {
-		return ModelCachePVCName
-	}
-	return fmt.Sprintf("%s-model-cache", isvc.Name)
 }
 
 // isLocalModelSource delegates to the shared isLocalSource helper in source.go.
@@ -1519,7 +1475,7 @@ func applyInitContainerDiagnostics(containers []corev1.Container) {
 	}
 }
 
-func buildModelStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, namespace string, useCache bool, cacheMode string, caCertConfigMap string, initContainerImage string, defaultFSGroup int64, prep string, initContainerUser int64, allowedHostPathRoots []string, hfEndpoint string) (cfg modelStorageConfig) {
+func buildModelStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, cache effectiveModelCache, namespace string, useCache bool, cacheMode string, caCertConfigMap string, initContainerImage string, defaultFSGroup int64, prep string, initContainerUser int64, allowedHostPathRoots []string, hfEndpoint string) (cfg modelStorageConfig) {
 	// Stamp crash diagnostics on whatever the branches below return. Done
 	// once here rather than at each construction site so a future storage
 	// path cannot be added without it (#1437).
@@ -1543,9 +1499,9 @@ func buildModelStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1al
 		return buildOCIStorageConfig(model, initContainerImage)
 	}
 	if useCache {
-		return buildCachedStorageConfig(model, isvc, cacheMode, caCertConfigMap, initContainerImage, defaultFSGroup, prep, initContainerUser, hfEndpoint)
+		return buildCachedStorageConfig(model, isvc, cache, cacheMode, caCertConfigMap, initContainerImage, defaultFSGroup, prep, initContainerUser, hfEndpoint)
 	}
-	return buildEmptyDirStorageConfig(model, isvc, namespace, caCertConfigMap, initContainerImage, hfEndpoint)
+	return buildEmptyDirStorageConfig(model, isvc, cache, namespace, caCertConfigMap, initContainerImage, hfEndpoint)
 }
 
 // disallowedLocalSourceStorageConfig returns a storage config whose init
@@ -1760,7 +1716,7 @@ func invalidFileSetStorageConfig(initImage string) modelStorageConfig {
 	}
 }
 
-func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, cacheMode string, caCertConfigMap string, initContainerImage string, defaultFSGroup int64, prep string, initContainerUser int64, hfEndpoint string) modelStorageConfig {
+func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, cache effectiveModelCache, cacheMode string, caCertConfigMap string, initContainerImage string, defaultFSGroup int64, prep string, initContainerUser int64, hfEndpoint string) modelStorageConfig {
 	cacheDir := fmt.Sprintf("/models/%s", effectiveModelCacheKey(model))
 
 	// Resolve the fsGroup that the CSI will actually apply to the volume.
@@ -1789,7 +1745,7 @@ func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1a
 					Name: "model-cache",
 					VolumeSource: corev1.VolumeSource{
 						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-							ClaimName: modelCachePVCName(isvc, cacheMode),
+							ClaimName: cache.pvcName(cacheMode),
 							ReadOnly:  false,
 						},
 					},
@@ -1815,7 +1771,7 @@ func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1a
 				Name: "model-cache",
 				VolumeSource: corev1.VolumeSource{
 					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-						ClaimName: modelCachePVCName(isvc, cacheMode),
+						ClaimName: cache.pvcName(cacheMode),
 						ReadOnly:  false,
 					},
 				},
@@ -1859,7 +1815,7 @@ func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1a
 			Name: "model-cache",
 			VolumeSource: corev1.VolumeSource{
 				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-					ClaimName: modelCachePVCName(isvc, cacheMode),
+					ClaimName: cache.pvcName(cacheMode),
 					ReadOnly:  false,
 				},
 			},
@@ -1913,7 +1869,7 @@ func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1a
 	}
 }
 
-func buildEmptyDirStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, namespace string, caCertConfigMap string, initContainerImage string, hfEndpoint string) modelStorageConfig {
+func buildEmptyDirStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, cache effectiveModelCache, namespace string, caCertConfigMap string, initContainerImage string, hfEndpoint string) modelStorageConfig {
 	// Multi-file staging branch for emptyDir storage.
 	plan, err := modelStagingPlan(model)
 	if err != nil {
@@ -1940,7 +1896,7 @@ func buildEmptyDirStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev
 			{
 				Name: "model-storage",
 				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
-					SizeLimit: ephemeralCacheSizeLimit(isvc),
+					SizeLimit: ephemeralCacheSizeLimit(isvc, cache),
 				}},
 			},
 		}
@@ -1972,7 +1928,7 @@ func buildEmptyDirStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev
 		{
 			Name: "model-storage",
 			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
-				SizeLimit: ephemeralCacheSizeLimit(isvc),
+				SizeLimit: ephemeralCacheSizeLimit(isvc, cache),
 			}},
 		},
 	}
@@ -2256,7 +2212,7 @@ func ensureSharedModelCachePVC(ctx context.Context, c client.Client, namespace, 
 	return nil
 }
 
-func (r *InferenceServiceReconciler) ensureModelCachePVC(ctx context.Context, isvc *inferencev1alpha1.InferenceService) error {
+func (r *InferenceServiceReconciler) ensureModelCachePVC(ctx context.Context, isvc *inferencev1alpha1.InferenceService, cache effectiveModelCache) error {
 	log := logf.FromContext(ctx)
 
 	// Bring-your-own cache PVC (#928): spec.modelCache.claimName names a
@@ -2264,7 +2220,7 @@ func (r *InferenceServiceReconciler) ensureModelCachePVC(ctx context.Context, is
 	// it — it only verifies the claim exists. A missing claim is surfaced as
 	// an error (-> Degraded condition + event) rather than silently falling
 	// back to the shared cache.
-	if claim := userModelCacheClaimName(isvc); claim != "" {
+	if claim := cache.claimName(); claim != "" {
 		pvc := &corev1.PersistentVolumeClaim{}
 		err := r.Get(ctx, types.NamespacedName{Name: claim, Namespace: isvc.Namespace}, pvc)
 		if err == nil {
@@ -2285,12 +2241,12 @@ func (r *InferenceServiceReconciler) ensureModelCachePVC(ctx context.Context, is
 
 	shared := resolveCacheMode(r.ModelCacheMode) == ModelCacheModeShared
 	namespace := isvc.Namespace
-	pvcName := modelCachePVCName(isvc, r.ModelCacheMode)
+	pvcName := cache.pvcName(r.ModelCacheMode)
 
 	pvc := &corev1.PersistentVolumeClaim{}
 	err := r.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: namespace}, pvc)
 	if err == nil {
-		r.warnIgnoredModelCacheStorageClass(isvc, pvc)
+		r.warnIgnoredModelCacheStorageClass(isvc, cache, pvc)
 		return nil
 	}
 	if !apierrors.IsNotFound(err) {
@@ -2344,7 +2300,7 @@ func (r *InferenceServiceReconciler) ensureModelCachePVC(ctx context.Context, is
 	// operator-global flag for the claim created here (#1963); the class of an
 	// already-existing claim is never changed, immutability aside, which is
 	// what warnIgnoredModelCacheStorageClass surfaces in both cache modes.
-	effectiveClass := userModelCacheStorageClassName(isvc)
+	effectiveClass := cache.storageClassName()
 	if effectiveClass == "" {
 		effectiveClass = r.ModelCacheClass
 	}
@@ -2384,14 +2340,14 @@ func (r *InferenceServiceReconciler) ensureModelCachePVC(ctx context.Context, is
 // authoritative over anything derived from the Model now: a single-file
 // name is derived from GGUF metadata the Model may have parsed only after
 // the Job ran, and the Job wrote the name it had then.
-func buildPrefetchedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, cacheMode string, initContainerImage string, staged []string) (cfg modelStorageConfig) {
+func buildPrefetchedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, cache effectiveModelCache, cacheMode string, initContainerImage string, staged []string) (cfg modelStorageConfig) {
 	defer func() { applyInitContainerDiagnostics(cfg.initContainers) }()
 	cacheDir := fmt.Sprintf("/models/%s", effectiveModelCacheKey(model))
 	volumes := []corev1.Volume{{
 		Name: "model-cache",
 		VolumeSource: corev1.VolumeSource{
 			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-				ClaimName: modelCachePVCName(isvc, cacheMode),
+				ClaimName: cache.pvcName(cacheMode),
 				ReadOnly:  true,
 			},
 		},

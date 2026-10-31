@@ -43,7 +43,7 @@ import (
 
 const (
 	// cachePrepTripwireDeploymentHash is desiredTemplateHash of
-	// constructDeployment for cachePrepTripwireIsvc and cachePrepTripwireModel.
+	// constructDeploymentForCache for cachePrepTripwireIsvc and cachePrepTripwireModel.
 	cachePrepTripwireDeploymentHash = "036258d33debc73f" //nolint:gosec // a SHA-256 prefix of a pod template, not a credential
 	// cachePrepTripwireJobHash is desiredTemplateHash of buildPrefetchJob's
 	// pod template for cachePrepTripwireModel.
@@ -97,7 +97,7 @@ func cachePrepTripwireModelReconciler() *ModelReconciler {
 
 func TestCachePrepAlwaysTemplatesUnchanged(t *testing.T) {
 	r := cachePrepTripwireISvcReconciler()
-	dep := r.constructDeployment(cachePrepTripwireIsvc(), cachePrepTripwireModel(), nil, 1, "", "")
+	dep := r.constructDeploymentForCache(cachePrepTripwireIsvc(), cachePrepTripwireModel(), resolveEffectiveModelCache(cachePrepTripwireIsvc(), cachePrepTripwireModel()), nil, 1, "", "")
 	if got := desiredTemplateHash(dep.Spec.Template); got != cachePrepTripwireDeploymentHash {
 		t.Errorf("cache-backed Deployment pod template drifted from base: desiredTemplateHash = %s, want %s\n"+
 			"every cache-backed pod would roll on upgrade; the default policy must render exactly what base rendered",
@@ -131,7 +131,7 @@ func TestCachePrepEmptyPolicyRendersPrep(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			model := cachePrepTripwireModel()
 			model.Spec.Files = tc.files
-			cfg := buildCachedStorageConfig(model, nil, "", "", "docker.io/curlimages/curl:8.18.0", 102, "", DefaultInitContainerUser, "")
+			cfg := buildCachedStorageConfig(model, nil, resolveEffectiveModelCache(nil, model), "", "", "docker.io/curlimages/curl:8.18.0", 102, "", DefaultInitContainerUser, "")
 			if len(cfg.initContainers) < 1 || cfg.initContainers[0].Name != "model-cache-prep" {
 				t.Fatalf("empty policy rendered initContainers %v, want model-cache-prep first", containerNames(cfg.initContainers))
 			}

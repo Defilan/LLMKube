@@ -299,7 +299,7 @@ func TestModelStagingPlan_UsesExpandedGlobs(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "default"},
 		Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: "m", Runtime: "vllm"},
 	}
-	cfg := buildModelStorageConfig(model, isvc, "default", true, "", "", defaultPrefetchImage, 0, ModelCachePrepAlways, DefaultInitContainerUser, nil, "")
+	cfg := buildModelStorageConfig(model, isvc, resolveEffectiveModelCache(isvc, model), "default", true, "", "", defaultPrefetchImage, 0, ModelCachePrepAlways, DefaultInitContainerUser, nil, "")
 	var files string
 	for _, c := range cfg.initContainers {
 		for _, e := range c.Env {

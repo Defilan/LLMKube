@@ -69,7 +69,7 @@ func TestMultiFileInitContainer_BareRepoIDViaMirror(t *testing.T) {
 	}
 
 	for _, useCache := range []bool{true, false} {
-		cfg := buildModelStorageConfig(model, isvc, "default", useCache, "", "", defaultPrefetchImage, 0, ModelCachePrepAlways, DefaultInitContainerUser, nil, repoBaseMirror)
+		cfg := buildModelStorageConfig(model, isvc, resolveEffectiveModelCache(isvc, model), "default", useCache, "", "", defaultPrefetchImage, 0, ModelCachePrepAlways, DefaultInitContainerUser, nil, repoBaseMirror)
 		var downloader *corev1.Container
 		for i := range cfg.initContainers {
 			if cfg.initContainers[i].Name == "model-downloader" {

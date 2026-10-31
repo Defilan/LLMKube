@@ -390,7 +390,7 @@ func buildPodAnnotations(isvc *inferencev1alpha1.InferenceService, emitScrape bo
 	if emitScrape {
 		// port is the fully-resolved container port (spec.containerPort ->
 		// spec.endpoint.port -> backend.DefaultPort(), resolved once in
-		// constructDeployment), so annotation scrapers hit the real app port
+		// constructDeploymentForCache), so annotation scrapers hit the real app port
 		// for every runtime and honor spec.containerPort — regardless of the
 		// container-port name ("http", which metrics-named scrape regexes miss).
 		set("prometheus.io/scrape", "true")
@@ -420,6 +420,7 @@ func servedModelPath(isvc *inferencev1alpha1.InferenceService, model *inferencev
 // optIn reports the second case, whose container learns the paths from LLMKUBE_MODEL_*.
 func (r *InferenceServiceReconciler) servingStorage(
 	isvc *inferencev1alpha1.InferenceService,
+	cache effectiveModelCache,
 	model, draftModel *inferencev1alpha1.Model,
 	backend RuntimeBackend,
 	hfEndpoint, draftHFEndpoint string,
@@ -431,8 +432,8 @@ func (r *InferenceServiceReconciler) servingStorage(
 	// Same predicate as the provisioning side (modelNeedsCachePVC), so a
 	// service that declined the cache mounts an emptyDir instead of a claim
 	// nobody created (#1451).
-	useCache := modelWantsCacheVolume(model, isvc, r.ModelCachePath)
-	if g := r.prefetchGate(isvc, model); g.applies && g.satisfied {
+	useCache := modelWantsCacheVolume(model, cache, r.ModelCachePath)
+	if g := r.prefetchGate(isvc, model, cache); g.applies && g.satisfied {
 		// The weights are already on the claim (#2136): mount it read-only
 		// and verify the names the Job recorded, rather than run the
 		// downloader on the serving node.
@@ -440,9 +441,9 @@ func (r *InferenceServiceReconciler) servingStorage(
 		if g.entry != nil {
 			staged = g.entry.Files
 		}
-		storageConfig = buildPrefetchedStorageConfig(model, effectiveCacheService(isvc, model), r.ModelCacheMode, r.InitContainerImage, staged)
+		storageConfig = buildPrefetchedStorageConfig(model, isvc, cache, r.ModelCacheMode, r.InitContainerImage, staged)
 	} else {
-		storageConfig = buildModelStorageConfig(model, isvc, isvc.Namespace, useCache, r.ModelCacheMode, r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.ModelCachePrep, resolveInitContainerUser(r.InitContainerUser), r.AllowedHostPathRoots, hfEndpoint)
+		storageConfig = buildModelStorageConfig(model, isvc, cache, isvc.Namespace, useCache, r.ModelCacheMode, r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.ModelCachePrep, resolveInitContainerUser(r.InitContainerUser), r.AllowedHostPathRoots, hfEndpoint)
 	}
 	modelPath = servedModelPath(isvc, model, storageConfig)
 
@@ -452,8 +453,8 @@ func (r *InferenceServiceReconciler) servingStorage(
 	// must not have a cache volume and two init containers injected behind
 	// its back just because a draft model is referenced.
 	if draftModel != nil {
-		draftUseCache := modelWantsCacheVolume(draftModel, isvc, r.ModelCachePath)
-		draftStorage := buildModelStorageConfig(draftModel, isvc, isvc.Namespace, draftUseCache,
+		draftUseCache := modelWantsCacheVolume(draftModel, cache, r.ModelCachePath)
+		draftStorage := buildModelStorageConfig(draftModel, isvc, cache, isvc.Namespace, draftUseCache,
 			r.ModelCacheMode, r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.ModelCachePrep, resolveInitContainerUser(r.InitContainerUser), r.AllowedHostPathRoots, draftHFEndpoint)
 		// The path comes from the merge's rewritten draft config, not from
 		// draftStorage: the merge may have remounted the draft's volume to
@@ -516,9 +517,12 @@ func setCommandAndArgs(
 	}
 }
 
-func (r *InferenceServiceReconciler) constructDeployment(
+// constructDeploymentForCache renders the Deployment for a service whose
+// effective modelCache has already been resolved.
+func (r *InferenceServiceReconciler) constructDeploymentForCache(
 	isvc *inferencev1alpha1.InferenceService,
 	model *inferencev1alpha1.Model,
+	cache effectiveModelCache,
 	draftModel *inferencev1alpha1.Model,
 	replicas int32,
 	hfEndpoint string,
@@ -545,7 +549,7 @@ func (r *InferenceServiceReconciler) constructDeployment(
 		port = isvc.Spec.Endpoint.Port
 	}
 
-	storageConfig, modelPath, draftPath, optInStaging := r.servingStorage(isvc, model, draftModel, backend, hfEndpoint, draftHFEndpoint)
+	storageConfig, modelPath, draftPath, optInStaging := r.servingStorage(isvc, cache, model, draftModel, backend, hfEndpoint, draftHFEndpoint)
 	args := backend.BuildArgs(isvc, model, modelPath, draftPath, port)
 
 	startupProbe, livenessProbe, readinessProbe := backend.BuildProbes(port)

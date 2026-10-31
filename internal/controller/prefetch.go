@@ -63,7 +63,7 @@ const (
 )
 
 // classifyPrefetchRequest is the one place that decides whether a prefetch
-// request can be honoured. isvc must already carry its effective modelCache.
+// request can be honoured.
 func classifyPrefetchRequest(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, modelCachePath string) (prefetchApplicability, string) {
 	memberNode, memberClaim := multiNodeMemberClaim(isvc)
 	draftRef, draftField := draftWeightsRefFor(isvc)
@@ -114,45 +114,6 @@ func resolveServingRuntime(isvc *inferencev1alpha1.InferenceService) string {
 	return isvc.Spec.Runtime
 }
 
-// inheritedModelCache is the block a service with no modelCache of its own
-// takes from the Model: the claim and its settings, never the prefetch
-// request. Model.spec.modelCache.prefetch is spec.prefetch, which holds no
-// service; a service that waits for the staging asks with its own block.
-func inheritedModelCache(model *inferencev1alpha1.Model) *inferencev1alpha1.ModelCacheSpec {
-	cache := model.Spec.ModelCache.DeepCopy()
-	cache.Prefetch = false
-	return cache
-}
-
-// inheritModelCache gives a service with no modelCache block of its own the
-// Model's claim, in memory only: the claim is declared once on the Model and
-// every referencing service resolves it, while a service that sets its own
-// block keeps it. The controller never writes an InferenceService spec, so
-// the copy is never persisted.
-//
-// A status write mid-reconcile decodes the server's object back into isvc and
-// drops the block again, so the helpers that read it after such a write go
-// through effectiveCacheService instead of trusting the mutation, and
-// reconcileDeployment re-applies it after its own status writes.
-func inheritModelCache(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model) {
-	if isvc == nil || model == nil || isvc.Spec.ModelCache != nil || model.Spec.ModelCache == nil {
-		return
-	}
-	isvc.Spec.ModelCache = inheritedModelCache(model)
-}
-
-// effectiveCacheService returns isvc as the cache helpers should read it: the
-// service itself when it has a modelCache block, else a shallow copy carrying
-// the Model's. The copy is never written anywhere.
-func effectiveCacheService(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model) *inferencev1alpha1.InferenceService {
-	if isvc == nil || isvc.Spec.ModelCache != nil || model == nil || model.Spec.ModelCache == nil {
-		return isvc
-	}
-	eff := *isvc
-	eff.Spec.ModelCache = inheritedModelCache(model)
-	return &eff
-}
-
 // modelWantsPrefetch reports whether the Model asks to be staged into its own
 // cache claim: spec.prefetch, or its alias spec.modelCache.prefetch.
 func modelWantsPrefetch(model *inferencev1alpha1.Model) bool {
@@ -190,14 +151,6 @@ func prefetchableSource(model *inferencev1alpha1.Model) bool {
 	}
 	// A bare repo ID with spec.files is staged by the operator (stagingRepoBase).
 	return hasMultiFileStaging(model) && isHFRepoSource(model.Spec.Source)
-}
-
-// servicePrefetchRequested reports whether an InferenceService asks for its
-// Model to be prefetched into the cache claim its pods mount. The request is
-// the service's own: inheritModelCache carries the Model's claim, not this.
-func servicePrefetchRequested(isvc *inferencev1alpha1.InferenceService) bool {
-	return isvc != nil && isvc.Spec.ModelCache != nil && isvc.Spec.ModelCache.Prefetch &&
-		isvc.Spec.ModelCache.Persistence != inferencev1alpha1.ModelCachePersistenceEphemeral
 }
 
 // findPrefetchStatus returns the entry for claim, or nil.
@@ -272,13 +225,13 @@ func serviceReportsPrefetchedFilesMissing(isvc *inferencev1alpha1.InferenceServi
 // own, and would download at serve time if the claim were not staged: the
 // Model asks for prefetch, the service does not, and the pods mount a cache
 // claim (not Metal, not an ephemeral or disabled cache, not a pre-staged
-// source). ok is false otherwise. isvc must carry its effective modelCache.
-func unprefetchedConsumerClaim(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, cacheMode, cachePath string) (string, bool) {
-	if servicePrefetchRequested(isvc) || !modelWantsPrefetch(model) || isMetalModel(model) ||
-		!modelNeedsCachePVC(model, isvc, cachePath) {
+// source). ok is false otherwise.
+func unprefetchedConsumerClaim(cache effectiveModelCache, model *inferencev1alpha1.Model, cacheMode, cachePath string) (string, bool) {
+	if cache.prefetchRequested() || !modelWantsPrefetch(model) || isMetalModel(model) ||
+		!modelNeedsCachePVC(model, cache, cachePath) {
 		return "", false
 	}
-	return modelCachePVCName(isvc, cacheMode), true
+	return cache.pvcName(cacheMode), true
 }
 
 // jobSucceeded / jobFailed read the Job's terminal conditions.

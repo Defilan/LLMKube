@@ -164,7 +164,7 @@ type ModelReconciler struct {
 	ModelCacheAccessMode string
 	// ModelCacheMode is the InferenceService reconciler's cache mode, so a
 	// service-requested prefetch (#2136) targets the claim that service's
-	// pods mount (modelCachePVCName), including a perService claim.
+	// pods mount (effectiveModelCache.pvcName), including a perService claim.
 	ModelCacheMode string
 	// ModelCachePath is the InferenceService reconciler's cache path flag;
 	// empty means caching is disabled and no service can consume a

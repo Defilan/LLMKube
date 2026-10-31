@@ -44,7 +44,7 @@ const (
 	wantTransformersOff = "1"
 )
 
-// TestHubOfflineEnv drives constructDeployment and asserts on the serving
+// TestHubOfflineEnv drives constructDeploymentForCache and asserts on the serving
 // container's env: spec.hubOffline adds both offline variables exactly once, a
 // spec.env entry still lands last, the operator's downloader stays online, and
 // the runtime mirror env is dropped because an offline runtime makes no request.
@@ -165,7 +165,7 @@ func TestHubOfflineEnv(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
-			dep := r.constructDeployment(tc.isvc, tc.model, nil, 1, testMirror, "")
+			dep := r.constructDeploymentForCache(tc.isvc, tc.model, resolveEffectiveModelCache(tc.isvc, tc.model), nil, 1, testMirror, "")
 
 			for _, want := range tc.wantOffline {
 				got := servingEnv(dep, want.Name)
@@ -229,7 +229,7 @@ func TestHubOfflineEnvUserEnvWins(t *testing.T) {
 			},
 		},
 	}
-	dep := r.constructDeployment(svc, model, nil, 1, testMirror, "")
+	dep := r.constructDeploymentForCache(svc, model, resolveEffectiveModelCache(svc, model), nil, 1, testMirror, "")
 	for _, name := range []string{"HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"} {
 		entries := servingEnv(dep, name)
 		if len(entries) != 2 || entries[0].Value != "1" || entries[len(entries)-1].Value != "0" {
@@ -372,7 +372,7 @@ func TestHubOfflineEnvReachesMultiNodeMembers(t *testing.T) {
 		Spec:       inferencev1alpha1.ModelSpec{Source: "Qwen/Qwen3.8-27B-FP8"},
 	}
 	r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
-	tmpl := r.constructDeployment(isvc, model, nil, 1, "", "").Spec.Template
+	tmpl := r.constructDeploymentForCache(isvc, model, resolveEffectiveModelCache(isvc, model), nil, 1, "", "").Spec.Template
 	mnb := resolveBackend(isvc).(MultiNodeArgsBuilder)
 	for rank, member := range isvc.Spec.MultiNode.Members {
 		pod := memberPodFromTemplate(tmpl, isvc, member, int32(rank), mnb) //nolint:gosec // G115: two members

@@ -673,7 +673,7 @@ var _ = Describe("buildPrefetchedStorageConfig", func() {
 
 	It("mounts the claim read-only and verifies the staged file set instead of downloading", func() {
 		model := multiFileModel(2)
-		cfg := buildPrefetchedStorageConfig(model, isvc, ModelCacheModeShared, "curl:8.18.0", nil)
+		cfg := buildPrefetchedStorageConfig(model, isvc, resolveEffectiveModelCache(isvc, model), ModelCacheModeShared, "curl:8.18.0", nil)
 		key := effectiveModelCacheKey(model)
 		Expect(cfg.modelPath).To(Equal("/models/" + key + "/config.json"))
 		Expect(cfg.stagedDir).To(Equal("/models/" + key))
@@ -694,7 +694,7 @@ var _ = Describe("buildPrefetchedStorageConfig", func() {
 	})
 
 	It("fails closed when the glob expansion is not current for the Model's generation", func() {
-		cfg := buildPrefetchedStorageConfig(multiFileModel(3), isvc, ModelCacheModeShared, "curl:8.18.0", nil)
+		cfg := buildPrefetchedStorageConfig(multiFileModel(3), isvc, resolveEffectiveModelCache(isvc, multiFileModel(3)), ModelCacheModeShared, "curl:8.18.0", nil)
 		Expect(cfg.initContainers).To(HaveLen(1))
 		Expect(strings.Join(cfg.initContainers[0].Command, " ")).To(ContainSubstring("StagedFilesNotCurrent"))
 		Expect(cfg.volumes[0].PersistentVolumeClaim.ReadOnly).To(BeTrue())
@@ -702,7 +702,7 @@ var _ = Describe("buildPrefetchedStorageConfig", func() {
 
 	It("verifies the names the entry recorded over names derived now", func() {
 		multi := multiFileModel(2)
-		cfg := buildPrefetchedStorageConfig(multi, isvc, ModelCacheModeShared, "curl:8.18.0", []string{"config.json", "a.safetensors"})
+		cfg := buildPrefetchedStorageConfig(multi, isvc, resolveEffectiveModelCache(isvc, multi), ModelCacheModeShared, "curl:8.18.0", []string{"config.json", "a.safetensors"})
 		key := effectiveModelCacheKey(multi)
 		Expect(envValue(cfg.initContainers[0].Env, "MODEL_FILES")).To(Equal("config.json\na.safetensors"))
 		Expect(cfg.modelPath).To(Equal("/models/" + key + "/config.json"))
@@ -713,7 +713,7 @@ var _ = Describe("buildPrefetchedStorageConfig", func() {
 			Spec:       inferencev1alpha1.ModelSpec{Source: "https://example.com/models/llama.gguf"},
 			Status:     inferencev1alpha1.ModelStatus{CacheKey: "abc123", GGUF: &inferencev1alpha1.GGUFMetadata{ModelName: "Parsed After The Job"}},
 		}
-		cfg = buildPrefetchedStorageConfig(single, nil, ModelCacheModeShared, "curl:8.18.0", []string{"llama.gguf"})
+		cfg = buildPrefetchedStorageConfig(single, nil, resolveEffectiveModelCache(nil, single), ModelCacheModeShared, "curl:8.18.0", []string{"llama.gguf"})
 		Expect(canonicalModelBasename(single)).NotTo(Equal("llama.gguf"))
 		Expect(envValue(cfg.initContainers[0].Env, "MODEL_FILES")).To(Equal("llama.gguf"))
 		Expect(cfg.modelPath).To(Equal("/models/abc123/llama.gguf"))
@@ -726,7 +726,7 @@ var _ = Describe("buildPrefetchedStorageConfig", func() {
 			Spec:       inferencev1alpha1.ModelSpec{Source: "https://example.com/models/llama.gguf", SHA256: strings.Repeat("AB", 32)},
 			Status:     inferencev1alpha1.ModelStatus{CacheKey: "abc123"},
 		}
-		cfg := buildPrefetchedStorageConfig(model, nil, ModelCacheModeShared, "curl:8.18.0", []string{"pinned.gguf"})
+		cfg := buildPrefetchedStorageConfig(model, nil, resolveEffectiveModelCache(nil, model), ModelCacheModeShared, "curl:8.18.0", []string{"pinned.gguf"})
 		verify := cfg.initContainers[0]
 		Expect(envValue(verify.Env, "MODEL_SHA256")).To(Equal(strings.Repeat("ab", 32)))
 		Expect(envValue(verify.Env, "MODEL_PATH")).To(Equal("/models/abc123/pinned.gguf"))
@@ -735,7 +735,7 @@ var _ = Describe("buildPrefetchedStorageConfig", func() {
 		Expect(cmd).To(ContainSubstring("spec.sha256"))
 
 		model.Spec.SHA256 = ""
-		cfg = buildPrefetchedStorageConfig(model, nil, ModelCacheModeShared, "curl:8.18.0", []string{"pinned.gguf"})
+		cfg = buildPrefetchedStorageConfig(model, nil, resolveEffectiveModelCache(nil, model), ModelCacheModeShared, "curl:8.18.0", []string{"pinned.gguf"})
 		Expect(envValue(cfg.initContainers[0].Env, "MODEL_SHA256")).To(BeEmpty())
 		Expect(strings.Join(cfg.initContainers[0].Command, " ")).NotTo(ContainSubstring("llmkube_sha256_hash"))
 	})
@@ -746,7 +746,7 @@ var _ = Describe("buildPrefetchedStorageConfig", func() {
 			Spec:       inferencev1alpha1.ModelSpec{Source: "https://example.com/models/llama.gguf"},
 			Status:     inferencev1alpha1.ModelStatus{CacheKey: "abc123"},
 		}
-		cfg := buildPrefetchedStorageConfig(model, nil, ModelCacheModeShared, "curl:8.18.0", nil)
+		cfg := buildPrefetchedStorageConfig(model, nil, resolveEffectiveModelCache(nil, model), ModelCacheModeShared, "curl:8.18.0", nil)
 		Expect(cfg.modelPath).To(Equal("/models/abc123/" + canonicalModelBasename(model)))
 		Expect(cfg.stagedDir).To(BeEmpty())
 		Expect(cfg.volumes[0].PersistentVolumeClaim.ClaimName).To(Equal(ModelCachePVCName))
@@ -785,7 +785,9 @@ var _ = Describe("prefetchGate classification", func() {
 	// and held, so prefetch: true never rolls out a downloader quietly.
 	DescribeTable("refuses what prefetch cannot cover and passes through what never downloads",
 		func(cachePath, source string, mutate func(*inferencev1alpha1.InferenceService), wantApplies, wantUnsupported bool, wantReason string) {
-			g := reconciler(cachePath).prefetchGate(newService(mutate), newModel(source))
+			svc := newService(mutate)
+			mdl := newModel(source)
+			g := reconciler(cachePath).prefetchGate(svc, mdl, resolveEffectiveModelCache(svc, mdl))
 			Expect(g.requested).To(BeTrue())
 			Expect(g.applies).To(Equal(wantApplies))
 			Expect(g.unsupported).To(Equal(wantUnsupported))
@@ -809,10 +811,10 @@ var _ = Describe("prefetchGate classification", func() {
 		model := newModel(https)
 		model.Spec.ModelCache = &inferencev1alpha1.ModelCacheSpec{ClaimName: "model-cache", Prefetch: true}
 		svc := newService(func(s *inferencev1alpha1.InferenceService) { s.Spec.ModelCache = nil })
-		g := reconciler("/models").prefetchGate(svc, model)
+		g := reconciler("/models").prefetchGate(svc, model, resolveEffectiveModelCache(svc, model))
 		Expect(g.requested).To(BeFalse(), "modelCache.prefetch on the Model is spec.prefetch; a service asks with its own block")
 		Expect(svc.Spec.ModelCache).To(BeNil(), "the gate reads an effective copy")
-		Expect(effectiveCacheService(svc, model).Spec.ModelCache.ClaimName).To(Equal("model-cache"))
+		Expect(resolveEffectiveModelCache(svc, model).claimName()).To(Equal("model-cache"))
 	})
 
 	It("refuses a multiNode member that mounts its own claim, which no prefetch stages", func() {
@@ -822,7 +824,8 @@ var _ = Describe("prefetchGate classification", func() {
 				{Node: "node-b", ModelCache: &inferencev1alpha1.MultiNodeMemberCache{ClaimName: "node-b-cache"}},
 			}}
 		})
-		g := reconciler("/models").prefetchGate(svc, newModel(https))
+		mdl := newModel(https)
+		g := reconciler("/models").prefetchGate(svc, mdl, resolveEffectiveModelCache(svc, mdl))
 		Expect(g.unsupported).To(BeTrue(), "rank 1 would mount node-b-cache read-only and fail model-verify forever")
 		Expect(g.message).To(ContainSubstring("node-b-cache"))
 	})
@@ -852,14 +855,17 @@ var _ = Describe("warnPrefetchTargetMismatch", func() {
 
 	It("warns a service that mounts a claim its prefetched Model was not staged into", func() {
 		r, recorder := newReconciler()
-		r.warnPrefetchTargetMismatch(service(&inferencev1alpha1.ModelCacheSpec{ClaimName: "elsewhere"}), model)
+		elsewhere := service(&inferencev1alpha1.ModelCacheSpec{ClaimName: "elsewhere"})
+		r.warnPrefetchTargetMismatch(elsewhere, model, resolveEffectiveModelCache(elsewhere, model))
 		Expect(drainEvents(recorder)).To(ContainElement(HavePrefix("Warning " + ReasonPrefetchTargetMismatch)))
 	})
 
 	It("stays quiet for a service on the prefetched claim, or one that asks for its own prefetch", func() {
 		r, recorder := newReconciler()
-		r.warnPrefetchTargetMismatch(service(nil), model)
-		r.warnPrefetchTargetMismatch(service(&inferencev1alpha1.ModelCacheSpec{ClaimName: "elsewhere", Prefetch: true}), model)
+		own := service(nil)
+		r.warnPrefetchTargetMismatch(own, model, resolveEffectiveModelCache(own, model))
+		asksOwn := service(&inferencev1alpha1.ModelCacheSpec{ClaimName: "elsewhere", Prefetch: true})
+		r.warnPrefetchTargetMismatch(asksOwn, model, resolveEffectiveModelCache(asksOwn, model))
 		Expect(drainEvents(recorder)).To(BeEmpty())
 	})
 })

@@ -62,11 +62,11 @@ func TestModelCachePersistence_EphemeralSkipsPVC(t *testing.T) {
 
 	// Control: the same model without the opt-out does want a cache PVC.
 	// Without this the test could pass because the model was never cacheable.
-	if !modelNeedsCachePVC(model, nil, "/models") {
+	if !modelNeedsCachePVC(model, resolveEffectiveModelCache(nil, nil), "/models") {
 		t.Fatal("control failed: a cacheable model with caching enabled should want a PVC")
 	}
 
-	if modelNeedsCachePVC(model, ephemeralISvc(), "/models") {
+	if modelNeedsCachePVC(model, resolveEffectiveModelCache(ephemeralISvc(), nil), "/models") {
 		t.Error("ephemeral persistence should skip the cache PVC, but the operator would provision one")
 	}
 }
@@ -99,7 +99,7 @@ func TestModelCachePersistence_DefaultAndCachedStillCache(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if !modelNeedsCachePVC(model, tc.isvc, "/models") {
+			if !modelNeedsCachePVC(model, resolveEffectiveModelCache(tc.isvc, nil), "/models") {
 				t.Error("caching should remain on; only an explicit Ephemeral opt-out disables it")
 			}
 		})
@@ -112,17 +112,17 @@ func TestModelCachePersistence_DefaultAndCachedStillCache(t *testing.T) {
 func TestModelCachePersistence_MountSideAgrees(t *testing.T) {
 	model := cacheableModel()
 
-	if !modelWantsCacheVolume(model, nil, "/models") {
+	if !modelWantsCacheVolume(model, resolveEffectiveModelCache(nil, nil), "/models") {
 		t.Fatal("control failed: a cacheable model should mount the cache volume")
 	}
-	if modelWantsCacheVolume(model, ephemeralISvc(), "/models") {
+	if modelWantsCacheVolume(model, resolveEffectiveModelCache(ephemeralISvc(), nil), "/models") {
 		t.Error("ephemeral persistence should mount an emptyDir, not the cache volume")
 	}
 
 	// Both gates must agree for every combination, since disagreement is what
 	// produces an orphaned claim or an unschedulable pod.
 	for _, isvc := range []*inferencev1alpha1.InferenceService{nil, ephemeralISvc()} {
-		if got, want := modelWantsCacheVolume(model, isvc, "/models"), modelNeedsCachePVC(model, isvc, "/models"); got != want {
+		if got, want := modelWantsCacheVolume(model, resolveEffectiveModelCache(isvc, nil), "/models"), modelNeedsCachePVC(model, resolveEffectiveModelCache(isvc, nil), "/models"); got != want {
 			t.Errorf("mount side (%v) and provisioning side (%v) disagree", got, want)
 		}
 	}
@@ -131,7 +131,7 @@ func TestModelCachePersistence_MountSideAgrees(t *testing.T) {
 // Ephemeral must not resurrect caching when the operator has it switched off
 // globally, and must not override the pvc:// exclusion.
 func TestModelCachePersistence_DoesNotOverrideOtherExclusions(t *testing.T) {
-	if modelNeedsCachePVC(cacheableModel(), ephemeralISvc(), "") {
+	if modelNeedsCachePVC(cacheableModel(), resolveEffectiveModelCache(ephemeralISvc(), nil), "") {
 		t.Error("caching disabled on the operator must stay disabled")
 	}
 	staged := &inferencev1alpha1.Model{
@@ -139,7 +139,7 @@ func TestModelCachePersistence_DoesNotOverrideOtherExclusions(t *testing.T) {
 		Spec:       inferencev1alpha1.ModelSpec{Source: "pvc://weights/m.gguf"},
 	}
 	staged.Status.CacheKey = "deadbeefdeadbeef"
-	if modelNeedsCachePVC(staged, ephemeralISvc(), "/models") {
+	if modelNeedsCachePVC(staged, resolveEffectiveModelCache(ephemeralISvc(), nil), "/models") {
 		t.Error("pvc:// sources are pre-staged and never take a cache PVC")
 	}
 }

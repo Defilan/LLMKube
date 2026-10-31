@@ -97,11 +97,10 @@ type prefetchGate struct {
 }
 
 // prefetchGate reads the Model's prefetch entry for the claim this service's
-// pods mount. Call after inheritModelCache.
-func (r *InferenceServiceReconciler) prefetchGate(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model) prefetchGate {
+// pods mount.
+func (r *InferenceServiceReconciler) prefetchGate(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, cache effectiveModelCache) prefetchGate {
 	g := prefetchGate{}
-	isvc = effectiveCacheService(isvc, model)
-	if !servicePrefetchRequested(isvc) {
+	if !cache.prefetchRequested() {
 		return g
 	}
 	g.requested = true
@@ -119,7 +118,7 @@ func (r *InferenceServiceReconciler) prefetchGate(isvc *inferencev1alpha1.Infere
 		return g
 	}
 	g.applies = true
-	g.claim = modelCachePVCName(isvc, r.ModelCacheMode)
+	g.claim = cache.pvcName(r.ModelCacheMode)
 	entry := findPrefetchStatus(model, g.claim)
 	g.entry = entry
 	switch {
@@ -187,8 +186,8 @@ func setModelPrefetchedCondition(isvc *inferencev1alpha1.InferenceService, g pre
 // not reconciled, so a member lost to an eviction or a drain is recreated
 // only once the prefetch finishes; the Deployment path heals through its
 // ReplicaSet meanwhile.
-func (r *InferenceServiceReconciler) holdForPrefetch(ctx context.Context, isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, desiredReplicas int32, modelReady bool) (held bool, dep *appsv1.Deployment, counts replicaCounts, result *ctrl.Result, err error) {
-	g := r.prefetchGate(isvc, model)
+func (r *InferenceServiceReconciler) holdForPrefetch(ctx context.Context, isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, cache effectiveModelCache, desiredReplicas int32, modelReady bool) (held bool, dep *appsv1.Deployment, counts replicaCounts, result *ctrl.Result, err error) {
+	g := r.prefetchGate(isvc, model, cache)
 	setModelPrefetchedCondition(isvc, g)
 	if !g.applies || g.satisfied || desiredReplicas == 0 {
 		// The hold's diagnosis is this controller's to clear: the Ready path
@@ -246,8 +245,8 @@ func (r *InferenceServiceReconciler) holdForPrefetch(ctx context.Context, isvc *
 // the condition must have transitioned after the entry last succeeded, so a
 // claim the serving node cannot reach at all is re-staged once and then
 // stays reported, not re-staged in a loop.
-func (r *InferenceServiceReconciler) restagePrefetchOnMissingFiles(ctx context.Context, isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model) {
-	g := r.prefetchGate(isvc, model)
+func (r *InferenceServiceReconciler) restagePrefetchOnMissingFiles(ctx context.Context, isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, cache effectiveModelCache) {
+	g := r.prefetchGate(isvc, model, cache)
 	if !g.applies || !g.satisfied {
 		return
 	}
@@ -298,11 +297,11 @@ func (r *InferenceServiceReconciler) restagePrefetchOnMissingFiles(ctx context.C
 // prefetch when its Model was prefetched, but into another claim than the
 // one this service mounts: its pods download at serve time, which is what
 // the Model's spec.prefetch was meant to avoid.
-func (r *InferenceServiceReconciler) warnPrefetchTargetMismatch(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model) {
+func (r *InferenceServiceReconciler) warnPrefetchTargetMismatch(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, cache effectiveModelCache) {
 	if r.Recorder == nil {
 		return
 	}
-	claim, ok := unprefetchedConsumerClaim(effectiveCacheService(isvc, model), model, r.ModelCacheMode, r.ModelCachePath)
+	claim, ok := unprefetchedConsumerClaim(cache, model, r.ModelCacheMode, r.ModelCachePath)
 	if !ok {
 		return
 	}
