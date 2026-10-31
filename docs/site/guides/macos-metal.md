@@ -423,6 +423,14 @@ admitting it blind risks a host-level stall instead of a failed pod.
 Set `--memory-check-mode warn` to restore the older log-and-proceed
 behavior if you need an escape hatch.
 
+A size probe that fails only because the source cannot be reached
+right now (connection refused, no route to host, a timeout, a
+temporary DNS failure, a 5xx or a 429) is retried on the next poll
+without a status change or a Warning Event; nothing starts in the
+meantime. The agent refuses with `MemoryCheckFailed` once such
+failures have lasted 3 minutes, and at once for a definitive answer
+such as a 401, 403 or 404.
+
 The agent also implements **memory-pressure protection**: if
 macOS reports critical memory pressure, the agent can evict the
 lowest-priority running InferenceService, keep it stopped until
@@ -1066,7 +1074,9 @@ The agent could not size the model at all, so it refused to start
 it. `status.schedulingMessage` lists every source it tried (local
 file, Model `status.size`, HEAD probe of the source URL). The most
 common causes are a gated Hugging Face repo rejecting the HEAD
-probe (401) or a source URL that does not return `Content-Length`.
+probe (401), a source URL that does not return `Content-Length`, or
+a source that stayed unreachable for the 3 minutes the agent retries
+a failed probe quietly.
 Fix the source so it can be probed, wait for the Model controller
 to populate `status.size`, or start the agent with
 `--memory-check-mode warn` to admit unsized models at your own

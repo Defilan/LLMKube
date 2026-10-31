@@ -119,6 +119,14 @@ func (a *MetalAgent) handleStartProcessError(
 		a.emitInferenceEvent(ctx, &ManagedProcess{Namespace: isvc.Namespace, Name: isvc.Name},
 			corev1.EventTypeWarning, EventReasonEngineRecordFailed, "Start failed: %v", startErr)
 	}
+	// A download that could not read its sourceSecretRef has not fetched
+	// anything yet, so retrying the start costs one more read. Any other
+	// failure is not requeued even when it may be transient: a retry would
+	// download or load the model again every poll.
+	var readErr *sourceSecretReadError
+	if errors.As(startErr, &readErr) {
+		a.requeue(types.NamespacedName{Namespace: isvc.Namespace, Name: isvc.Name}.String())
+	}
 	return fmt.Errorf("failed to start process: %w", startErr)
 }
 

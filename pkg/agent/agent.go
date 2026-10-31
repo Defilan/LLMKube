@@ -420,6 +420,11 @@ type MetalAgent struct {
 	// over-cap download, so reconcileProcess can refuse such a Model without
 	// re-downloading the whole file (tens of GB) every reconcile.
 	digestMismatches *digestMismatchMemo
+
+	// sizeProbes tracks each InferenceService's streak of transient remote
+	// size probe failures, which memory admission retries quietly until it
+	// lasts sizeProbeRetryWindow (#2326).
+	sizeProbes sizeProbeRetries
 }
 
 // ManagedProcess represents a running inference process (llama-server, oMLX, or Ollama model).
@@ -1238,7 +1243,7 @@ func (a *MetalAgent) fetchModelThenStopStale(
 ) (*inferencev1alpha1.Model, error) {
 	model, modelErr := a.fetchModelForReconcile(ctx, isvc)
 	if modelErr != nil && !apierrors.IsNotFound(modelErr) {
-		return nil, modelErr
+		return nil, a.retryIfTransient(isvc, modelErr)
 	}
 	if existing != nil {
 		a.logger.Infow("spec changed; restarting process to pick up new flags",
@@ -1359,7 +1364,7 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 		if errors.As(err, &conflict) {
 			return a.refuseStart(ctx, isvc, EventReasonEndpointNameConflict, conflict.Error())
 		}
-		return fmt.Errorf("failed to check endpoint name: %w", err)
+		return a.retryIfTransient(isvc, fmt.Errorf("failed to check endpoint name: %w", err))
 	}
 
 	// Refuse a Model the controller marked Failed, any local model source or
@@ -1561,6 +1566,7 @@ func (a *MetalAgent) deleteProcess(ctx context.Context, key string) error {
 	// never reaches a.processes, since refuseStart returns before a process
 	// is ever stored there.
 	a.digestMismatches.forgetISVC(key)
+	a.sizeProbes.forget(key)
 
 	a.mu.Lock()
 	// Whatever tears the service down (a delete, eviction, a spec change)
@@ -2270,8 +2276,9 @@ func (a *MetalAgent) checkMemoryAdmission(
 ) error {
 	estimate, err := a.estimateModelMemory(ctx, model, contextSize, cacheTypeK, cacheTypeV)
 	if err != nil {
-		return a.failMemoryCheck(ctx, isvc, fmt.Sprintf("memory estimation failed: %v", err))
+		return a.failModelEstimate(ctx, isvc, model, err)
 	}
+	a.sizeProbes.forget(types.NamespacedName{Namespace: isvc.Namespace, Name: isvc.Name}.String())
 	memoryEstimatedBytes.WithLabelValues(isvc.Name, isvc.Namespace).Set(float64(estimate.TotalBytes))
 
 	// This Mac's budget, the limit its owner set with --memory-fraction. Every
@@ -2562,34 +2569,25 @@ func (a *MetalAgent) estimateModelMemory(
 		}
 	}
 
-	// Last resort: HEAD the source for its Content-Length.
-	if fileSizeBytes == 0 &&
-		(strings.HasPrefix(model.Spec.Source, "http://") || strings.HasPrefix(model.Spec.Source, "https://")) {
-		probeClient := safehttp.NewClient(a.downloadAllow, 0, downloadHostsFlag)
-		size, err := remoteModelSize(ctx, probeClient, model.Spec.Source)
-		probeClient.CloseIdleConnections()
-		if err != nil {
+	// Last resort: HEAD the source over the network for its size.
+	var probeErr error
+	if fileSizeBytes == 0 {
+		if size, probed, err := a.probeRemoteModelSize(ctx, model); err != nil {
+			probeErr = err
 			reasons = append(reasons, fmt.Sprintf("remote size probe failed: %v", err))
-		} else {
-			fileSizeBytes = size
-		}
-	}
-
-	// s3:// sources need the signed, credential-bearing client, so they are
-	// probed through the same executor the download uses rather than the
-	// plain client above.
-	if fileSizeBytes == 0 && isS3Source(model.Spec.Source) {
-		size, err := a.s3SizeProbe(ctx, model)
-		if err != nil {
-			reasons = append(reasons, fmt.Sprintf("remote size probe failed: %v", err))
-		} else {
+		} else if probed {
 			fileSizeBytes = size
 		}
 	}
 
 	if fileSizeBytes == 0 {
-		return MemoryEstimate{}, fmt.Errorf(
-			"cannot determine model size: %s", strings.Join(reasons, "; "))
+		err := fmt.Errorf("cannot determine model size: %s", strings.Join(reasons, "; "))
+		// The probe was the only input still missing, so a probe that may
+		// succeed next time makes the whole estimate retryable.
+		if isTransientError(probeErr) {
+			return MemoryEstimate{}, &transientSizeProbeError{err: err}
+		}
+		return MemoryEstimate{}, err
 	}
 
 	var layerCount, embeddingSize, headCount, headCountKV, keyLength, valueLength uint64
@@ -2610,6 +2608,26 @@ func (a *MetalAgent) estimateModelMemory(
 		KeyLength:   keyLength,
 		ValueLength: valueLength,
 	}), nil
+}
+
+// probeRemoteModelSize sizes an http(s) source with a HEAD for its
+// Content-Length, or an s3:// source with a signed HEAD through the same
+// executor the download uses, since it needs the credential-bearing client.
+// probed is false for any other source, which has no remote size to ask for.
+func (a *MetalAgent) probeRemoteModelSize(
+	ctx context.Context, model *inferencev1alpha1.Model,
+) (size uint64, probed bool, err error) {
+	switch {
+	case strings.HasPrefix(model.Spec.Source, "http://") || strings.HasPrefix(model.Spec.Source, "https://"):
+		probeClient := safehttp.NewClient(a.downloadAllow, 0, downloadHostsFlag)
+		defer probeClient.CloseIdleConnections()
+		size, err = remoteModelSize(ctx, probeClient, model.Spec.Source)
+		return size, true, err
+	case isS3Source(model.Spec.Source):
+		size, err = a.s3SizeProbe(ctx, model)
+		return size, true, err
+	}
+	return 0, false, nil
 }
 
 // localModelSize returns the on-disk size of a model at a local path: the

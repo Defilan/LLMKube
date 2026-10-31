@@ -1683,6 +1683,10 @@ To resolve:
 - **Increase the memory fraction** with `--memory-fraction 0.9` if this is a dedicated inference machine
 - **Close other applications** to free unified memory
 
+### Model refused with MemoryCheckFailed
+
+The agent could not size a model that is not in the model store yet, so it refused to start it rather than admit it unsized. `status.schedulingMessage` lists every size source it tried, including the HEAD probe of an `http(s)` or `s3` source. A probe that fails because the origin cannot be reached right now (connection refused, no route to host, network unreachable, a timeout, a temporary DNS failure, a 5xx or a 429) is not refused at once: the agent logs it at warn level and retries on the next poll, without a status change or a Warning Event, and starts nothing until the size is known. Only when the probe has kept failing that way for 3 minutes is the start refused with `MemoryCheckFailed`. A definitive answer (401, 403, 404, any other 4xx, a response without `Content-Length`, a host the SSRF guard refuses) is refused immediately.
+
 ### Model download blocked by the SSRF guard
 
 The Model's source resolves to a private, loopback or link-local address, which the agent refuses to fetch from by default:
@@ -1696,7 +1700,7 @@ If the source is a LAN mirror you trust (an internal MinIO or registry), add its
 
 ### LAN download fails with `no route to host` after an upgrade
 
-The guard allowed the host, but macOS blocked the connection. macOS Local Network Privacy ties its permission to the agent binary, so a new binary loses access to the local network until it is granted again, and the refusal surfaces as `connect: no route to host` rather than a permission error. It affects every connection the agent opens to a LAN address, including its connection to a Kubernetes API server on the LAN, not only model downloads; downloads from the internet are not affected. Incoming connections to the ingress are governed by the macOS firewall instead, which may ask again to allow them for the new binary. Grant the agent access in System Settings, Privacy & Security, Local Network, or reach the mirror over a route macOS does not treat as local (for example a VPN or tailnet address).
+The guard allowed the host, but macOS blocked the connection. macOS Local Network Privacy ties its permission to the agent binary, so a new binary loses access to the local network until it is granted again, and the refusal surfaces as `connect: no route to host` rather than a permission error. It affects every connection the agent opens to a LAN address, including its connection to a Kubernetes API server on the LAN, not only model downloads; downloads from the internet are not affected. Incoming connections to the ingress are governed by the macOS firewall instead, which may ask again to allow them for the new binary. Grant the agent access in System Settings, Privacy & Security, Local Network, or reach the mirror over a route macOS does not treat as local (for example a VPN or tailnet address). When the failing connection is the memory check's size probe of a remote Model, the agent retries it quietly for 3 minutes before refusing with `MemoryCheckFailed`, so a denied permission shows up as that refusal after a short delay.
 
 ### `ModelDigestMismatch`
 
