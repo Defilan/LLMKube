@@ -675,7 +675,12 @@ standing, but no success stands for more than 13 minutes (the
 slack) without a newer check finishing. A Mac whose report keeps
 changing restarts the check each time, so without that bound an old
 success, and its `hostIP`, would outlive the address it proved; past
-it `Reachable` is `Unknown`, reason `VerificationPending`. Put the verifier
+it `Reachable` is `Unknown`, reason `VerificationPending`, and the
+message names a verifier pod stuck terminating if one is what keeps
+the check from starting. Times a verifier's node reports are kept
+between the verifier's start and the moment the controller reads it,
+so a node clock that is off does not change when a result expires or
+when the next check runs. Put the verifier
 where the relay pods for this Mac run, so it tests the path the relay
 will use.
 

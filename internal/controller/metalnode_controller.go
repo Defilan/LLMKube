@@ -393,15 +393,19 @@ func (r *MetalNodeReconciler) reconcileDialBack(ctx context.Context, mn *inferen
 				"the agent's pin, port or addresses changed since the last check; a new check is due")
 		}
 	}
-	if verifiedResultExpired(mn, now) {
-		r.setReachable(mn, metav1.ConditionUnknown, inferencev1alpha1.MetalNodeReasonVerificationPending,
-			fmt.Sprintf("the last check that reached this Mac finished more than %s ago and none has finished since; a new check is due",
-				metalNodeMaxResultAge))
-	}
 
 	pods, err := r.ownedVerifiers(ctx, mn)
 	if err != nil {
 		return 0, nil, err
+	}
+	if verifiedResultExpired(mn, now) {
+		msg := fmt.Sprintf("the last check that reached this Mac finished more than %s ago and none has finished since; a new check is due",
+			metalNodeMaxResultAge)
+		if blocking := terminatingVerifier(pods); blocking != nil {
+			msg += fmt.Sprintf("; verifier pod %s has been terminating since %s and no check starts until it is gone",
+				blocking.Name, blocking.DeletionTimestamp.UTC().Format(time.RFC3339))
+		}
+		r.setReachable(mn, metav1.ConditionUnknown, inferencev1alpha1.MetalNodeReasonVerificationPending, msg)
 	}
 	switch {
 	case !hostIPValid:
@@ -585,6 +589,12 @@ func dialBackWait(mn *inferencev1alpha1.MetalNode, hash string, now time.Time) t
 	if v.LastStartTime != nil {
 		wait = max(wait, metalNodeMinStartSpacing-now.Sub(v.LastStartTime.Time))
 	}
+	if v.LastCheckTime != nil {
+		// lastCheckTime is stored to the second; a verifier started in that
+		// second could finish, clamped to its start, no later than it, and
+		// unread would take its result for one already read.
+		wait = max(wait, v.LastCheckTime.Truncate(time.Second).Add(time.Second).Sub(now))
+	}
 	return max(0, wait)
 }
 
@@ -602,6 +612,17 @@ func (r *MetalNodeReconciler) ownedVerifiers(ctx context.Context, mn *inferencev
 		}
 	}
 	return out, nil
+}
+
+// terminatingVerifier is a verifier pod being deleted, which keeps any new
+// check from starting until it is gone, or nil.
+func terminatingVerifier(pods []corev1.Pod) *corev1.Pod {
+	for i := range pods {
+		if pods[i].DeletionTimestamp != nil {
+			return &pods[i]
+		}
+	}
+	return nil
 }
 
 // stopVerifiers is every verifier pod not already being deleted.
@@ -637,6 +658,7 @@ func (r *MetalNodeReconciler) harvestVerifiers(mn *inferencev1alpha1.MetalNode, 
 			if term != nil && !term.FinishedAt.IsZero() {
 				finished = term.FinishedAt.Time
 			}
+			finished = clampFinished(v, finished, now)
 			if current && unread(mn, finished) {
 				r.applyVerifierResult(mn, &pod, term, hash, finished)
 			}
@@ -653,8 +675,32 @@ func (r *MetalNodeReconciler) harvestVerifiers(mn *inferencev1alpha1.MetalNode, 
 	return busy, toDelete
 }
 
-// unread reports whether a verifier that finished at finished has not been
-// recorded yet: lastCheckTime is the finish time of the last result read.
+// clampFinished bounds a verifier's finish time, which the kubelet stamps on
+// its node's clock, to when the controller started it (lastStartTime) and
+// now, both on the controller's clock. lastCheckTime is compared with the
+// controller's clock (the recheck, the backoff, the result's age) and with
+// failures it records at its own now, so an unclamped node clock minutes
+// behind would expire every fresh result at once, and one ahead would delay
+// rechecks or hide later results.
+func clampFinished(v *inferencev1alpha1.MetalNodeVerification, finished, now time.Time) time.Time {
+	if v != nil && v.LastStartTime != nil && finished.Before(v.LastStartTime.Time) {
+		finished = v.LastStartTime.Time
+	}
+	return minTime(finished, now)
+}
+
+func minTime(a, b time.Time) time.Time {
+	if b.Before(a) {
+		return b
+	}
+	return a
+}
+
+// unread reports whether a verifier that finished at finished (clamped) has
+// not been recorded yet: lastCheckTime is the finish time of the last result
+// read, or when the last failure was recorded. dialBackWait starts no
+// verifier in the same second as lastCheckTime, so a newer verifier's clamped
+// finish always lands in a later second.
 func unread(mn *inferencev1alpha1.MetalNode, finished time.Time) bool {
 	v := mn.Status.Verification
 	return v == nil || v.LastCheckTime == nil || finished.Truncate(time.Second).After(v.LastCheckTime.Time)
