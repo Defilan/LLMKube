@@ -96,6 +96,11 @@ type InferenceServiceWatcher struct {
 	// seeded holds keys the first poll treats as already seen (engines
 	// adopted at startup, #2079); see SeedSeen.
 	seeded map[string]bool
+	// requeued holds keys the next poll delivers again even though their
+	// resourceVersion has not changed; see Requeue. requeueMu guards it:
+	// the agent's event loop sets keys while the poll loop takes them.
+	requeueMu sync.Mutex
+	requeued  map[string]bool
 }
 
 // NewInferenceServiceWatcher creates a new watcher with the default failure
@@ -316,6 +321,7 @@ func (w *InferenceServiceWatcher) poll(
 
 		lastVersion, exists := seen[key]
 		currentVersion := isvc.ResourceVersion
+		requeued := w.takeRequeue(key)
 
 		if !exists {
 			// New service
@@ -324,8 +330,8 @@ func (w *InferenceServiceWatcher) poll(
 				InferenceService: isvc,
 			}
 			seen[key] = currentVersion
-		} else if lastVersion != currentVersion {
-			// Updated service
+		} else if lastVersion != currentVersion || requeued {
+			// Updated service, or one the agent asked to see again
 			eventChan <- InferenceServiceEvent{
 				Type:             EventTypeUpdated,
 				InferenceService: isvc,
@@ -335,6 +341,7 @@ func (w *InferenceServiceWatcher) poll(
 	}
 
 	w.forgetVanishedLookupFailures(current)
+	w.forgetVanishedRequeues(current)
 
 	// Check for deleted services
 	for key := range seen {
@@ -504,6 +511,44 @@ func (w *InferenceServiceWatcher) forgetVanishedLookupFailures(current map[strin
 	}
 	if pruned {
 		watchModelLookupFailingServices.Set(float64(len(w.lookupFailing)))
+	}
+}
+
+// Requeue makes the next poll deliver key as Updated even when its
+// resourceVersion has not changed. The agent calls it after a start it
+// deferred without writing anything to the InferenceService (a remote size
+// probe that failed transiently, #2326): with no write the resourceVersion
+// stays put, and the poll alone would never deliver the service again.
+func (w *InferenceServiceWatcher) Requeue(key string) {
+	w.requeueMu.Lock()
+	defer w.requeueMu.Unlock()
+	if w.requeued == nil {
+		w.requeued = make(map[string]bool)
+	}
+	w.requeued[key] = true
+}
+
+// takeRequeue reports whether key was requeued and clears the request, so a
+// requeue delivers the service once.
+func (w *InferenceServiceWatcher) takeRequeue(key string) bool {
+	w.requeueMu.Lock()
+	defer w.requeueMu.Unlock()
+	if !w.requeued[key] {
+		return false
+	}
+	delete(w.requeued, key)
+	return true
+}
+
+// forgetVanishedRequeues drops the requeue requests of services this poll did
+// not list, or found are not ours: there is nothing left to deliver.
+func (w *InferenceServiceWatcher) forgetVanishedRequeues(current map[string]bool) {
+	w.requeueMu.Lock()
+	defer w.requeueMu.Unlock()
+	for key := range w.requeued {
+		if !current[key] {
+			delete(w.requeued, key)
+		}
 	}
 }
 

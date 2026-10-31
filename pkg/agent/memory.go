@@ -417,12 +417,25 @@ func remoteModelSize(ctx context.Context, httpClient *http.Client, source string
 	}()
 
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("bad status: %s", resp.Status)
+		return 0, &sizeProbeStatusError{StatusCode: resp.StatusCode, Status: resp.Status}
 	}
 	if resp.ContentLength <= 0 {
 		return 0, fmt.Errorf("no Content-Length in HEAD response")
 	}
 	return uint64(resp.ContentLength), nil
+}
+
+// sizeProbeStatusError is a size probe HEAD answered with a status other than
+// 200. It carries the code so transientSizeProbeError can tell an origin that
+// is down for the moment (5xx, 429) from one that answered definitively (403,
+// 404).
+type sizeProbeStatusError struct {
+	StatusCode int
+	Status     string
+}
+
+func (e *sizeProbeStatusError) Error() string {
+	return "bad status: " + e.Status
 }
 
 // s3ObjectSize returns an s3:// object's byte size from a SigV4-signed HEAD
