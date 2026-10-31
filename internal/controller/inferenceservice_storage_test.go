@@ -1795,8 +1795,9 @@ var _ = Describe("cache prep init container (#855)", func() {
 		Expect(cmd).NotTo(ContainSubstring("102"))
 	})
 
-	It("fsGroup<=0 case: prep command is 'chown 100:100 /models && chmod 770 /models'", func() {
-		config := buildCachedStorageConfig(cacheModel(), nil, resolveEffectiveModelCache(nil, cacheModel()), "", "", "curl:8.18.0", 0, ModelCachePrepAlways, DefaultInitContainerUser, "")
+	It("fsGroup<=0 case: prep chowns to the configured init container user with group 0, mode 770 (#2204)", func() {
+		const initUser = int64(4242)
+		config := buildCachedStorageConfig(cacheModel(), nil, resolveEffectiveModelCache(nil, cacheModel()), "", "", "curl:8.18.0", 0, ModelCachePrepAlways, initUser, "")
 		prep := config.initContainers[0]
 		Expect(prep.Command).To(Equal([]string{"sh", "-c", "chown 4242:0 /models && chmod 770 /models"}))
 	})
