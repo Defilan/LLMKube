@@ -287,6 +287,51 @@ the new default store is a directory the agent has never populated.
   object; see
   [`inferenceservice-name-taken-service.md`](./inferenceservice-name-taken-service.md).
 
+### Metal agent: label `sourceSecretRef` Secrets (next release)
+
+The metal-agent reads a Model's `spec.sourceSecretRef` Secret only when it is
+labeled `inference.llmkube.dev/model-source-credentials=true`, and never reads
+the relay token Secret `llmkube-metal-relay` (#1956). An unlabeled or missing
+Secret, or the relay Secret, refuses the start with
+`status.schedulingStatus: SourceSecretNotAllowed`, and the message gives the
+`kubectl label` command.
+
+#### Upgrade blocker
+
+Every Metal InferenceService whose Model names an unlabeled Secret is refused
+after the agent upgrade. Before upgrading the agents, list the Secrets your
+Models name, review the list, and label them:
+
+```bash
+kubectl get models -A -o json | jq -r '.items[] | select(.spec.sourceSecretRef.name != null) | "\(.metadata.namespace) \(.spec.sourceSecretRef.name)"' | sort -u > llmkube-source-secrets.txt
+cat llmkube-source-secrets.txt     # review: each line is "<namespace> <secret>"
+while read -r ns name; do kubectl label secret "$name" -n "$ns" inference.llmkube.dev/model-source-credentials=true; done < llmkube-source-secrets.txt
+```
+
+Labeling a Secret a non-Metal Model uses is harmless: the in-cluster download
+Job does not check the label. A line naming `llmkube-metal-relay` is a Model
+pointing at the relay token Secret: move its credentials to their own Secret.
+
+If you cannot label every Secret first, start the agent with the deprecated
+`--allow-unlabeled-source-secrets` for one release. Unlabeled Secrets are then
+read as before, and each start that relies on the flag gets a
+`SourceSecretUnlabeled` Warning Event, so
+`kubectl get events -A --field-selector reason=SourceSecretUnlabeled` lists
+what is left. The flag will be removed in a later release.
+
+#### Behavior changes
+
+- A Hugging Face Model whose `sourceSecretRef` names a Secret the agent may
+  not read used to download without the token; it is now refused. A Model
+  with no `sourceSecretRef` is unaffected.
+- The agent reads the Secret from the Model's namespace. Before, it used its
+  own `--namespace`, so an agent running with `--namespace ""` (the chart's
+  `scope: cluster`) failed `s3` downloads with a NotFound and sent Hugging Face
+  requests without the token. A namespaced agent is unaffected.
+
+Rolling back the agent restores the old behavior; the labels are inert to
+older agents and to the controller, so there is nothing to undo.
+
 ## Verify the upgrade
 
 1. **Controller pod replaced and Ready.**

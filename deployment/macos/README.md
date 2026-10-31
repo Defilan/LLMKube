@@ -420,6 +420,44 @@ Like a digest mismatch, the refusal is remembered, so the agent does not downloa
 
 Upgrade note: if you deliberately serve a model file larger than the Mac's physical memory (for example with a Model `spec.hardware.memoryBudget` above the Mac's RAM), raise `--max-download-size` or set it to `0` before upgrading, or the agent will refuse that download.
 
+### Model-source credentials Secrets (`sourceSecretRef`)
+
+A Model's `spec.sourceSecretRef` names the Secret that holds its download credentials (`AWS_*` for `s3` sources, `HF_TOKEN` and `HF_ENDPOINT` for Hugging Face and its mirrors). The agent reads that Secret with its own identity, which can read Secrets in the namespaces it serves, and anyone who can write a Model picks the name. So the agent reads only a Secret its owner has marked for this use:
+
+```bash
+kubectl label secret <name> -n <namespace> inference.llmkube.dev/model-source-credentials=true
+```
+
+- A Model whose `sourceSecretRef` names a Secret without the label (the value must be `true`), a Secret that does not exist, or one the agent's RBAC does not let it read (outside a pinned `secretNames`/`resourceNames` list), is refused with reason `SourceSecretNotAllowed` (a Warning Event, plus `status.schedulingStatus`/`status.schedulingMessage`). The message gives the `kubectl label` command for that Secret. Nothing is downloaded and nothing is sent to the object store or Hugging Face. The check reads only the Secret's metadata.
+- The relay token Secret, `llmkube-metal-relay`, is never read as model-source credentials, labeled or not, and even with `--allow-unlabeled-source-secrets`. Keep model credentials in their own Secret.
+- The check runs for every runtime and whether or not the model is already in the model store, so a later cache eviction cannot turn a running service into a refused one. It runs again when the agent reads the Secret for a download or the memory check's `s3` size probe, so a Secret that loses its label in between is refused too.
+- A refusal is re-checked on every poll: label the Secret (or create it) and the InferenceService starts within a few seconds. A transient error reading the Secret (a timeout, an API server restart) is not a refusal; the start is retried.
+- A Model with no `sourceSecretRef` is unaffected, and so is the in-cluster download Job, which reads the Secret with the controller's own credentials.
+
+The Secret is read from the Model's own namespace (the InferenceService's namespace). Before this release the agent read it from its `--namespace`, so with `--namespace ""` (the chart's `scope: cluster`) an `s3` source failed with a NotFound for a Secret that exists, and a Hugging Face download went out without its token.
+
+The label is the Secret owner's opt-in; it complements, and does not replace, pinning the agent's `secrets: get` to named Secrets (`metalAgent.rbac.secretNames` in the chart, or `resourceNames` in [`metal-agent-rbac.yaml`](metal-agent-rbac.yaml)). With both, the agent can read only Secrets that are listed in its Role and marked by their owner.
+
+#### Upgrade note: label existing credentials Secrets
+
+After the upgrade, every Metal InferenceService whose Model names an unlabeled Secret is refused until the Secret is labeled. Before upgrading the agent, list the Secrets your Models name, review them, and label them:
+
+```bash
+kubectl get models -A -o json | jq -r '.items[] | select(.spec.sourceSecretRef.name != null) | "\(.metadata.namespace) \(.spec.sourceSecretRef.name)"' | sort -u > llmkube-source-secrets.txt
+cat llmkube-source-secrets.txt     # review: each line is "<namespace> <secret>"
+while read -r ns name; do kubectl label secret "$name" -n "$ns" inference.llmkube.dev/model-source-credentials=true; done < llmkube-source-secrets.txt
+```
+
+A line naming `llmkube-metal-relay` means a Model points at the relay token Secret: move its credentials to a Secret of their own instead of labeling it.
+
+If you cannot label every Secret before upgrading, start the agent with `--allow-unlabeled-source-secrets` for one release. It is deprecated and will be removed: an unlabeled Secret is then read as before, the agent logs a warning at startup, and every start that relies on the flag gets a `SourceSecretUnlabeled` Warning Event naming the Secret and the label command, so `kubectl get events -A --field-selector reason=SourceSecretUnlabeled` lists what is left to label. To set it in the launchd plist:
+
+```xml
+    <string>--allow-unlabeled-source-secrets</string>
+```
+
+Behavior change for Hugging Face sources: a Model whose `sourceSecretRef` names a Secret the agent may not read (unlabeled, missing, or the relay Secret) used to download without the token; it is now refused. A Model with no `sourceSecretRef` still downloads public repositories without a token.
+
 ### Choosing the cluster (`--kubeconfig`, `--kube-context`)
 
 The agent finds its cluster the same way controller-runtime tools do: the
@@ -463,7 +501,9 @@ rest of this section is the manual equivalent with the shared ServiceAccount.
 with only the permissions the agent uses (read InferenceServices and Models,
 update InferenceService status, manage the Services and EndpointSlices that
 publish each server, write events, read the relay token Secret and
-`sourceSecretRef` secrets).
+`sourceSecretRef` secrets). The agent uses a `sourceSecretRef` Secret only
+when it carries the `inference.llmkube.dev/model-source-credentials=true`
+label; see "Model-source credentials Secrets (`sourceSecretRef`)" above.
 
 If you installed LLMKube with Helm, the chart can create the same identity for
 you, so a `helm upgrade` keeps the agent's permissions current instead of
@@ -1119,6 +1159,11 @@ kubectl describe inferenceservice <name>
 - **Cache slot** (`ModelSourceNotAllowed`): for a downloaded source, the
   file at `<model-store>/<model>/<file>` must be a regular file the agent
   wrote. A symlink there is refused, not followed.
+- **Credentials Secret** (`SourceSecretNotAllowed`): a Model's
+  `sourceSecretRef` must name an existing Secret labeled
+  `inference.llmkube.dev/model-source-credentials=true`, and never the relay
+  token Secret. See "Model-source credentials Secrets (`sourceSecretRef`)"
+  above.
 
 ### The extraArgs typed allowlist
 
@@ -1437,7 +1482,8 @@ On a Metal InferenceService (`kubectl describe inferenceservice <name>`):
   `RelaySecretNotManaged` (Warning).
 - From the agent: `RelayNotAdopted`, `ExtraArgsRejected`,
   `EndpointNameConflict`, `ModelSourceNotAllowed`, `ServiceNameTooLong`,
-  `ModelDigestMismatch`, `ModelDownloadTooLarge` (Warning).
+  `ModelDigestMismatch`, `ModelDownloadTooLarge`, `SourceSecretNotAllowed`,
+  `SourceSecretUnlabeled` (Warning).
 
 `ServiceNameTooLong` means the InferenceService name is too long for the
 `<isvc>-agent` Service (at most 57 characters, since the name plus `-agent`
@@ -1632,6 +1678,10 @@ The downloaded source's SHA256 does not match the Model's `spec.sha256`. The bad
 ### `ModelDownloadTooLarge`
 
 The Model's download went over `--max-download-size`: either the source declared a size over the cap (nothing was written) or the body ran past it (the partial was removed). The message says which, and names the cap in bytes. If the source is wrong, fix `spec.source`; the next reconcile retries. If the model really is that large, raise `--max-download-size` (or set it to `0`) and restart the agent. If the spec was already right and the source was fixed upstream, delete and recreate the Model (or the InferenceService), or restart the agent. Placing the file in the cache slot by hand is not enough: the remembered refusal is checked first, so it only lifts after one of those. See "`--max-download-size` flag (download cap)" above.
+
+### `SourceSecretNotAllowed`
+
+The Model's `spec.sourceSecretRef` names a Secret the agent will not read: it is not labeled `inference.llmkube.dev/model-source-credentials=true`, it does not exist in the Model's namespace, the agent's RBAC does not let it read it (a Secret outside `metalAgent.rbac.secretNames`, or the `resourceNames` you pinned in `metal-agent-rbac.yaml`), or it is the relay token Secret `llmkube-metal-relay`. The message says which, and gives the `kubectl label` command. Label (or create) the Secret, or add it to the pinned names, and the next poll starts the service; for the relay Secret, move the credentials to a Secret of their own and point `sourceSecretRef` at it. See "Model-source credentials Secrets (`sourceSecretRef`)" above.
 
 ### Can't connect to Kubernetes
 

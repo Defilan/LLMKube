@@ -35,7 +35,6 @@ import (
 	"time"
 
 	"go.uber.org/zap"
-	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
@@ -53,10 +52,10 @@ type ExecutorConfig struct {
 	// the agent boundary, mirroring LlamaCppBackend.BuildArgs. Empty omits the
 	// flag, so llama.cpp falls back to the model path.
 	ServedModelName string
-	// SourceSecretRef is the Model's spec.sourceSecretRef, used to resolve
-	// credentials for s3:// fetches on the metal path. May be nil for non-s3
-	// sources.
-	SourceSecretRef *corev1.LocalObjectReference
+	// SourceSecret locates the Model's spec.sourceSecretRef in the Model's own
+	// namespace, used to resolve credentials for s3:// fetches and the
+	// Hugging Face token on the metal path. Nil when the Model names none.
+	SourceSecret sourceSecretKey
 	// SHA256 is the Model's spec.sha256: the expected hex digest of a
 	// downloaded source, mirroring the controller's own verifySHA256. Empty
 	// skips verification entirely. A local source (absolute path or
@@ -217,14 +216,18 @@ type MetalExecutor struct {
 	// OpenAI-compatible clients a stable endpoint across process respawns.
 	fixedPort int
 
-	// namespace and k8sClient let the executor resolve a Model's
-	// sourceSecretRef for s3:// credentials (resolveS3Credentials). Both are
-	// optional: when nil, s3:// sources fail with a clear message rather than
-	// silently falling through to an anonymous GET. They are set via
-	// WithKubeClient.
-	namespace string
+	// k8sClient lets the executor resolve a Model's sourceSecretRef for s3://
+	// credentials (resolveS3Credentials) and the Hugging Face token
+	// (resolveHFAuth), in the Model's own namespace. Optional: when nil, s3://
+	// sources fail with a clear message rather than silently falling through
+	// to an anonymous GET. Set via WithKubeClient.
 	k8sClient client.Client
 	caCerts   [][]byte
+	// allowUnlabeledSourceSecrets lets getSourceSecret read a sourceSecretRef
+	// Secret without the model-source-credentials marker (the deprecated
+	// --allow-unlabeled-source-secrets flag). Set via
+	// WithAllowUnlabeledSourceSecrets.
+	allowUnlabeledSourceSecrets bool
 
 	// downloadAllow is the parsed --allowed-download-hosts list: hosts and
 	// CIDRs the SSRF guard lets through even though they resolve to a
@@ -250,18 +253,19 @@ type MetalExecutor struct {
 	childTracker
 }
 
-// Option configures a MetalExecutor. Used to wire the Kubernetes client and
-// namespace the s3 fetch path needs.
+// Option configures a MetalExecutor. Used to wire the Kubernetes client the
+// s3 fetch path needs.
 type Option func(*MetalExecutor)
 
-// WithKubeClient attaches the agent's controller-runtime client and the
-// InferenceService/Model namespace so ensureModel can resolve sourceSecretRef
-// for s3:// sources. caCerts is the set of PEM CA bundles the operator trusts
-// (from the same caCertConfigMap the controller uses), so a private MinIO
-// behind a self-signed CA is reachable.
-func WithKubeClient(namespace string, c client.Client, caCerts [][]byte) Option {
+// WithKubeClient attaches the agent's controller-runtime client so ensureModel
+// can resolve sourceSecretRef. The Secret is read from the namespace of the
+// Model that names it (sourceSecretKeyFor), not from a namespace fixed at
+// construction: one executor serves every namespace the agent watches.
+// caCerts is the set of PEM CA bundles the operator trusts (from the same
+// caCertConfigMap the controller uses), so a private MinIO behind a
+// self-signed CA is reachable.
+func WithKubeClient(c client.Client, caCerts [][]byte) Option {
 	return func(e *MetalExecutor) {
-		e.namespace = namespace
 		e.k8sClient = c
 		e.caCerts = caCerts
 	}
@@ -320,7 +324,7 @@ func (e *MetalExecutor) SetPort(port int) {
 }
 
 func (e *MetalExecutor) StartProcess(ctx context.Context, config ExecutorConfig) (*ManagedProcess, error) {
-	modelPath, err := e.ensureModel(ctx, config.ModelSource, config.ModelName, config.SourceSecretRef, config.SHA256)
+	modelPath, err := e.ensureModel(ctx, config.ModelSource, config.ModelName, config.SourceSecret, config.SHA256)
 	if err != nil {
 		return nil, fmt.Errorf("failed to ensure model: %w", err)
 	}
@@ -410,7 +414,7 @@ func (e *MetalExecutor) processLogPath(namespace, name string) string {
 }
 
 func (e *MetalExecutor) ensureModel(
-	ctx context.Context, source, name string, secretRef s3SecretRef, expectedSHA256 string,
+	ctx context.Context, source, name string, secretRef sourceSecretKey, expectedSHA256 string,
 ) (string, error) {
 	localPath := modelCacheSlot(e.modelStorePath, name, source)
 	local := isLocalModelSource(source)
@@ -594,7 +598,7 @@ func resolveLocalModelSource(source string) (string, error) {
 // sigv4-signed client (the metal half of #1449, which #1450 fixed for the
 // controller path): the raw source never reaches a plain GET.
 func (e *MetalExecutor) fetchModel(
-	ctx context.Context, source, filePath string, secretRef s3SecretRef, expectedSHA256 string,
+	ctx context.Context, source, filePath string, secretRef sourceSecretKey, expectedSHA256 string,
 ) error {
 	if isS3Source(source) {
 		return e.downloadS3(ctx, source, filePath, secretRef, expectedSHA256)
@@ -608,7 +612,10 @@ func (e *MetalExecutor) fetchModel(
 	// request is built, so the scheme works the same as the init-container path.
 	var token string
 	if secretRef != nil {
-		secretToken, hfEndpoint := e.resolveHFAuth(ctx, secretRef.Name)
+		secretToken, hfEndpoint, err := e.resolveHFAuth(ctx, secretRef)
+		if err != nil {
+			return err
+		}
 		if isHFAuthHostForEndpoint(source, hfEndpoint) {
 			token = secretToken
 		}
@@ -623,18 +630,14 @@ func (e *MetalExecutor) fetchModel(
 // the Model's spec.sourceSecretRef; when nil the fetch fails clearly rather than
 // falling back to an anonymous GET.
 func (e *MetalExecutor) downloadS3(
-	ctx context.Context, source, filePath string, secretRef s3SecretRef, expectedSHA256 string,
+	ctx context.Context, source, filePath string, secretRef sourceSecretKey, expectedSHA256 string,
 ) error {
 	bucket, _, err := parseS3Source(source)
 	if err != nil {
 		return err
 	}
 
-	var secretName string
-	if secretRef != nil {
-		secretName = secretRef.Name
-	}
-	creds, err := e.resolveS3Credentials(ctx, source, secretName)
+	creds, err := e.resolveS3Credentials(ctx, source, secretRef)
 	if err != nil {
 		return err
 	}

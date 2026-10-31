@@ -250,6 +250,14 @@ type MetalAgentConfig struct {
 	// Logged at Warn on startup.
 	AllowUnsafeExtraArgs bool
 
+	// AllowUnlabeledSourceSecrets is the deprecated escape hatch for
+	// upgrading (--allow-unlabeled-source-secrets): a Model's sourceSecretRef
+	// may name a Secret without the inference.llmkube.dev/
+	// model-source-credentials=true label. Every start that relies on it gets
+	// a SourceSecretUnlabeled Warning Event. The relay token Secret stays
+	// refused. Logged at Warn on startup; removed in a future release.
+	AllowUnlabeledSourceSecrets bool
+
 	// IngressPort is the TLS port of the authenticated ingress that
 	// in-cluster relays use to reach engines. The ingress listens on all
 	// interfaces; engines listen on 127.0.0.1 only. Must differ from Port and
@@ -556,6 +564,12 @@ func NewMetalAgent(config MetalAgentConfig) *MetalAgent {
 			"refused non-listener flags, paths and vllm-swift code-loading flags from InferenceServices " +
 			"are not checked; listener, registration, multi-node and distributed flags stay refused")
 	}
+	if config.AllowUnlabeledSourceSecrets {
+		logger.Warnw(allowUnlabeledSourceSecretsFlag+" is deprecated and will be removed in a future release: "+
+			"a Model's sourceSecretRef may name a Secret without the "+
+			inferencev1alpha1.LabelModelSourceCredentials+"=true label; label those Secrets and drop the flag",
+			"label", inferencev1alpha1.LabelModelSourceCredentials)
+	}
 
 	// The state directory holds the engine records in relay and legacy mode
 	// alike; a directory that cannot be resolved fails each record write, and
@@ -612,7 +626,8 @@ func (a *MetalAgent) buildExecutors() {
 		a.config.LlamaServerBin,
 		a.config.ModelStorePath,
 		a.logger.With("subsystem", "executor"),
-		WithKubeClient(a.config.Namespace, a.config.K8sClient, nil),
+		WithKubeClient(a.config.K8sClient, nil),
+		WithAllowUnlabeledSourceSecrets(a.config.AllowUnlabeledSourceSecrets),
 		WithAllowedDownloadHosts(a.config.AllowedDownloadHosts),
 		WithMaxDownloadBytes(a.config.MaxDownloadBytes),
 	)
@@ -938,7 +953,7 @@ func buildExecutorConfig(
 		ModelSource:            model.Spec.Source,
 		ModelName:              model.Name,
 		ServedModelName:        servedModelName(isvc, model),
-		SourceSecretRef:        model.Spec.SourceSecretRef,
+		SourceSecret:           sourceSecretKeyFor(model.Namespace, model.Spec.SourceSecretRef),
 		SHA256:                 model.Spec.SHA256,
 		GPULayers:              base.GPULayers,
 		ContextSize:            base.ContextSize,
@@ -1336,9 +1351,11 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 	}
 
 	// Refuse a Model the controller marked Failed, any local model source or
-	// pagedSSDCacheDir that resolves outside the allowed roots, a symlink in
-	// a downloaded source's cache slot, and a Model this agent already found
-	// to have a mismatching SHA256 (refused without downloading it again).
+	// pagedSSDCacheDir that resolves outside the allowed roots, a
+	// sourceSecretRef naming a Secret the agent may not read (unmarked,
+	// missing, or the relay token Secret), a symlink in a downloaded
+	// source's cache slot, and a Model this agent already found to have a
+	// mismatching SHA256 (refused without downloading it again).
 	// All of these run before memory admission, since admission's success
 	// path clears SchedulingStatus and a refusal placed after it would flap
 	// the status on every reconcile.

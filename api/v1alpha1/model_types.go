@@ -118,6 +118,11 @@ type ModelSpec struct {
 	//
 	// One Secret may carry both sets of keys; each is used only by the source
 	// scheme it belongs to.
+	//
+	// On the Metal path the metal-agent reads the Secret only when it carries
+	// the label inference.llmkube.dev/model-source-credentials=true, and never
+	// reads the relay token Secret (llmkube-metal-relay); any other Secret
+	// refuses the start with SourceSecretNotAllowed.
 	// +optional
 	SourceSecretRef *corev1.LocalObjectReference `json:"sourceSecretRef,omitempty"`
 

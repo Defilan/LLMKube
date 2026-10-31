@@ -34,6 +34,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
@@ -468,7 +469,7 @@ func s3CapExecutor(t *testing.T, dir, srvURL string, limit int64) *MetalExecutor
 		t.Fatalf("add inference scheme: %v", err)
 	}
 	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "minio-models", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "minio-models", Namespace: "default", Labels: modelSourceCredentialsLabels()},
 		Data: map[string][]byte{
 			"AWS_ACCESS_KEY_ID":     []byte("AKIAEXAMPLE0000000"),
 			"AWS_SECRET_ACCESS_KEY": []byte("secretaccesskeyvalue0000000000000"),
@@ -478,7 +479,7 @@ func s3CapExecutor(t *testing.T, dir, srvURL string, limit int64) *MetalExecutor
 	}
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 	return NewMetalExecutor("/bin/llama-server", dir, newNopLogger(),
-		WithKubeClient("default", k8sClient, nil), allowTestServers(), WithMaxDownloadBytes(limit))
+		WithKubeClient(k8sClient, nil), allowTestServers(), WithMaxDownloadBytes(limit))
 }
 
 // The s3 path enforces the cap the same way: an object whose size is over
@@ -496,7 +497,7 @@ func TestEnsureModel_S3DownloadCap(t *testing.T) {
 		dir := t.TempDir()
 
 		_, err := s3CapExecutor(t, dir, srv.URL, limit).ensureModel(t.Context(), "s3://models/org/repo/model.gguf",
-			"s3-cap-model", &corev1.LocalObjectReference{Name: "minio-models"}, "")
+			"s3-cap-model", &types.NamespacedName{Namespace: "default", Name: "minio-models"}, "")
 
 		assertTooLarge(t, err, limit+1000)
 		assertDirEmpty(t, filepath.Join(dir, "s3-cap-model"))
@@ -511,7 +512,7 @@ func TestEnsureModel_S3DownloadCap(t *testing.T) {
 		dir := t.TempDir()
 
 		_, err := s3CapExecutor(t, dir, srv.URL, limit).ensureModel(t.Context(), "s3://models/org/repo/model.gguf",
-			"s3-cap-model", &corev1.LocalObjectReference{Name: "minio-models"}, "")
+			"s3-cap-model", &types.NamespacedName{Namespace: "default", Name: "minio-models"}, "")
 
 		assertTooLarge(t, err, 0)
 		assertDirEmpty(t, filepath.Join(dir, "s3-cap-model"))

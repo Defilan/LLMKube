@@ -250,6 +250,20 @@ mismatch. See "Security model" in
 [`deployment/macos/README.md`](https://github.com/defilantech/LLMKube/blob/main/deployment/macos/README.md#security-model)
 for both.
 
+A private source needs credentials in a Secret named by the Model's
+`spec.sourceSecretRef` (`AWS_*` for `s3`, `HF_TOKEN` for a gated Hugging
+Face repository). The agent reads that Secret only when its owner has
+labeled it for this use, and never reads the relay token Secret
+`llmkube-metal-relay`; any other Secret refuses the start with
+`SourceSecretNotAllowed`:
+
+```bash
+kubectl label secret <name> -n <namespace> inference.llmkube.dev/model-source-credentials=true
+```
+
+See ["Model-source credentials Secrets"](https://github.com/defilantech/LLMKube/blob/main/deployment/macos/README.md#model-source-credentials-secrets-sourcesecretref)
+in `deployment/macos/README.md`.
+
 The agent's log should show:
 
 ```
@@ -1078,6 +1092,18 @@ wrong, or, if the model really is that large, raise
 "`--max-download-size` flag (download cap)" in
 [`deployment/macos/README.md`](https://github.com/defilantech/LLMKube/blob/main/deployment/macos/README.md#--max-download-size-flag-download-cap).
 
+**InferenceService refused with `SourceSecretNotAllowed`**
+The Model's `spec.sourceSecretRef` names a Secret the agent will not
+read: it is not labeled
+`inference.llmkube.dev/model-source-credentials=true`, it does not
+exist in the Model's namespace, the agent's RBAC does not let it read
+it (a Secret outside `metalAgent.rbac.secretNames`), or it is the
+relay token Secret `llmkube-metal-relay`. The message says which and
+gives the `kubectl label` command; label, create, or allow the Secret
+and the next poll starts the service. Keep
+credentials out of the relay Secret. See
+["Model-source credentials Secrets"](https://github.com/defilantech/LLMKube/blob/main/deployment/macos/README.md#model-source-credentials-secrets-sourcesecretref).
+
 **Login Items lists the agent as "Defilan Technologies LLC"**
 System Settings > General > Login Items & Extensions lists a release
 agent under the name of the company that signs LLMKube's releases, not
@@ -1164,7 +1190,12 @@ on). Before upgrading across releases, read "Upgrading" and
 and the
 [upgrade and rollback runbook](https://github.com/defilantech/LLMKube/blob/main/docs/operations/runbooks/upgrade-rollback.md):
 some releases change the plist or refuse an old configuration until
-it is fixed. A new agent binary can also lose macOS Local Network
+it is fixed. Before upgrading to the release that checks
+`sourceSecretRef` Secrets, label every Secret your Models name with
+`inference.llmkube.dev/model-source-credentials=true`, or run the agent
+with the deprecated `--allow-unlabeled-source-secrets` for one release;
+see ["Upgrade note: label existing credentials Secrets"](https://github.com/defilantech/LLMKube/blob/main/deployment/macos/README.md#upgrade-note-label-existing-credentials-secrets).
+A new agent binary can also lose macOS Local Network
 access; see
 ["LAN download fails with `no route to host` after an upgrade"](https://github.com/defilantech/LLMKube/blob/main/deployment/macos/README.md#lan-download-fails-with-no-route-to-host-after-an-upgrade).
 

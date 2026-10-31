@@ -414,7 +414,7 @@ func newS3AdmissionAgent(
 ) *MetalAgent {
 	t.Helper()
 	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "minio-models", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "minio-models", Namespace: "default", Labels: modelSourceCredentialsLabels()},
 		Data: map[string][]byte{
 			"AWS_ACCESS_KEY_ID":     []byte("AKIAEXAMPLE0000000"),
 			"AWS_SECRET_ACCESS_KEY": []byte("secretaccesskeyvalue0000000000000"),

@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,6 +12,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
@@ -228,16 +230,16 @@ func TestEnsureModel_HFSchemeSendsToken(t *testing.T) {
 		t.Fatalf("add corev1 scheme: %v", err)
 	}
 	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "hf-token", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "hf-token", Namespace: "default", Labels: modelSourceCredentialsLabels()},
 		Data:       map[string][]byte{"HF_TOKEN": []byte("hf_secret")},
 	}
 
 	tests := []struct {
 		name      string
-		secretRef *corev1.LocalObjectReference
+		secretRef sourceSecretKey
 		wantAuth  string
 	}{
-		{"with source secret", &corev1.LocalObjectReference{Name: "hf-token"}, "Bearer hf_secret"},
+		{"with source secret", &types.NamespacedName{Namespace: "default", Name: "hf-token"}, "Bearer hf_secret"},
 		{"without source secret", nil, ""},
 	}
 	for _, tc := range tests {
@@ -245,7 +247,7 @@ func TestEnsureModel_HFSchemeSendsToken(t *testing.T) {
 			gotPath, gotAuth = "", ""
 			k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 			executor := NewMetalExecutor("/bin/llama-server", t.TempDir(), newNopLogger(),
-				WithKubeClient("default", k8sClient, nil), allowTestServers())
+				WithKubeClient(k8sClient, nil), allowTestServers())
 
 			dst, err := executor.ensureModel(t.Context(), "hf://org/repo", "hf-model", tc.secretRef, "")
 			if err != nil {
@@ -292,7 +294,7 @@ func TestEnsureModel_MirrorHostSendsToken(t *testing.T) {
 	// so the two share a host and only the path differs, exactly as Artifactory.
 	source := srv.URL + "/artifactory/api/huggingfaceml/repo/org/repo/resolve/main/m.gguf"
 	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "hf-token", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "hf-token", Namespace: "default", Labels: modelSourceCredentialsLabels()},
 		Data: map[string][]byte{
 			"HF_TOKEN":    []byte("hf_secret"),
 			"HF_ENDPOINT": []byte(srv.URL),
@@ -301,10 +303,10 @@ func TestEnsureModel_MirrorHostSendsToken(t *testing.T) {
 
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 	executor := NewMetalExecutor("/bin/llama-server", t.TempDir(), newNopLogger(),
-		WithKubeClient("default", k8sClient, nil), allowTestServers())
+		WithKubeClient(k8sClient, nil), allowTestServers())
 
 	dst, err := executor.ensureModel(t.Context(), source, "mirror-model",
-		&corev1.LocalObjectReference{Name: "hf-token"}, "")
+		&types.NamespacedName{Namespace: "default", Name: "hf-token"}, "")
 	if err != nil {
 		t.Fatalf("ensureModel(%q): %v", source, err)
 	}
@@ -336,7 +338,7 @@ func TestEnsureModel_OtherHostSendsNoToken(t *testing.T) {
 	}
 
 	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "hf-token", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "hf-token", Namespace: "default", Labels: modelSourceCredentialsLabels()},
 		Data: map[string][]byte{
 			"HF_TOKEN":    []byte("hf_secret"),
 			"HF_ENDPOINT": []byte("https://other-mirror.corp.example/repo"),
@@ -345,10 +347,10 @@ func TestEnsureModel_OtherHostSendsNoToken(t *testing.T) {
 
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 	executor := NewMetalExecutor("/bin/llama-server", t.TempDir(), newNopLogger(),
-		WithKubeClient("default", k8sClient, nil), allowTestServers())
+		WithKubeClient(k8sClient, nil), allowTestServers())
 
 	dst, err := executor.ensureModel(t.Context(), srv.URL+"/m.gguf", "other-model",
-		&corev1.LocalObjectReference{Name: "hf-token"}, "")
+		&types.NamespacedName{Namespace: "default", Name: "hf-token"}, "")
 	if err != nil {
 		t.Fatalf("ensureModel: %v", err)
 	}
@@ -360,14 +362,17 @@ func TestEnsureModel_OtherHostSendsNoToken(t *testing.T) {
 	}
 }
 
-// resolveHFAuth is the one read both gate keys come from, so its unavailable
-// cases must resolve to empty values (the ungated request that worked before
-// #1900) rather than failing, and its values must be trimmed: an env-projected
-// Secret routinely carries a trailing newline, which would send a malformed
-// token or close the mirror gate silently.
+// resolveHFAuth is the one read both gate keys come from. With no Kubernetes
+// client or no sourceSecretRef it resolves to empty values (the ungated
+// request that worked before #1900), and its values are trimmed: an
+// env-projected Secret routinely carries a trailing newline, which would send
+// a malformed token or close the mirror gate silently. A sourceSecretRef that
+// names a missing Secret is refused, not downloaded without the token (#1956):
+// before, it resolved to empty values and the request went out anonymous.
 func TestResolveHFAuth(t *testing.T) {
-	if got, ep := (&MetalExecutor{}).resolveHFAuth(t.Context(), "hf-token"); got != "" || ep != "" {
-		t.Errorf("nil client resolved (%q, %q), want empty values", got, ep)
+	key := &types.NamespacedName{Namespace: "default", Name: "hf-token"}
+	if got, ep, err := (&MetalExecutor{}).resolveHFAuth(t.Context(), key); got != "" || ep != "" || err != nil {
+		t.Errorf("nil client resolved (%q, %q, %v), want empty values and no error", got, ep, err)
 	}
 
 	scheme := runtime.NewScheme()
@@ -375,7 +380,7 @@ func TestResolveHFAuth(t *testing.T) {
 		t.Fatalf("add corev1 scheme: %v", err)
 	}
 	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "hf-token", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "hf-token", Namespace: "default", Labels: modelSourceCredentialsLabels()},
 		Data: map[string][]byte{
 			"HF_TOKEN":    []byte("hf_secret\n"),
 			"HF_ENDPOINT": []byte("https://mirror.corp.example/repo\n"),
@@ -383,24 +388,25 @@ func TestResolveHFAuth(t *testing.T) {
 	}
 	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 	executor := NewMetalExecutor("/bin/llama-server", t.TempDir(), newNopLogger(),
-		WithKubeClient("default", client, nil))
+		WithKubeClient(client, nil))
 
 	t.Run("both keys are trimmed", func(t *testing.T) {
-		got, ep := executor.resolveHFAuth(t.Context(), "hf-token")
-		if got != "hf_secret" || ep != "https://mirror.corp.example/repo" {
-			t.Errorf("resolveHFAuth() = (%q, %q), want trimmed values", got, ep)
+		got, ep, err := executor.resolveHFAuth(t.Context(), key)
+		if err != nil || got != "hf_secret" || ep != "https://mirror.corp.example/repo" {
+			t.Errorf("resolveHFAuth() = (%q, %q, %v), want trimmed values", got, ep, err)
 		}
 	})
-	t.Run("empty secret name reads nothing", func(t *testing.T) {
-		got, ep := executor.resolveHFAuth(t.Context(), "")
-		if got != "" || ep != "" {
-			t.Errorf("resolveHFAuth(empty) = (%q, %q), want empty values", got, ep)
+	t.Run("no secret reference reads nothing", func(t *testing.T) {
+		got, ep, err := executor.resolveHFAuth(t.Context(), nil)
+		if got != "" || ep != "" || err != nil {
+			t.Errorf("resolveHFAuth(nil) = (%q, %q, %v), want empty values and no error", got, ep, err)
 		}
 	})
-	t.Run("absent secret continues unauthenticated", func(t *testing.T) {
-		got, ep := executor.resolveHFAuth(t.Context(), "missing")
-		if got != "" || ep != "" {
-			t.Errorf("resolveHFAuth(missing) = (%q, %q), want empty values", got, ep)
+	t.Run("absent secret is refused", func(t *testing.T) {
+		got, ep, err := executor.resolveHFAuth(t.Context(), &types.NamespacedName{Namespace: "default", Name: "missing"})
+		var notAllowed *SourceSecretNotAllowedError
+		if !errors.As(err, &notAllowed) || got != "" || ep != "" {
+			t.Errorf("resolveHFAuth(missing) = (%q, %q, %v), want a *SourceSecretNotAllowedError", got, ep, err)
 		}
 	})
 }

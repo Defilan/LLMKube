@@ -53,14 +53,15 @@ import (
 // reasons are valid" (that question is answered once, by
 // inferencev1alpha1.MetalAgentRefusalReasons).
 var knownReasonConstants = map[string]string{
-	"EventReasonEndpointNameConflict":  EventReasonEndpointNameConflict,
-	"EventReasonModelSourceNotAllowed": EventReasonModelSourceNotAllowed,
-	"EventReasonExtraArgsRejected":     EventReasonExtraArgsRejected,
-	"EventReasonServiceNameTooLong":    EventReasonServiceNameTooLong,
-	"EventReasonModelDigestMismatch":   EventReasonModelDigestMismatch,
-	"EventReasonModelDownloadTooLarge": EventReasonModelDownloadTooLarge,
-	"EventReasonMemoryCheckFailed":     EventReasonMemoryCheckFailed,
-	"EventReasonInsufficientMemory":    EventReasonInsufficientMemory,
+	"EventReasonEndpointNameConflict":   EventReasonEndpointNameConflict,
+	"EventReasonModelSourceNotAllowed":  EventReasonModelSourceNotAllowed,
+	"EventReasonExtraArgsRejected":      EventReasonExtraArgsRejected,
+	"EventReasonServiceNameTooLong":     EventReasonServiceNameTooLong,
+	"EventReasonModelDigestMismatch":    EventReasonModelDigestMismatch,
+	"EventReasonModelDownloadTooLarge":  EventReasonModelDownloadTooLarge,
+	"EventReasonSourceSecretNotAllowed": EventReasonSourceSecretNotAllowed,
+	"EventReasonMemoryCheckFailed":      EventReasonMemoryCheckFailed,
+	"EventReasonInsufficientMemory":     EventReasonInsufficientMemory,
 }
 
 // emptyStringLit is the source text go/ast.BasicLit.Value carries for the
@@ -98,7 +99,7 @@ func TestMetalAgentRefusalReasons_CoversEveryAgentRefusalReason(t *testing.T) {
 	// SchedulingStatus assignments this scan looks for, it would silently
 	// stop finding anything and this test would pass vacuously. Pin the
 	// current site count as a floor so that kind of breakage is loud.
-	const minExpectedSites = 17
+	const minExpectedSites = 19
 	if sites < minExpectedSites {
 		t.Fatalf("scan found %d refusal reason site(s), want at least %d; either a refusal reason "+
 			"was removed or the scan itself no longer recognizes the current call-site shape", sites, minExpectedSites)

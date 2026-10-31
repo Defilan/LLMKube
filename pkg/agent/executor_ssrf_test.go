@@ -40,6 +40,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -222,7 +223,7 @@ func s3SecretClient(t *testing.T, endpoint string) client.Client {
 		t.Fatalf("add corev1 scheme: %v", err)
 	}
 	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "minio-models", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "minio-models", Namespace: "default", Labels: modelSourceCredentialsLabels()},
 		Data: map[string][]byte{
 			"AWS_ACCESS_KEY_ID":     []byte("AKIAEXAMPLE0000000"),
 			"AWS_SECRET_ACCESS_KEY": []byte("secretaccesskeyvalue0000000000000"),
@@ -243,7 +244,7 @@ func TestDownloadS3_BlockedEndpointRefusedUnlessAllowlisted(t *testing.T) {
 	}
 	byName := "http://minio.test:" + u.Port()
 	resolve := withLookup(map[string]string{"minio.test": "127.0.0.1"})
-	ref := &corev1.LocalObjectReference{Name: "minio-models"}
+	ref := &types.NamespacedName{Namespace: "default", Name: "minio-models"}
 	const source = "s3://models/org/repo/model.gguf"
 
 	cases := []struct {
@@ -263,7 +264,7 @@ func TestDownloadS3_BlockedEndpointRefusedUnlessAllowlisted(t *testing.T) {
 			hits.Store(0)
 			dir := t.TempDir()
 			e := NewMetalExecutor("/bin/llama-server", dir, newNopLogger(),
-				WithKubeClient("default", s3SecretClient(t, tc.endpoint), nil),
+				WithKubeClient(s3SecretClient(t, tc.endpoint), nil),
 				WithAllowedDownloadHosts(tc.allow), resolve)
 
 			path, err := e.ensureModel(t.Context(), source, "s3-model", ref, "")

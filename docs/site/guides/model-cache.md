@@ -203,6 +203,9 @@ apiVersion: v1
 kind: Secret
 metadata:
   name: hf-token
+  labels:
+    # Required on the Metal path only; harmless in-cluster.
+    inference.llmkube.dev/model-source-credentials: "true"
 stringData:
   HF_TOKEN: hf_xxx
 ---
@@ -223,6 +226,13 @@ spec:
 
 Public repositories need none of this. Omit the key, or the Secret entirely,
 and downloads go out unauthenticated as before.
+
+On the Metal path the metal-agent reads a `sourceSecretRef` Secret only when it
+carries the `inference.llmkube.dev/model-source-credentials: "true"` label (and
+never the relay token Secret `llmkube-metal-relay`); otherwise the
+InferenceService is refused with `SourceSecretNotAllowed` instead of
+downloading without the token. The in-cluster downloader does not check the
+label. See ["Model-source credentials Secrets"](https://github.com/defilantech/LLMKube/blob/main/deployment/macos/README.md#model-source-credentials-secrets-sourcesecretref).
 
 ### Pulling from an authenticated Hugging Face mirror
 
