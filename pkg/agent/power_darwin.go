@@ -167,8 +167,14 @@ func (s *ApplePowerSampler) Run(ctx context.Context) {
 	waitErr := cmd.Wait()
 	<-parseDone
 	if waitErr != nil && ctx.Err() == nil {
+		// The usual cause is sudo refusing the command because the installed
+		// sudoers rule is missing or was rendered for a different interval;
+		// stderr then carries sudo's own message.
 		s.logger.Warnw("apple-power: powermetrics exited unexpectedly",
-			"error", waitErr, "stderr", strings.TrimSpace(stderrBuf.String()))
+			"error", waitErr, "stderr", strings.TrimSpace(stderrBuf.String()),
+			"argv", powermetricsArgv(s.bin, s.interval),
+			"remedy", fmt.Sprintf("if sudo refused the command, run make install-powermetrics-sudo "+
+				"APPLE_POWER_INTERVAL_MS=%d", powermetricsIntervalMS(s.interval)))
 	} else {
 		s.logger.Infow("apple-power: sampling stopped")
 	}
@@ -273,24 +279,43 @@ func parsePowermetricsStream(r io.Reader, emit func(applePowerSample)) error {
 // invocation. macOS ships sudo at /usr/bin/sudo and SIP keeps it there.
 const defaultSudoBin = "/usr/bin/sudo"
 
+// minPowermetricsIntervalMS is the smallest -i value the agent passes;
+// shorter configured intervals are raised to it.
+const minPowermetricsIntervalMS = 100
+
+// powermetricsIntervalMS is the -i value the agent passes for a configured
+// interval: whole milliseconds (truncated), never below
+// minPowermetricsIntervalMS. The sudoers rule pins this exact number, which
+// `make install-powermetrics-sudo` renders from APPLE_POWER_INTERVAL_MS.
+func powermetricsIntervalMS(interval time.Duration) int {
+	ms := int(interval / time.Millisecond)
+	if ms < minPowermetricsIntervalMS {
+		return minPowermetricsIntervalMS
+	}
+	return ms
+}
+
+// powermetricsArgv is the command sudo runs as root: the binary followed by
+// its arguments.
+//
+// SECURITY: this is the one command line the shipped sudoers fragment
+// permits. If you change flags, update deployment/macos/sudoers.d/llmkube-powermetrics
+// in lockstep, along with the tests in power_darwin_test.go and
+// powermetrics_sudoers_test.go that assert the two stay in sync, or sudo will
+// refuse the agent's command after upgrade because the rule no longer matches.
+func powermetricsArgv(bin string, interval time.Duration) []string {
+	return []string{
+		bin,
+		"--samplers", "cpu_power,gpu_power",
+		"-i", strconv.Itoa(powermetricsIntervalMS(interval)),
+	}
+}
+
 // defaultPowermetricsCommand builds the actual sudo invocation. Split out so
 // tests can swap in a fixture-replay command.
-//
-// SECURITY: the argv emitted here is what the shipped sudoers fragment is
-// pinned to. If you change flags, update deployment/macos/sudoers.d/llmkube-powermetrics
-// in lockstep — and the regression test in power_darwin_test.go that asserts
-// the two stay in sync — or the agent will silently lose power data after
-// upgrade because sudoers will no longer match the new argv.
 func defaultPowermetricsCommand(ctx context.Context, bin string, interval time.Duration) *exec.Cmd {
-	intervalMS := int(interval / time.Millisecond)
-	if intervalMS < 100 {
-		intervalMS = 100
-	}
-	return exec.CommandContext(ctx,
-		defaultSudoBin, "-n", bin,
-		"--samplers", "cpu_power,gpu_power",
-		"-i", strconv.Itoa(intervalMS),
-	)
+	args := append([]string{"-n"}, powermetricsArgv(bin, interval)...)
+	return exec.CommandContext(ctx, defaultSudoBin, args...)
 }
 
 // stderrCapture is an io.Writer that retains at most max bytes of stderr,

@@ -820,7 +820,7 @@ The Metal Agent can publish real-time CPU / GPU / ANE / Combined power gauges so
 
 ### Enable
 
-1. Install the NOPASSWD sudoers fragment so the agent can call `powermetrics` without a password. **The shipped fragment pins both the binary path and its argument vector** so the grant is `powermetrics --samplers cpu_power,gpu_power -i <numeric-interval>` only, not `powermetrics --output-file=/wherever`.
+1. Install the NOPASSWD sudoers fragment so the agent can call `powermetrics` without a password. **The shipped fragment pins both the binary path and its arguments.** The rule contains no wildcard characters and the sampling interval is rendered into it at install time, so it matches only this one command line (sudo compares the space-joined arguments): with the default 1s interval the grant is `powermetrics --samplers cpu_power,gpu_power -i 1000` and nothing else, not `powermetrics --output-file=/wherever`.
 
    The easy way (one command, sudo prompts you):
 
@@ -828,7 +828,17 @@ The Metal Agent can publish real-time CPU / GPU / ANE / Combined power gauges so
    make install-powermetrics-sudo
    ```
 
-   This renders the placeholder for the current user, syntax-checks with `visudo -cf`, and atomically installs to `/etc/sudoers.d/llmkube-powermetrics` with `0440 root:wheel` ownership. The grant is read back to your terminal so you can see exactly what was just authorized.
+   This renders the template's two placeholders (the current user and the interval), syntax-checks with `visudo -cf`, and atomically installs to `/etc/sudoers.d/llmkube-powermetrics` with `0440 root:wheel` ownership. The grant is read back to your terminal so you can see exactly what was just authorized. To see the rendered file without installing anything, run `make render-powermetrics-sudoers`.
+
+   If you run the agent with a non-default `--apple-power-interval`, pass the same interval in whole milliseconds (minimum 100, the floor the agent applies), for example for `--apple-power-interval=2s`:
+
+   ```bash
+   make install-powermetrics-sudo APPLE_POWER_INTERVAL_MS=2000
+   ```
+
+   If the installed rule does not match the agent's command (the fragment is missing, or was rendered for a different interval), sudo refuses it and the agent logs `apple-power: powermetrics exited unexpectedly` with sudo's message, the command it asked sudo to run (`argv`, without the leading `/usr/bin/sudo -n`) and a `remedy` field naming the `make` command to run.
+
+   Upgrading the agent does not change an installed `/etc/sudoers.d/llmkube-powermetrics`; after an upgrade, re-run `make install-powermetrics-sudo` (with `APPLE_POWER_INTERVAL_MS` if you use a non-default interval).
 
    To **uninstall**:
 
@@ -840,8 +850,10 @@ The Metal Agent can publish real-time CPU / GPU / ANE / Combined power gauges so
 
    ```bash
    TMP=$(mktemp)
-   sed "s/__LLMKUBE_USER__/$(whoami)/" deployment/macos/sudoers.d/llmkube-powermetrics > "$TMP"
-   sudo visudo -cf "$TMP"
+   sed -e "s/__LLMKUBE_USER__/$(whoami)/" \
+       -e "s/__LLMKUBE_POWERMETRICS_INTERVAL_MS__/1000/" \
+       deployment/macos/sudoers.d/llmkube-powermetrics > "$TMP"
+   visudo -cf "$TMP"   # syntax check; needs no root
    sudo install -m 0440 -o root -g wheel "$TMP" /etc/sudoers.d/llmkube-powermetrics
    rm "$TMP"
    ```
@@ -881,7 +893,7 @@ All four gauges read 0 unless `--apple-power-enabled` is set.
 
 ### Tuning
 
-- `--apple-power-interval=1s` — sampling cadence; tighter values don't add fidelity because `powermetrics` rounds to whole milliseconds.
+- `--apple-power-interval=1s`: sampling cadence; tighter values don't add fidelity because `powermetrics` rounds to whole milliseconds. The sudoers rule pins the interval, so after changing it re-run `make install-powermetrics-sudo APPLE_POWER_INTERVAL_MS=<ms>` with the new value in whole milliseconds (minimum 100).
 - `--powermetrics-bin=/usr/bin/powermetrics` — override only if you've installed `powermetrics` somewhere non-standard.
 
 ## Health Checks & Monitoring
@@ -1360,6 +1372,12 @@ controller predates relay support.
   design. Call the Service instead, or, on the Mac itself, the agent's client
   proxy on `127.0.0.1:<client-port>` (see "Ingress and client-proxy flags"
   above).
+- Upgrading the agent does not change `/etc/sudoers.d/llmkube-powermetrics`.
+  On a host where you installed the powermetrics rule, re-run
+  `make install-powermetrics-sudo` (with `APPLE_POWER_INTERVAL_MS=<ms>` if
+  the agent uses a non-default `--apple-power-interval`), then confirm with
+  `sudo -ln | grep powermetrics` that the rule ends in `-i` followed by a
+  number.
 
 #### Upgrading to 0.10.1
 

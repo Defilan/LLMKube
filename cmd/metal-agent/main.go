@@ -637,7 +637,8 @@ func main() {
 			"see deployment/macos/sudoers.d/llmkube-powermetrics. Darwin only.")
 	flag.DurationVar(&cfg.ApplePowerInterval, "apple-power-interval",
 		agent.DefaultApplePowerInterval,
-		"powermetrics sampling cadence. Only meaningful with --apple-power-enabled.")
+		"powermetrics sampling cadence. Only meaningful with --apple-power-enabled. The sudoers rule "+
+			"pins this value: install it with make install-powermetrics-sudo APPLE_POWER_INTERVAL_MS=<ms>.")
 	flag.StringVar(&cfg.PowermetricsBin, "powermetrics-bin", agent.DefaultPowermetricsBin,
 		"Path to the macOS powermetrics binary. Only used with --apple-power-enabled.")
 	flag.StringVar(&cfg.AllowedModelRoots, "allowed-model-roots", "",
