@@ -185,8 +185,11 @@ func (r *ModelRouterReconciler) resolveBackend(
 		Tier:         b.Tier,
 		Capabilities: append([]string(nil), b.Capabilities...),
 	}
+	// Only a set weight is written: absent means the default share of 1 on
+	// both sides, and an explicit 0 must survive to drain the backend.
 	if b.Weight != nil {
-		wire.Weight = int(*b.Weight)
+		w := *b.Weight
+		wire.Weight = &w
 	}
 	if b.Timeout != nil {
 		wire.Timeout = b.Timeout.Duration

@@ -48,6 +48,9 @@ type Proxy struct {
 	// It gates the residual no_pricing counter for a request served by an
 	// unpriced backend, a config that bypassed validation.
 	hasUSDBudget bool
+	// randN draws the per-request order of a weighted rule. Tests replace it
+	// with a seeded source.
+	randN randInt64N
 }
 
 // ProxyOption customizes a Proxy at construction time. The proxy
@@ -99,6 +102,7 @@ func NewProxy(cfg *Config, logger *slog.Logger, opts ...ProxyOption) *Proxy {
 		logger:     logger,
 		routerName: "default",
 		budgets:    NewBudgetStore(compileBudgetRules(cfg.Policy.Budgets), time.Now),
+		randN:      defaultRandInt64N,
 	}
 	// Config.Validate rejects an unparseable entry, so the error is not
 	// checked again here.
@@ -683,7 +687,8 @@ func (p *Proxy) enforceFailClosed(f *RequestFeatures, dec *MatchResult) error {
 	return nil
 }
 
-// dispatchWithFallback walks the backend list in declared order and
+// dispatchWithFallback walks the backend list in dispatch order (declared
+// order, or a weighted rule's per-request draw, see dispatchOrder) and
 // returns the first successful (non-5xx, non-error) response. On
 // fail-closed routes with all backends unhealthy, the last error
 // propagates back to the handler as HTTP 502 or 503 (the caller in
@@ -713,7 +718,7 @@ func (p *Proxy) dispatchWithFallback(
 	// outage (502).
 	allIncumbentBusy := true
 	tracer := otel.Tracer("model_router.dispatch")
-	for i, name := range dec.Backends {
+	for i, name := range p.dispatchOrder(dec) {
 		// A client that went away cancels every remaining attempt: a fallback
 		// would only fail on the cancelled context.
 		if err := ctx.Err(); err != nil {
