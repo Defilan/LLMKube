@@ -107,6 +107,13 @@ permissions in step with the release. The kubeconfig is still minted by hand:
 the chart never creates a token Secret. See the same README section for the
 values block and the migration from the hand-applied manifest.
 
+The recipe mints a 30-day token into a file that the kubeconfig reads through
+`tokenFile`. To rotate it, mint a new token into the same file (the README
+gives the one-line command); client-go re-reads the file about once a minute,
+so the running agent picks it up without a restart or a plist change.
+`llmkube metal join` is the recommended path: its token lasts 7 days and the
+agent renews it itself.
+
 Without `METAL_KUBECONFIG` the agent connects with the current context
 of `~/.kube/config`, usually an admin identity. Under launchd it does
 not see your shell's `$KUBECONFIG`.
@@ -935,6 +942,26 @@ revoked and the command fails. For a Mac whose objects you applied by
 hand without the label, `--include-unlabeled` also deletes unlabeled
 objects with the Mac's names, with a warning for each; objects
 labeled for another Mac are never deleted.
+
+### Limit the agent's writes (Kubernetes 1.30+)
+
+The agent's Role lets it create, update and delete any Service and
+EndpointSlice in its namespace, because RBAC cannot scope a verb to a label.
+A ValidatingAdmissionPolicy narrows that to the objects the agent manages:
+for every ServiceAccount named `llmkube-metal-<name>`, a write must leave the
+label `llmkube.ai/managed-by=metal-agent` on a Service, EndpointSlice or
+Endpoints object, and an update or delete must find it there. An update of
+the Service an InferenceService controls is also allowed, so the agent can
+take it over after a CUDA to Metal switch or a relay hand-back. The
+`llmkube-metal-` ServiceAccount prefix is reserved for Mac agents.
+
+The Helm chart installs the policy by default
+(`metalAgent.writePolicy.enabled`). Without Helm, a cluster admin applies
+[`deployment/macos/metal-agent-write-policy.yaml`](https://github.com/defilantech/LLMKube/blob/main/deployment/macos/metal-agent-write-policy.yaml)
+once; do not apply both. On Kubernetes older than 1.30 only the Role applies.
+See
+["Limiting the agent's writes"](https://github.com/defilantech/LLMKube/blob/main/deployment/macos/README.md#limiting-the-agents-writes-admission-policy-kubernetes-130)
+for what it does and does not stop.
 
 ## Optional: Apple Silicon power metrics
 
