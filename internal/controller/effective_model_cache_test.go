@@ -133,9 +133,6 @@ func TestResolveEffectiveModelCache(t *testing.T) {
 // The inherited block must be a copy: the Model is read on every reconcile of
 // every service, and a shared pointer would let one service's use of the value
 // mutate the Model.
-// The inherited block must be a copy: the Model is read on every reconcile of
-// every service, and a shared pointer would let one service's use of the value
-// mutate the Model.
 func TestResolveEffectiveModelCacheCopiesTheModelBlock(t *testing.T) {
 	model := &inferencev1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "default"}}
 	model.Spec.ModelCache = &inferencev1alpha1.ModelCacheSpec{ClaimName: "from-model", Prefetch: true, StorageClassName: "fast"}

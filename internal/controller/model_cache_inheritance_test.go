@@ -248,6 +248,8 @@ var _ = Describe("Model.spec.modelCache inheritance (#2142)", func() {
 			Expect(after.Annotations[AnnotationDesiredTemplateHash]).To(Equal(hashBefore),
 				"the template hash must not move when the inherited block is made explicit")
 			Expect(after.Spec.Template).To(Equal(*templateBefore))
+			Expect(hasModelDownloader(after)).To(BeTrue(),
+				"neither case asks for a prefetch, so the pod still downloads at serve time")
 		},
 		Entry("an inherited claimName", "explicit-claim", &inferencev1alpha1.ModelCacheSpec{ClaimName: "explicit-block-cache"}),
 		Entry("an inherited ephemeral opt-out", "explicit-ephemeral", &inferencev1alpha1.ModelCacheSpec{
@@ -255,3 +257,13 @@ var _ = Describe("Model.spec.modelCache inheritance (#2142)", func() {
 		}),
 	)
 })
+
+// hasModelDownloader reports whether the pod downloads at serve time.
+func hasModelDownloader(dep *appsv1.Deployment) bool {
+	for _, c := range dep.Spec.Template.Spec.InitContainers {
+		if c.Name == "model-downloader" {
+			return true
+		}
+	}
+	return false
+}
