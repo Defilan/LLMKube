@@ -67,7 +67,7 @@ expect_rc 1 "test failure must fail the gate when lint passes"
 expect_line 'gate: lint +PASS' "summary must report the passing lint"
 expect_line 'gate: test +FAIL' "summary must report the test failure"
 
-# Everything green: exit zero, all seven steps PASS.
+# Everything green: exit zero, all seven default steps PASS (the probe is unset).
 repo=$(new_repo)
 run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_FMT_CMD=true GATE_COPYRIGHT_CMD=true GATE_VET_CMD=true \
 	GATE_LINT_CMD=true GATE_TEST_CMD=true
@@ -190,6 +190,37 @@ for s in regen drift fmt copyright vet lint test; do
 	printf '%s\n' "$GATE_OUT" | grep -qF "log=$GATE_LOG_DIR/$s.log" || fail "summary must name the $s log"
 	[ -e "$GATE_LOG_DIR/$s.log" ] || fail "$s step must write its log file"
 done
+
+# The extra probe step is optional: unset keeps the six-step summary, and a
+# failing probe must fail the gate and skip vet rather than run it anyway.
+repo=$(new_repo)
+run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_FMT_CMD=true GATE_COPYRIGHT_CMD=true GATE_VET_CMD=true \
+	GATE_LINT_CMD=true GATE_TEST_CMD=true
+expect_rc 0 "a gate without a probe must pass"
+if printf '%s\n' "$GATE_OUT" | grep -qE 'gate: probe'; then
+	fail "an unset probe must not appear in the summary
+$GATE_OUT"
+fi
+
+repo=$(new_repo)
+stamp="$(mktemp -d)"
+run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_FMT_CMD=true GATE_COPYRIGHT_CMD=true \
+	GATE_PROBE_CMD="touch $stamp/probe_ran" GATE_VET_CMD="touch $stamp/vet_ran" \
+	GATE_LINT_CMD=true GATE_TEST_CMD=true
+expect_rc 0 "a passing probe must pass the gate"
+expect_line 'gate: probe +PASS' "summary must report the probe"
+[ -e "$stamp/probe_ran" ] || fail "a configured probe must run"
+[ -e "$stamp/vet_ran" ] || fail "vet must still run after a passing probe"
+
+repo=$(new_repo)
+stamp="$(mktemp -d)"
+run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_FMT_CMD=true GATE_COPYRIGHT_CMD=true \
+	GATE_PROBE_CMD=false GATE_VET_CMD="touch $stamp/vet_ran" \
+	GATE_LINT_CMD=true GATE_TEST_CMD=true
+expect_rc 1 "a failing probe must fail the gate"
+expect_line 'gate: probe +FAIL' "summary must report the probe failure"
+expect_line 'gate: vet +SKIPPED' "a failing probe must skip vet"
+if [ -e "$stamp/vet_ran" ]; then fail "vet must not run after a failing probe"; fi
 
 # The gate pins the default seed and honors an override.
 repo=$(new_repo)

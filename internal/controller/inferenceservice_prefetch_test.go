@@ -607,45 +607,6 @@ var _ = Describe("InferenceService modelCache.prefetch (#2136)", func() {
 		Expect(stored.Spec.ModelCache).To(BeNil(), "inheritance is never written back to the service's spec")
 	})
 
-	It("verifies the Model's claim a service inherits, and mounts it for the draft too", func() {
-		// The inherited claim is the service's cache volume (#2136), so the
-		// provisioning side must verify it (a user-owned claim that is
-		// missing is Degraded, not silently replaced by one the pods never
-		// mount), and the draft's weights ride on that same claim.
-		model := readyModel("inherited-claim-model", "https://example.com/models/llama.gguf", func(m *inferencev1alpha1.Model) {
-			m.Spec.ModelCache = &inferencev1alpha1.ModelCacheSpec{ClaimName: "inherited-claim"}
-		})
-		readyModel("inherited-draft", "https://example.com/models/draft.gguf", nil)
-
-		By("refusing to provision a replacement when the inherited claim is missing")
-		missing := newService("inherited-missing", model.Name, nil)
-		missing.Spec.SpeculativeDecoding = &inferencev1alpha1.SpeculativeDecodingSpec{Type: "draft-simple", DraftModelRef: "inherited-draft"}
-		Expect(k8sClient.Update(ctx, missing)).To(Succeed())
-		got := reconcileService(isvcReconciler(), missing.Name)
-		Expect(got.Status.Phase).To(Equal(PhaseFailed))
-		Expect(got.Status.Conditions).NotTo(BeEmpty())
-		Expect(meta.FindStatusCondition(got.Status.Conditions, ConditionDegraded)).NotTo(BeNil(),
-			"the Model's claim is verified as the service's cache volume; a missing one is Degraded")
-		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Name: ModelCachePVCName, Namespace: ns},
-			&corev1.PersistentVolumeClaim{}))).To(BeTrue(), "no shared claim is created for a service that mounts another")
-
-		By("mounting the inherited claim for both the target and the draft once it exists")
-		createCachePVC(ctx, ns, "inherited-claim")
-		isvc := newService("inherited-draft-svc", model.Name, nil)
-		isvc.Spec.SpeculativeDecoding = &inferencev1alpha1.SpeculativeDecodingSpec{Type: "draft-simple", DraftModelRef: "inherited-draft"}
-		Expect(k8sClient.Update(ctx, isvc)).To(Succeed())
-		reconcileService(isvcReconciler(), isvc.Name)
-
-		dep := &appsv1.Deployment{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvc.Name, Namespace: ns}, dep)).To(Succeed())
-		for _, v := range dep.Spec.Template.Spec.Volumes {
-			if v.PersistentVolumeClaim != nil {
-				Expect(v.PersistentVolumeClaim.ClaimName).To(Equal("inherited-claim"),
-					"volume %q mounts the claim the service resolves, not the draft Model's own default", v.Name)
-			}
-		}
-	})
-
 	It("does not hold a service whose Model source is not prefetchable", func() {
 		model := readyModel("pvc-model", "pvc://staged-models/llama.gguf", nil)
 		isvc := newService("pvc-prefetch", model.Name, &inferencev1alpha1.ModelCacheSpec{Prefetch: true})

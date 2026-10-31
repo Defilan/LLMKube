@@ -172,8 +172,12 @@ test-envtest: manifests generate fmt vet setup-envtest ## Run the envtest suites
 # as make -j: targets sharing the manifests/generate prerequisites would
 # race the regeneration). Logs under ${TMPDIR:-/tmp}/llmkube-gate.
 .PHONY: gate
-gate: controller-gen golangci-lint setup-envtest ## Agent gate: regen + drift check, gofmt check, vet, then lint-all and tests in parallel.
-	@ENVTEST_BIN="$(ENVTEST)" BIN_DIR="$(LOCALBIN)" ENVTEST_K8S_VERSION="$(ENVTEST_K8S_VERSION)" GO_TEST_TIMEOUT="$(GO_TEST_TIMEOUT)" ./scripts/gate.sh
+# The gate's extra check: production code never assigns an InferenceService's
+# spec.modelCache, the mutation #2142 removes. Runs before vet so it fails fast.
+GATE_PROBE_CMD ?= go test ./internal/controller/ -run TestNoProductionModelCacheAssignment -count=1
+
+gate: controller-gen golangci-lint setup-envtest ## Agent gate: regen + drift check, gofmt check, modelCache assignment guard, vet, then lint-all and tests in parallel.
+	@ENVTEST_BIN="$(ENVTEST)" BIN_DIR="$(LOCALBIN)" ENVTEST_K8S_VERSION="$(ENVTEST_K8S_VERSION)" GO_TEST_TIMEOUT="$(GO_TEST_TIMEOUT)" GATE_PROBE_CMD='$(GATE_PROBE_CMD)' ./scripts/gate.sh
 
 # BASE_REF is the ref test-affected diffs against. Fork contributors:
 # override with BASE_REF=origin/main.
