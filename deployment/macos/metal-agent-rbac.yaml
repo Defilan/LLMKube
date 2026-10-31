@@ -16,6 +16,13 @@
 # cluster removed that binding.
 #
 #   kubectl apply -n <namespace> -f deployment/macos/metal-agent-rbac.yaml
+#
+# RBAC cannot scope the Service and EndpointSlice verbs below to the agent's
+# own objects. On Kubernetes 1.30 or newer, also apply
+# metal-agent-write-policy.yaml once per cluster (the Helm chart installs it by
+# default): it limits those writes to objects labeled
+# llmkube.ai/managed-by=metal-agent (#2081). Without it this Role is the only
+# limit.
 apiVersion: v1
 kind: ServiceAccount
 metadata:

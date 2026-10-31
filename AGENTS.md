@@ -72,7 +72,7 @@ contributors share. The human onboarding narrative lives in
 | Check AGENTS.md references resolve  | `make check-agents-md`  |
 | New Go file headers carry the template's year | `make check-copyright` |
 | Go builder images match `go.mod`    | `make check-go-version` |
-| Chart metal-agent RBAC vs manifest  | `make check-metal-agent-rbac` |
+| Chart metal-agent RBAC and write policy vs manifests | `make check-metal-agent-rbac` |
 
 ## Definition of done
 
@@ -81,8 +81,8 @@ A change is not done until all of these hold.
 1. The pre-commit gate passes: `make fmt`, `make vet`, `make lint`, `make test`.
 2. The pre-push gate passes: `make lint-all`. If `charts/` changed, run
    `make test-chart`, plus `make test-chart-rules` if the PrometheusRule
-   changed, plus `make check-metal-agent-rbac` if the metal-agent identity
-   template or its values changed. If CRD types in `api/v1alpha1/` changed, run
+   changed, plus `make check-metal-agent-rbac` if the metal-agent identity or
+   write-policy template or its values changed. If CRD types in `api/v1alpha1/` changed, run
    `make generate` and `make chart-crds`, then `git status` must be clean.
    Uncommitted generated files mean a step was skipped, and the CI CRD sync
    check will fail.

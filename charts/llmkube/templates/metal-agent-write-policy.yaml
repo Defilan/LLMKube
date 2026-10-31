@@ -1,0 +1,97 @@
+{{- /*
+Limit the macOS Metal agent's Service, EndpointSlice and Endpoints writes to
+the objects it manages (#2081). The agent's Role grants create, update and
+delete on every Service and EndpointSlice in its namespace, because RBAC cannot
+scope a verb to a label, so a leaked agent kubeconfig could otherwise rewrite
+or delete unrelated Services.
+
+Every object the agent writes carries llmkube.ai/managed-by=metal-agent. A
+create or update must leave that label on the object; an update or delete must
+find it on the current object. The one exception is an update of a Service an
+InferenceService controls (controller ownerReference): the Service the
+controller wrote, which the agent takes over in legacy mode after a CUDA to
+Metal switch or a relay hand-back (ownedFor in pkg/agent/registry.go). Deletes
+stay label-only, as in the agent.
+
+It applies to ServiceAccounts named llmkube-metal-<DNS-1123 label> in any
+namespace: the shared llmkube-metal-agent identity and the per-Mac identities
+`llmkube metal token create` creates. That prefix is reserved for Mac agents.
+The controller's own ServiceAccount is excluded by name, because a release
+named, say, llmkube-metal-prod names it llmkube-metal-prod-controller-manager.
+
+deployment/macos/metal-agent-write-policy.yaml is the same policy for installs
+without Helm (no controller exclusion: the kustomize controller is
+llmkube-controller-manager). make check-metal-agent-rbac fails if the two
+drift. Clusters without ValidatingAdmissionPolicy (Kubernetes older than 1.30)
+skip this and keep only the Role.
+
+The has() guards matter: with failurePolicy Fail, an evaluation error would
+deny the request.
+*/ -}}
+{{- if and .Values.metalAgent.writePolicy.enabled (.Capabilities.APIVersions.Has "admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy") }}
+{{- $name := include "llmkube.resourceName" (dict "root" $ "suffix" "-metal-agent-writes") }}
+{{- $controller := printf "system:serviceaccount:%s:%s" (include "llmkube.namespace" .) (include "llmkube.serviceAccountName" .) }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "llmkube.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      operations: ["CREATE", "UPDATE", "DELETE"]
+      resources: ["services", "endpoints"]
+    - apiGroups: ["discovery.k8s.io"]
+      apiVersions: ["v1"]
+      operations: ["CREATE", "UPDATE", "DELETE"]
+      resources: ["endpointslices"]
+  matchConditions:
+  - name: metal-agent-identity
+    expression: >-
+      request.userInfo.username.matches('^system:serviceaccount:[a-z0-9]([-a-z0-9]*[a-z0-9])?:llmkube-metal-[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
+  - name: not-llmkube-controller
+    expression: request.userInfo.username != {{ $controller | squote }}
+  validations:
+  - expression: >-
+      request.operation == 'DELETE' ||
+      (has(object.metadata.labels) &&
+      'llmkube.ai/managed-by' in object.metadata.labels &&
+      object.metadata.labels['llmkube.ai/managed-by'] == 'metal-agent')
+    message: >-
+      the metal-agent may only create or update Services, EndpointSlices and
+      Endpoints that keep the label llmkube.ai/managed-by=metal-agent
+      (ServiceAccounts named llmkube-metal-* are reserved for Mac agents, #2081)
+    reason: Forbidden
+  - expression: >-
+      request.operation == 'CREATE' ||
+      (has(oldObject.metadata.labels) &&
+      'llmkube.ai/managed-by' in oldObject.metadata.labels &&
+      oldObject.metadata.labels['llmkube.ai/managed-by'] == 'metal-agent') ||
+      (request.operation == 'UPDATE' &&
+      request.resource.group == '' && request.resource.resource == 'services' &&
+      has(oldObject.metadata.ownerReferences) &&
+      oldObject.metadata.ownerReferences.exists(ref,
+      ref.apiVersion.startsWith('inference.llmkube.dev/') &&
+      ref.kind == 'InferenceService' &&
+      has(ref.controller) && ref.controller))
+    message: >-
+      the metal-agent may only update or delete Services, EndpointSlices and
+      Endpoints already labeled llmkube.ai/managed-by=metal-agent, or update a
+      Service an InferenceService controls (ServiceAccounts named
+      llmkube-metal-* are reserved for Mac agents, #2081)
+    reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "llmkube.labels" . | nindent 4 }}
+spec:
+  policyName: {{ $name }}
+  validationActions: [Deny]
+{{- end }}

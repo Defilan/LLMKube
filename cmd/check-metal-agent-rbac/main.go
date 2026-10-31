@@ -15,7 +15,9 @@ limitations under the License.
 */
 
 // Command check-metal-agent-rbac keeps the Helm chart's metal-agent identity
-// identical to deployment/macos/metal-agent-rbac.yaml (#2152).
+// identical to deployment/macos/metal-agent-rbac.yaml (#2152), and the chart's
+// agent write policy identical to deployment/macos/metal-agent-write-policy.yaml
+// apart from the controller exclusion only the chart needs (#2081).
 //
 // The standalone manifest is what cmd/metal-agent/rbac_test.go pins to the
 // agent's own API calls, so it is the source of truth for the rules. The chart
@@ -80,6 +82,8 @@ func main() {
 	root := flag.String("root", ".", "repo root")
 	manifest := flag.String("manifest", "deployment/macos/metal-agent-rbac.yaml",
 		"standalone RBAC manifest, relative to --root")
+	writePolicyManifest := flag.String("write-policy", "deployment/macos/metal-agent-write-policy.yaml",
+		"standalone agent write policy, relative to --root")
 	chart := flag.String("chart", "charts/llmkube", "chart directory, relative to --root")
 	helm := flag.String("helm", "helm", "helm binary")
 	flag.Parse()
@@ -89,6 +93,12 @@ func main() {
 		fmt.Fprintln(os.Stderr, "check-metal-agent-rbac:", err)
 		os.Exit(2)
 	}
+	policyProblems, err := runWritePolicy(*root, *writePolicyManifest, *chart, *helm)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "check-metal-agent-rbac:", err)
+		os.Exit(2)
+	}
+	problems = append(problems, policyProblems...)
 	if len(problems) > 0 {
 		for _, p := range problems {
 			fmt.Fprintf(os.Stderr, "FAIL: %s\n", p)
@@ -96,6 +106,7 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Println("✅ metal-agent RBAC matches deployment/macos/metal-agent-rbac.yaml")
+	fmt.Println("✅ metal-agent write policy matches deployment/macos/metal-agent-write-policy.yaml")
 }
 
 // run reads the manifest, renders the chart for every branch, and returns one

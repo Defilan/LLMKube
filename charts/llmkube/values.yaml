@@ -744,7 +744,24 @@ metalAgent:
       create: true
       # Name of the ServiceAccount. Empty uses llmkube-metal-agent, the name
       # deployment/macos/README.md's `kubectl create token` recipe uses.
+      # Keep the llmkube-metal- prefix, or writePolicy below does not cover
+      # the agent.
       name: ""
+  writePolicy:
+    # Install a ValidatingAdmissionPolicy that holds every ServiceAccount named
+    # llmkube-metal-<name>, in any namespace, to the Services, EndpointSlices
+    # and Endpoints the agent manages (#2081): a create or update must leave
+    # the llmkube.ai/managed-by=metal-agent label on the object, and an update
+    # or delete must find it there. The one exception is an update of a
+    # Service an InferenceService controls, which the agent takes over after a
+    # CUDA to Metal switch or a relay hand-back. The llmkube-metal- prefix is
+    # reserved for Mac agents; the controller's own ServiceAccount is excluded
+    # by name. Independent of rbac.enabled: it also covers identities from
+    # deployment/macos/metal-agent-rbac.yaml and `llmkube metal token create`.
+    # Rendered only when the cluster serves admissionregistration.k8s.io/v1
+    # ValidatingAdmissionPolicy (Kubernetes 1.30 or newer); older clusters keep
+    # only the Role, the weaker fallback.
+    enabled: true
 
 # Network policies for the controller manager pod
 networkPolicies:

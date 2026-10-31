@@ -451,7 +451,14 @@ grep "connected to Kubernetes" ~/Library/Logs/llmkube/metal-agent.log
 
 ### Dedicated kubeconfig with least-privilege RBAC
 
-The agent doesn't need your admin credentials.
+The agent doesn't need your admin credentials. The recommended way to give it
+its own is `llmkube metal join` (see the
+[macOS Metal guide](https://llmkube.com/docs/guides/macos-metal#join-a-mac)):
+it creates a per-Mac ServiceAccount, writes a kubeconfig that reads a 7-day
+token from a file, and runs the agent with `--renew-service-account-token`,
+so the token renews itself and nothing here needs a calendar reminder. The
+rest of this section is the manual equivalent with the shared ServiceAccount.
+
 [`metal-agent-rbac.yaml`](metal-agent-rbac.yaml) creates a ServiceAccount
 with only the permissions the agent uses (read InferenceServices and Models,
 update InferenceService status, manage the Services and EndpointSlices that
@@ -477,11 +484,14 @@ metalAgent:
 kubeconfig below and skip its `kubectl apply` step. Without Helm, apply the
 manifest as the recipe does.
 
-Mint a kubeconfig from the identity:
+Mint a kubeconfig from the identity. The token lives in its own file, which
+the kubeconfig names as `tokenFile`, so it can be replaced later without
+touching the kubeconfig or the plist:
 
 ```bash
 NS=default                                  # the namespace the agent watches (--namespace)
 KC=$HOME/.kube/llmkube-metal-agent.yaml
+TOKEN_FILE=$HOME/.kube/llmkube-metal-agent.token
 CA=$(mktemp)                                # private temp file for the cluster CA
 
 # Without Helm. With metalAgent.rbac.enabled the chart already created these.
@@ -497,11 +507,12 @@ elif [ -n "$CA_FILE" ]; then
 fi
 test -s "$CA" || { echo "no cluster CA found in either certificate-authority-data or certificate-authority; set --certificate-authority on the set-cluster command below by hand" >&2; exit 1; }
 
-TOKEN=$(kubectl create token llmkube-metal-agent -n "$NS" --duration=8760h)
+# 30 days. Rotate it before then (below).
+(umask 077; kubectl create token llmkube-metal-agent -n "$NS" --duration=720h > "$TOKEN_FILE")
 
 kubectl --kubeconfig "$KC" config set-cluster llmkube \
   --server "$SERVER" --certificate-authority "$CA" --embed-certs
-kubectl --kubeconfig "$KC" config set-credentials llmkube-metal-agent --token "$TOKEN"
+kubectl --kubeconfig "$KC" config set users.llmkube-metal-agent.tokenFile "$TOKEN_FILE"
 kubectl --kubeconfig "$KC" config set-context llmkube \
   --cluster llmkube --user llmkube-metal-agent --namespace "$NS"
 kubectl --kubeconfig "$KC" config use-context llmkube
@@ -522,8 +533,31 @@ unusable CA.
 
 `kubectl create token` issues a time-limited token, and the API server may
 cap `--duration` below what you ask for. When it expires the agent logs
-`Unauthorized`; rerun the `create token` and `set-credentials` steps. The
-manifest is namespace-scoped: running the agent with `--namespace ""` (all
+`Unauthorized`. Rotate it before then by minting a new token into the same
+file; run this where `kubectl` reaches the cluster as an admin and the token
+file is local (the Mac, as above):
+
+```bash
+(umask 077; kubectl create token llmkube-metal-agent -n "$NS" --duration=720h > "$TOKEN_FILE.new") \
+  && mv "$TOKEN_FILE.new" "$TOKEN_FILE"
+```
+
+The rename replaces the file in one step, and client-go re-reads a
+`tokenFile` about once a minute, so the running agent picks the new token up
+without a restart and without any change to the plist or the kubeconfig. Run
+it on a schedule well inside the 30 days (weekly, say). Minting a new token
+does not revoke the old one: it stays valid until it expires. To revoke every
+token at once, delete and recreate the ServiceAccount (the API server rejects
+tokens bound to the old UID), then mint a new one.
+
+A kubeconfig from an older version of this recipe embeds the token inline,
+and an inline token wins over `tokenFile`. Move it to a file with the first
+command above (without `.new`), then
+`kubectl --kubeconfig "$KC" config set users.llmkube-metal-agent.tokenFile "$TOKEN_FILE"`
+and `kubectl --kubeconfig "$KC" config unset users.llmkube-metal-agent.token`,
+and restart the agent once.
+
+The manifest is namespace-scoped: running the agent with `--namespace ""` (all
 namespaces) needs the same rules in a ClusterRole and ClusterRoleBinding,
 which `metalAgent.rbac.scope: cluster` renders.
 
@@ -537,15 +571,15 @@ release namespace, because that is where the chart creates it. If you set
 `serviceAccount.create: false`, the identity you bind must live there.
 Deleting the ServiceAccount gives its replacement a new UID, and the API
 server validates a bound token against that UID, so the token you minted for
-the old one stops working: re-run `kubectl create token` and the
-`set-credentials` step after the upgrade, then restart the agent.
+the old one stops working: mint a new one into the token file after the
+upgrade (the rotation command above).
 
 Update an existing `metalAgent.rbac.namespaces` list and the namespaces you
 removed have their ServiceAccount, Role and RoleBinding deleted on upgrade,
 because Helm removes everything that leaves the release manifest. Adding a
 namespace back creates a fresh ServiceAccount with a new UID, so the token
-minted for the previous one stops working: re-run `kubectl create token` and
-`set-credentials` for that namespace. The namespaces the chart installs into
+minted for the previous one stops working: mint a new one into the token
+file for that namespace. The namespaces the chart installs into
 must exist: Helm creates only the release namespace, not the ones the chart
 names.
 
@@ -555,6 +589,63 @@ normally read through the default `system:discovery` ClusterRoleBinding. If
 your cluster's admins removed that binding, the ServiceAccount above needs it
 granted explicitly, for example
 `kubectl create clusterrolebinding llmkube-metal-agent-discovery --clusterrole=system:discovery --serviceaccount="$NS:llmkube-metal-agent"`.
+
+### Limiting the agent's writes (admission policy, Kubernetes 1.30+)
+
+RBAC cannot scope a verb to a label, so the Role above lets the agent create,
+update and delete every Service and EndpointSlice in its namespace. A leaked
+agent kubeconfig could rewrite or delete Services that have nothing to do with
+LLMKube. [`metal-agent-write-policy.yaml`](metal-agent-write-policy.yaml) is a
+ValidatingAdmissionPolicy and binding that close that for the agent's
+identities: every object the agent writes carries
+`llmkube.ai/managed-by=metal-agent`, so
+
+- a create or update of a Service, EndpointSlice or Endpoints object must
+  leave that label on it;
+- an update or delete must find the label on the object as it is now;
+- except that an update of a Service an InferenceService controls (controller
+  ownerReference) is allowed when it adds the label. That is the controller's
+  `<isvc>` Service, which the agent takes over in legacy mode after a CUDA to
+  Metal switch or when the controller hands it back after relay mode. A
+  delete stays label-only.
+
+It applies to every ServiceAccount named `llmkube-metal-<name>` in any
+namespace: the shared `llmkube-metal-agent` and the per-Mac
+`llmkube-metal-<mac>` identities `llmkube metal token create` creates. The
+`llmkube-metal-` ServiceAccount prefix is reserved for Mac agents; another
+workload with a ServiceAccount of that name is held to the same rule. Other
+identities, including the LLMKube controller, are not affected.
+
+Without Helm, a cluster admin applies it once per cluster (it is
+cluster-scoped):
+
+```bash
+kubectl apply -f deployment/macos/metal-agent-write-policy.yaml
+```
+
+With Helm, the chart installs the same policy by default
+(`metalAgent.writePolicy.enabled`), whether or not it also renders the agent's
+identity. Do not apply the raw file as well: the chart's copy also exempts the
+controller's own ServiceAccount, which a release named `llmkube-metal-<something>`
+puts under the prefix, and the raw copy does not. `make check-metal-agent-rbac`
+fails if the two copies drift.
+
+Check it from an admin context:
+
+```bash
+kubectl --as="system:serviceaccount:$NS:llmkube-metal-agent" -n "$NS" \
+  create service clusterip policy-probe --tcp=80 --dry-run=server
+# expect: ... denied request: the metal-agent may only create or update Services, ...
+```
+
+What it does not stop: the agent can still create labeled objects under any
+free name in its namespace, change or delete any labeled object there
+(including another Mac's), and take over a Service an InferenceService
+controls. It narrows a leaked token from every Service in the namespace to
+LLMKube's own endpoints.
+
+Kubernetes older than 1.30 does not serve ValidatingAdmissionPolicy; there the
+Role alone applies, the weaker fallback, and the chart skips the policy.
 
 ### `--metal-node` flag (MetalNode reporting) and the per-Mac Role
 

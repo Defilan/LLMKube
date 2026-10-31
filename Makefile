@@ -95,7 +95,7 @@ check-helm-webhook-cert: ## Verify the webhook serving cert names the capped Ser
 	@./scripts/check-helm-webhook-cert.sh
 
 .PHONY: check-metal-agent-rbac
-check-metal-agent-rbac: ## Verify the chart's metal-agent identity matches deployment/macos/metal-agent-rbac.yaml (#2152).
+check-metal-agent-rbac: ## Verify the chart's metal-agent identity and write policy match deployment/macos (#2152, #2081).
 	@go run ./cmd/check-metal-agent-rbac --root .
 
 .PHONY: sync-reviewer-prompts
