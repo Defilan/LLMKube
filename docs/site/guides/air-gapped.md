@@ -397,6 +397,8 @@ kubectl -n default create secret generic minio-creds \
   --from-literal=AWS_SECRET_ACCESS_KEY=<secret> \
   --from-literal=AWS_REGION=us-east-1 \
   --from-literal=AWS_ENDPOINT_URL=https://minio.internal:9000
+# Required for Metal (the metal-agent reads only a labeled Secret); harmless in-cluster.
+kubectl -n default label secret minio-creds inference.llmkube.dev/model-source-credentials=true
 ```
 
 ```yaml

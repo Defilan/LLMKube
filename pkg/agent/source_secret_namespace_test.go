@@ -40,16 +40,18 @@ const (
 	s3ObjectSource = "s3://models/org/repo/model.gguf"
 )
 
-// signedS3Server stands in for a private MinIO bucket: it answers only
-// SigV4-signed requests (HEAD with the object size, GET with the object) and
-// counts every request it receives, signed or not, so a test can assert that
-// nothing reached it.
+// signedS3Server stands in for a private origin: a MinIO bucket that answers
+// only SigV4-signed requests, or a gated Hugging Face repository that answers
+// only the test's HF_TOKEN bearer (HEAD with the object size, GET with the
+// object). It counts every request it receives, authenticated or not, so a
+// test can assert that nothing reached it.
 func signedS3Server(t *testing.T) (*httptest.Server, *atomic.Int32) {
 	t.Helper()
 	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
-		if !strings.HasPrefix(r.Header.Get("Authorization"), "AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE0000000/") {
+		auth := r.Header.Get("Authorization")
+		if !strings.HasPrefix(auth, "AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE0000000/") && auth != "Bearer hf_secret" {
 			w.WriteHeader(http.StatusForbidden)
 			return
 		}
@@ -125,7 +127,7 @@ func TestSourceSecret_ReadFromModelNamespace(t *testing.T) {
 	for _, agentNS := range []string{"", "default"} {
 		t.Run(fmt.Sprintf("agent namespace %q", agentNS), func(t *testing.T) {
 			srv, hits := signedS3Server(t)
-			secret := s3CredentialSecret(teamNamespace, minioRefName, srv.URL, nil)
+			secret := s3CredentialSecret(teamNamespace, minioRefName, srv.URL, modelSourceCredentialsLabels())
 			a := sourceSecretTestAgent(t, agentNS, secret)
 			model := sourceSecretTestModel(teamNamespace, minioRefName)
 

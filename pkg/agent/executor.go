@@ -223,6 +223,11 @@ type MetalExecutor struct {
 	// to an anonymous GET. Set via WithKubeClient.
 	k8sClient client.Client
 	caCerts   [][]byte
+	// allowUnlabeledSourceSecrets lets getSourceSecret read a sourceSecretRef
+	// Secret without the model-source-credentials marker (the deprecated
+	// --allow-unlabeled-source-secrets flag). Set via
+	// WithAllowUnlabeledSourceSecrets.
+	allowUnlabeledSourceSecrets bool
 
 	// downloadAllow is the parsed --allowed-download-hosts list: hosts and
 	// CIDRs the SSRF guard lets through even though they resolve to a
@@ -607,7 +612,10 @@ func (e *MetalExecutor) fetchModel(
 	// request is built, so the scheme works the same as the init-container path.
 	var token string
 	if secretRef != nil {
-		secretToken, hfEndpoint := e.resolveHFAuth(ctx, secretRef)
+		secretToken, hfEndpoint, err := e.resolveHFAuth(ctx, secretRef)
+		if err != nil {
+			return err
+		}
 		if isHFAuthHostForEndpoint(source, hfEndpoint) {
 			token = secretToken
 		}

@@ -450,6 +450,7 @@ func (a *MetalAgent) s3SizeProbe(ctx context.Context, model *inferencev1alpha1.M
 	if exec == nil {
 		exec = NewMetalExecutor(a.config.LlamaServerBin, a.config.ModelStorePath, a.logger,
 			WithKubeClient(a.config.K8sClient, nil),
+			WithAllowUnlabeledSourceSecrets(a.config.AllowUnlabeledSourceSecrets),
 			WithAllowedDownloadHosts(a.config.AllowedDownloadHosts))
 	}
 	return s3ObjectSize(ctx, exec, model.Spec.Source, sourceSecretKeyFor(model.Namespace, model.Spec.SourceSecretRef))

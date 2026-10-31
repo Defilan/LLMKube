@@ -39,12 +39,13 @@ import (
 // the controller did not recognize: it cleared the status every poll and the
 // agent refused again every poll, in a loop.
 const (
-	EventReasonEndpointNameConflict  = inferencev1alpha1.ReasonEndpointNameConflict
-	EventReasonModelSourceNotAllowed = inferencev1alpha1.ReasonModelSourceNotAllowed
-	EventReasonExtraArgsRejected     = inferencev1alpha1.ReasonExtraArgsRejected
-	EventReasonServiceNameTooLong    = inferencev1alpha1.ReasonServiceNameTooLong
-	EventReasonModelDigestMismatch   = inferencev1alpha1.ReasonModelDigestMismatch
-	EventReasonModelDownloadTooLarge = inferencev1alpha1.ReasonModelDownloadTooLarge
+	EventReasonEndpointNameConflict   = inferencev1alpha1.ReasonEndpointNameConflict
+	EventReasonModelSourceNotAllowed  = inferencev1alpha1.ReasonModelSourceNotAllowed
+	EventReasonExtraArgsRejected      = inferencev1alpha1.ReasonExtraArgsRejected
+	EventReasonServiceNameTooLong     = inferencev1alpha1.ReasonServiceNameTooLong
+	EventReasonModelDigestMismatch    = inferencev1alpha1.ReasonModelDigestMismatch
+	EventReasonModelDownloadTooLarge  = inferencev1alpha1.ReasonModelDownloadTooLarge
+	EventReasonSourceSecretNotAllowed = inferencev1alpha1.ReasonSourceSecretNotAllowed
 )
 
 // refuseStart records why the agent will not serve an InferenceService: it
@@ -80,7 +81,9 @@ func (a *MetalAgent) refuseStart(
 // memo every reconcile would download up to the cap again. A
 // *ModelCacheEntryNotRegularError (a symlink in a downloaded source's cache
 // slot that appeared after checkModelCacheSlot ran) is refused the same way
-// as ModelSourceNotAllowed. Every other StartProcess failure
+// as ModelSourceNotAllowed. A *SourceSecretNotAllowedError (a sourceSecretRef
+// Secret that lost its marker or was deleted after checkSourceSecret ran) is
+// refused as SourceSecretNotAllowed. Every other StartProcess failure
 // (network error, bad status, truncated download, health-check timeout, ...)
 // keeps the historical plain-wrapped-error, log-only behavior. Split out of
 // reconcileProcess, rather than inlined as an extra branch there, to keep its
@@ -108,6 +111,10 @@ func (a *MetalAgent) handleStartProcessError(
 	if errors.As(startErr, &slotErr) {
 		return a.refuseStart(ctx, isvc, EventReasonModelSourceNotAllowed, slotErr.Error())
 	}
+	var secretErr *SourceSecretNotAllowedError
+	if errors.As(startErr, &secretErr) {
+		return a.refuseStart(ctx, isvc, EventReasonSourceSecretNotAllowed, secretErr.Error())
+	}
 	if errors.Is(startErr, errEngineRecordWrite) {
 		a.emitInferenceEvent(ctx, &ManagedProcess{Namespace: isvc.Namespace, Name: isvc.Name},
 			corev1.EventTypeWarning, EventReasonEngineRecordFailed, "Start failed: %v", startErr)
@@ -117,8 +124,8 @@ func (a *MetalAgent) handleStartProcessError(
 
 // checkModelPreflight runs the Model-derived pre-flight refusal checks that
 // must all happen before memory admission (checkModelPaths, then
-// checkModelCacheSlot, then checkModelDigestMemo), returning the first
-// refusal. Combined into one call from reconcileProcess, rather than
+// checkSourceSecret, then checkModelCacheSlot, then checkModelDigestMemo),
+// returning the first refusal. Combined into one call from reconcileProcess, rather than
 // sequential `if err != nil { return err }` blocks there, purely to keep that
 // function's cyclomatic complexity under the linter's threshold; see
 // handleStartProcessError's doc comment for the same reasoning applied to the
@@ -128,6 +135,9 @@ func (a *MetalAgent) checkModelPreflight(
 	runtime, pagedSSDCacheDir string,
 ) error {
 	if err := a.checkModelPaths(ctx, isvc, model, pagedSSDCacheDir); err != nil {
+		return err
+	}
+	if err := a.checkSourceSecret(ctx, isvc, model); err != nil {
 		return err
 	}
 	if err := a.checkModelCacheSlot(ctx, isvc, model, runtime); err != nil {

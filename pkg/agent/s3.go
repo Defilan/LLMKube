@@ -133,21 +133,24 @@ func isHFAuthHostForEndpoint(source, hfEndpoint string) bool {
 // both keys so the gate cannot see a token without the endpoint it was paired
 // with. Both are trimmed: an env-projected Secret routinely carries a trailing
 // newline, which would send a malformed token or close the mirror gate
-// silently. Unlike the S3 credentials neither is a hard error when absent:
-// ungated repositories are the common case and must keep working with no
-// secret at all, so a missing secret or a missing key simply yields an empty
-// value and the request goes out unauthenticated.
-func (e *MetalExecutor) resolveHFAuth(ctx context.Context, key sourceSecretKey) (token, endpoint string) {
+// silently. A Model with no sourceSecretRef, or a Secret without either key,
+// yields empty values and the request goes out unauthenticated: ungated
+// repositories are the common case. But once the Model names a Secret, a
+// Secret the agent may not read (getSourceSecret: unmarked, missing, or the
+// relay token Secret) is a *SourceSecretNotAllowedError and any other read
+// failure an error, never a silent unauthenticated download: the Model asked
+// for credentials, and a download without them could fetch something else.
+func (e *MetalExecutor) resolveHFAuth(ctx context.Context, key sourceSecretKey) (token, endpoint string, err error) {
 	if e.k8sClient == nil || key == nil {
-		return "", ""
+		return "", "", nil
 	}
-	secret := &corev1.Secret{}
-	if err := e.k8sClient.Get(ctx, *key, secret); err != nil {
-		e.logger.Debugw("sourceSecretRef unreadable; continuing unauthenticated",
-			"secret", key.Name, "namespace", key.Namespace, "err", err)
-		return "", ""
+	secret, err := e.getSourceSecret(ctx, *key)
+	if err != nil {
+		return "", "", err
 	}
-	return strings.TrimSpace(string(secret.Data["HF_TOKEN"])), strings.TrimSpace(string(secret.Data["HF_ENDPOINT"]))
+	token = strings.TrimSpace(string(secret.Data["HF_TOKEN"]))
+	endpoint = strings.TrimSpace(string(secret.Data["HF_ENDPOINT"]))
+	return token, endpoint, nil
 }
 
 // resolveS3Credentials reads the AWS_* keys out of the Model's sourceSecretRef,
@@ -170,9 +173,9 @@ func (e *MetalExecutor) resolveS3Credentials(
 			"no secret was provided to the agent", source)
 	}
 
-	secret := &corev1.Secret{}
-	if err := e.k8sClient.Get(ctx, *key, secret); err != nil {
-		return s3Credentials{}, fmt.Errorf("read sourceSecretRef %q in namespace %q: %w", key.Name, key.Namespace, err)
+	secret, err := e.getSourceSecret(ctx, *key)
+	if err != nil {
+		return s3Credentials{}, err
 	}
 
 	creds := s3Credentials{

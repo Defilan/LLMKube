@@ -104,6 +104,9 @@ type AgentConfig struct {
 
 	// AllowModelMemoryBudgetOverride: see agent.MetalAgentConfig.
 	AllowModelMemoryBudgetOverride bool
+	// AllowUnlabeledSourceSecrets is the deprecated upgrade escape hatch:
+	// see agent.MetalAgentConfig.AllowUnlabeledSourceSecrets.
+	AllowUnlabeledSourceSecrets bool
 }
 
 // splitCSV parses a comma-separated string into a trimmed []string,
@@ -656,6 +659,11 @@ func main() {
 		"Relax the extraArgs policy (unknown flags, stray tokens, refused non-listener flags, path checks, "+
 			"vllm-swift code-loading) for Macs whose InferenceService authors are fully trusted; flags that "+
 			"set or move the engine's listener or registration, or start multi-node or distributed backends, stay refused.")
+	flag.BoolVar(&cfg.AllowUnlabeledSourceSecrets, "allow-unlabeled-source-secrets", false,
+		"DEPRECATED, removed in a future release: let a Model's spec.sourceSecretRef name a Secret without the "+
+			inferencev1alpha1.LabelModelSourceCredentials+"=true label, with a SourceSecretUnlabeled Warning "+
+			"Event on each start that relies on it. Only to keep existing Models working while their Secrets are "+
+			"labeled. The relay token Secret is refused either way.")
 	showVersion := flag.Bool("version", false, "Show version information")
 	flag.Parse()
 
@@ -888,6 +896,7 @@ func main() {
 		APIServerHost:             k8sConfig.Host,
 
 		AllowModelMemoryBudgetOverride: cfg.AllowModelMemoryBudgetOverride,
+		AllowUnlabeledSourceSecrets:    cfg.AllowUnlabeledSourceSecrets,
 	}
 	if cfg.MetalNode != "" {
 		// Collected once: hardware does not change while the agent runs.

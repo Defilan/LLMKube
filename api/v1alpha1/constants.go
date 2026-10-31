@@ -70,6 +70,18 @@ const (
 	MetalRelaySecretName = "llmkube-metal-relay"
 	MetalRelaySecretKey  = "token"
 
+	// LabelModelSourceCredentials marks a Secret its owner allows a Model's
+	// spec.sourceSecretRef to name on the Metal path (value "true"). The
+	// metal-agent reads only a Secret carrying it, and never the relay token
+	// Secret (MetalRelaySecretName), labeled or not; any other Secret refuses
+	// the start with ReasonSourceSecretNotAllowed. Without the marker any
+	// Model author could point the agent at any Secret it can read. The
+	// in-cluster download Job does not check it: it reads the Secret with the
+	// controller's own credentials, in the Model's namespace.
+	//
+	//nolint:gosec // G101: label key, not a credential value
+	LabelModelSourceCredentials = "inference.llmkube.dev/model-source-credentials"
+
 	// MetalAgentServiceSuffix names the agent-written Service and
 	// EndpointSlice ("<isvc>-agent") that point at the ingress.
 	MetalAgentServiceSuffix = "-agent"
@@ -266,6 +278,13 @@ const (
 	// agent's --max-download-size cap, by its declared size or by the bytes
 	// it streamed.
 	ReasonModelDownloadTooLarge string = "ModelDownloadTooLarge"
+
+	// ReasonSourceSecretNotAllowed is set when a Model's spec.sourceSecretRef
+	// names a Secret the agent will not read: one without the
+	// LabelModelSourceCredentials marker, one that does not exist or that
+	// the agent's RBAC does not let it read, or the relay token Secret
+	// (MetalRelaySecretName).
+	ReasonSourceSecretNotAllowed string = "SourceSecretNotAllowed"
 )
 
 // ReasonModelAttestationRejected is set on a Model the attestation policy
@@ -289,6 +308,7 @@ var MetalAgentRefusalReasons = []string{
 	ReasonServiceNameTooLong,
 	ReasonModelDigestMismatch,
 	ReasonModelDownloadTooLarge,
+	ReasonSourceSecretNotAllowed,
 }
 
 // ReasonRelaySecretNotManaged is the Status.SchedulingStatus (and Warning

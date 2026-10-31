@@ -4,11 +4,17 @@
 #
 # Full pull requires a live S3-compatible endpoint (e.g. MinIO) and is
 # validated manually.
+#
+# The label lets the Metal agent read this Secret for a Metal Model; the
+# agent refuses an unlabeled sourceSecretRef with SourceSecretNotAllowed. The
+# in-cluster downloader ignores it.
 apiVersion: v1
 kind: Secret
 metadata:
   name: s3-credentials
   namespace: default
+  labels:
+    inference.llmkube.dev/model-source-credentials: "true"
 stringData:
   AWS_ACCESS_KEY_ID: "minioadmin"
   AWS_SECRET_ACCESS_KEY: "minioadmin"

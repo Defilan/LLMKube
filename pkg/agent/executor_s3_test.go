@@ -79,7 +79,7 @@ func TestEnsureModel_S3UsesSigV4(t *testing.T) {
 	// The secret the executor must resolve. The endpoint points at the test
 	// server, standing in for the MinIO endpoint.
 	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "minio-models", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "minio-models", Namespace: "default", Labels: modelSourceCredentialsLabels()},
 		Data: map[string][]byte{
 			"AWS_ACCESS_KEY_ID":     []byte("AKIAEXAMPLE0000000"),
 			"AWS_SECRET_ACCESS_KEY": []byte("secretaccesskeyvalue0000000000000"),
@@ -166,7 +166,7 @@ func TestEnsureModel_S3SHA256MatchWritesStamp(t *testing.T) {
 		t.Fatalf("add corev1 scheme: %v", err)
 	}
 	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "minio-models", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "minio-models", Namespace: "default", Labels: modelSourceCredentialsLabels()},
 		Data: map[string][]byte{
 			"AWS_ACCESS_KEY_ID":     []byte("AKIAEXAMPLE0000000"),
 			"AWS_SECRET_ACCESS_KEY": []byte("secretaccesskeyvalue0000000000000"),
@@ -208,7 +208,7 @@ func TestEnsureModel_S3SHA256MismatchDeletesFile(t *testing.T) {
 		t.Fatalf("add corev1 scheme: %v", err)
 	}
 	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "minio-models", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "minio-models", Namespace: "default", Labels: modelSourceCredentialsLabels()},
 		Data: map[string][]byte{
 			"AWS_ACCESS_KEY_ID":     []byte("AKIAEXAMPLE0000000"),
 			"AWS_SECRET_ACCESS_KEY": []byte("secretaccesskeyvalue0000000000000"),
@@ -274,7 +274,7 @@ func TestEnsureModel_S3IncompleteSecretFails(t *testing.T) {
 		t.Fatalf("add corev1 scheme: %v", err)
 	}
 	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "partial-creds", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "partial-creds", Namespace: "default", Labels: modelSourceCredentialsLabels()},
 		Data: map[string][]byte{
 			// Access key present, secret key missing.
 			"AWS_ACCESS_KEY_ID": []byte("AKIAEXAMPLE0000000"),
@@ -438,7 +438,7 @@ func ensureS3ModelVia(t *testing.T, endpoint string) (string, error) {
 		t.Fatalf("add corev1 scheme: %v", err)
 	}
 	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "minio-models", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "minio-models", Namespace: "default", Labels: modelSourceCredentialsLabels()},
 		Data: map[string][]byte{
 			"AWS_ACCESS_KEY_ID":     []byte("AKIAEXAMPLE0000000"),
 			"AWS_SECRET_ACCESS_KEY": []byte("secretaccesskeyvalue0000000000000"),
