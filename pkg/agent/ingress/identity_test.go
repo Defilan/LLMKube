@@ -202,15 +202,89 @@ func TestLoadOrCreateIdentityCorruptPEMErrors(t *testing.T) {
 	}
 }
 
-func TestLoadOrCreateIdentityPartialStateErrors(t *testing.T) {
+// TestLoadOrCreateIdentityRebuildsMissingCert: with the key but no
+// certificate, the agent issues a new one for the same key (same pin), so an
+// operator can delete ingress-cert.pem to get a fresh certificate. A
+// certificate without its key is still refused: a new key would change the
+// pin.
+func TestLoadOrCreateIdentityRebuildsMissingCert(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := LoadOrCreateIdentity(dir); err != nil {
+	id, err := LoadOrCreateIdentity(dir)
+	if err != nil {
 		t.Fatalf("create: %v", err)
+	}
+	if _, err := id.BindMetalNode("6f1c2e3d-4a5b-4c6d-8e7f-90a1b2c3d4e5"); err != nil {
+		t.Fatal(err)
 	}
 	if err := os.Remove(filepath.Join(dir, certFileName)); err != nil {
 		t.Fatal(err)
 	}
+	rebuilt, err := LoadOrCreateIdentity(dir)
+	if err != nil {
+		t.Fatalf("load with the key but no certificate: %v", err)
+	}
+	if rebuilt.Pin() != id.Pin() {
+		t.Errorf("pin after rebuilding the certificate = %q, want the key's %q", rebuilt.Pin(), id.Pin())
+	}
+	if names := rebuilt.Certificate().Leaf.DNSNames; len(names) != 0 {
+		t.Errorf("rebuilt certificate names %v; it names a MetalNode only once bound again", names)
+	}
+	st, err := os.Stat(filepath.Join(dir, certFileName))
+	if err != nil {
+		t.Fatalf("the rebuilt certificate was not saved: %v", err)
+	}
+	if got := st.Mode().Perm(); got != 0o600 {
+		t.Errorf("rebuilt certificate mode = %o, want 0600", got)
+	}
+
+	if err := os.Remove(filepath.Join(dir, keyFileName)); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := LoadOrCreateIdentity(dir); err == nil {
-		t.Fatal("expected error when key exists but cert is missing")
+		t.Fatal("expected error when the certificate exists but the key is missing")
+	}
+	if _, err := os.Stat(filepath.Join(dir, keyFileName)); err == nil {
+		t.Error("a missing key was regenerated; the pin would change")
+	}
+}
+
+// TestBindMetalNodeReissuesOutsideValidity: a certificate issued while the
+// Mac's clock ran fast is not yet valid once the clock is right, and the
+// verifier would refuse it for good. Binding again re-issues it, same key and
+// name, once it is not valid now on the Mac's clock; one still valid is left
+// alone.
+func TestBindMetalNodeReissuesOutsideValidity(t *testing.T) {
+	id, err := LoadOrCreateIdentity(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const uid = "6f1c2e3d-4a5b-4c6d-8e7f-90a1b2c3d4e5"
+	real := time.Now()
+	id.setClock(func() time.Time { return real.Add(72 * time.Hour) })
+	if _, err := id.BindMetalNode(uid); err != nil {
+		t.Fatal(err)
+	}
+	if nb := id.Certificate().Leaf.NotBefore; !nb.After(real) {
+		t.Fatalf("NotBefore %s with the clock 3 days fast, want it in the real future", nb)
+	}
+
+	id.setClock(func() time.Time { return real })
+	reissued, err := id.BindMetalNode(uid)
+	if err != nil || !reissued {
+		t.Fatalf("binding with the clock fixed = %t, %v; want a re-issue of the not-yet-valid certificate", reissued, err)
+	}
+	leaf := id.Certificate().Leaf
+	if leaf.NotBefore.After(real) || !slices.Equal(leaf.DNSNames, []string{uid + ".metal-node.llmkube.invalid"}) ||
+		relay.PinFromCert(leaf) != id.Pin() {
+		t.Errorf("re-issued certificate: NotBefore %s names %v pin %q; want valid now, the same name and pin",
+			leaf.NotBefore, leaf.DNSNames, relay.PinFromCert(leaf))
+	}
+
+	if reissued, err := id.BindMetalNode(uid); err != nil || reissued {
+		t.Errorf("binding again with a valid certificate = %t, %v; want no re-issue", reissued, err)
+	}
+	id.setClock(func() time.Time { return leaf.NotAfter.Add(time.Hour) })
+	if reissued, err := id.BindMetalNode(uid); err != nil || !reissued {
+		t.Errorf("binding after NotAfter = %t, %v; want a re-issue", reissued, err)
 	}
 }

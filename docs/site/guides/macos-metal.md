@@ -645,7 +645,12 @@ MetalNode's namespace, owned by the MetalNode, placed by
   is not Reachable.
 - The certificate is checked for its validity period on the verifier
   node's clock. The agent backdates it by a day, so only a node clock
-  more than a day behind the Mac's fails a freshly re-issued one.
+  more than a day behind the Mac's fails a freshly re-issued one. The
+  agent also re-issues it (same key) whenever it is not valid on the
+  Mac's own clock, so one issued while that clock ran fast is replaced
+  within 5 minutes of the clock being fixed. Deleting
+  `ingress-cert.pem` (keeping `ingress-key.pem`) makes the agent issue
+  a fresh one at its next start, with the same pin.
 - Per-candidate results are `Reachable`, `Timeout`, `Refused`,
   `PinMismatch`, `CertificateMismatch`, `NotAllowed` or `Error`. The
   first `Reachable` address in order becomes `status.hostIP`, which is

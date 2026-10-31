@@ -16,7 +16,10 @@ limitations under the License.
 
 package ingress
 
-import "net"
+import (
+	"net"
+	"time"
+)
 
 // listenAddr returns the address Start bound, for tests that start the
 // server on port 0. Test-only: production code logs the address instead.
@@ -25,3 +28,6 @@ func (s *Server) listenAddr() net.Addr {
 	defer s.mu.Unlock()
 	return s.addr
 }
+
+// setClock replaces the identity's clock, for tests of a wrong Mac clock.
+func (id *Identity) setClock(now func() time.Time) { id.now = now }

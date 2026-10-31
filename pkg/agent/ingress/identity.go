@@ -67,6 +67,7 @@ type Identity struct {
 	dir string
 	key crypto.Signer
 	pin string
+	now func() time.Time // the Mac's clock; time.Now outside tests
 
 	mu   sync.Mutex // serializes BindMetalNode
 	cert atomic.Pointer[tls.Certificate]
@@ -79,10 +80,13 @@ type Identity struct {
 // dir is created with mode 0700 when missing. When both ingress-key.pem and
 // ingress-cert.pem exist they are loaded; the key file must not be readable
 // or writable by group or other. When neither exists a fresh ECDSA P-256
-// self-signed identity is generated and written with mode 0600. Any other
-// state (only one file present, unreadable or corrupt PEM, key/cert mismatch)
-// is an error: regenerating silently would change the pin that the operator
-// has recorded and break every relay pinned to this agent.
+// self-signed identity is generated and written with mode 0600. When only the
+// key exists, a certificate is issued for it again: the pin is the key's, so
+// nothing pinned to the agent changes, and deleting ingress-cert.pem is how
+// an operator gets a fresh certificate. Any other state (a certificate
+// without its key, unreadable or corrupt PEM, key/cert mismatch) is an error:
+// regenerating the key silently would change the pin that the operator has
+// recorded and break every relay pinned to this agent.
 func LoadOrCreateIdentity(dir string) (*Identity, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create ingress identity dir %s: %w", dir, err)
@@ -105,6 +109,10 @@ func LoadOrCreateIdentity(dir string) (*Identity, error) {
 		if err := generateIdentity(keyPath, certPath); err != nil {
 			return nil, err
 		}
+	case keyExists:
+		if err := reissueFromKey(keyPath, certPath); err != nil {
+			return nil, err
+		}
 	default:
 		return nil, fmt.Errorf(
 			"ingress identity in %s is incomplete (key present: %t, cert present: %t); "+
@@ -118,7 +126,7 @@ func LoadOrCreateIdentity(dir string) (*Identity, error) {
 	if !ok {
 		return nil, fmt.Errorf("ingress key %s cannot sign", keyPath)
 	}
-	id := &Identity{dir: dir, key: key, pin: spkiPin(cert.Leaf)}
+	id := &Identity{dir: dir, key: key, pin: spkiPin(cert.Leaf), now: time.Now}
 	id.cert.Store(&cert)
 	return id, nil
 }
@@ -137,10 +145,15 @@ func (id *Identity) GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate, erro
 // BindMetalNode makes the ingress certificate name the MetalNode with UID
 // uid (metalnode.IngressHostname), and nothing else, which is what the
 // controller's dial-back requires besides the pin. A certificate that already
-// does is left alone. Otherwise a new certificate is issued for the same key,
-// so the pin the relay and the EndpointSlices carry does not change; it
-// replaces ingress-cert.pem and is served to new connections. It reports
-// whether it re-issued. On error the current certificate stays in use.
+// does, and is valid now on the Mac's clock, is left alone. Otherwise a new
+// certificate is issued for the same key, so the pin the relay and the
+// EndpointSlices carry does not change; it replaces ingress-cert.pem and is
+// served to new connections. It reports whether it re-issued. On error the
+// current certificate stays in use.
+//
+// The validity check matters because the verifier checks the certificate's
+// dates: one issued while the Mac's clock ran more than identityBackdate fast
+// is not yet valid for the cluster, and is replaced once the clock is right.
 func (id *Identity) BindMetalNode(uid string) (bool, error) {
 	if errs := validation.IsDNS1123Label(uid); len(errs) > 0 {
 		return false, fmt.Errorf("MetalNode UID %q cannot name the ingress certificate: %s", uid, strings.Join(errs, "; "))
@@ -148,10 +161,12 @@ func (id *Identity) BindMetalNode(uid string) (bool, error) {
 	name := metalnode.IngressHostname(uid)
 	id.mu.Lock()
 	defer id.mu.Unlock()
-	if slices.Equal(id.cert.Load().Leaf.DNSNames, []string{name}) {
+	now := id.now()
+	if leaf := id.cert.Load().Leaf; slices.Equal(leaf.DNSNames, []string{name}) &&
+		!now.Before(leaf.NotBefore) && !now.After(leaf.NotAfter) {
 		return false, nil
 	}
-	der, err := IssueCertificate(id.key, time.Now(), name)
+	der, err := IssueCertificate(id.key, now, name)
 	if err != nil {
 		return false, err
 	}
@@ -179,18 +194,54 @@ func fileExists(p string) (bool, error) {
 	}
 }
 
-func loadIdentity(keyPath, certPath string) (tls.Certificate, error) {
+// readKeyFile reads the key file, refusing one readable or writable by group
+// or other.
+func readKeyFile(keyPath string) ([]byte, error) {
 	st, err := os.Stat(keyPath)
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("stat %s: %w", keyPath, err)
+		return nil, fmt.Errorf("stat %s: %w", keyPath, err)
 	}
 	if perm := st.Mode().Perm(); perm&0o077 != 0 {
-		return tls.Certificate{}, fmt.Errorf(
+		return nil, fmt.Errorf(
 			"ingress key %s has mode %04o; it must be 0600 (no group or other access)", keyPath, perm)
 	}
 	keyPEM, err := os.ReadFile(keyPath)
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("read %s: %w", keyPath, err)
+		return nil, fmt.Errorf("read %s: %w", keyPath, err)
+	}
+	return keyPEM, nil
+}
+
+// reissueFromKey writes a certificate, naming nothing yet, for the key in
+// keyPath. The agent binds it to its MetalNode once it reads the UID.
+func reissueFromKey(keyPath, certPath string) error {
+	keyPEM, err := readKeyFile(keyPath)
+	if err != nil {
+		return err
+	}
+	block, _ := pem.Decode(keyPEM)
+	if block == nil || block.Type != "PRIVATE KEY" {
+		return fmt.Errorf("ingress key %s is not a PEM PRIVATE KEY", keyPath)
+	}
+	parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("parse ingress key %s: %w", keyPath, err)
+	}
+	key, ok := parsed.(crypto.Signer)
+	if !ok {
+		return fmt.Errorf("ingress key %s cannot sign", keyPath)
+	}
+	der, err := IssueCertificate(key, time.Now())
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+}
+
+func loadIdentity(keyPath, certPath string) (tls.Certificate, error) {
+	keyPEM, err := readKeyFile(keyPath)
+	if err != nil {
+		return tls.Certificate{}, err
 	}
 	certPEM, err := os.ReadFile(certPath)
 	if err != nil {
