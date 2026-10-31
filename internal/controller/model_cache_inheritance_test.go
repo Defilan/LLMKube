@@ -47,6 +47,30 @@ var _ = Describe("Model.spec.modelCache inheritance (#2142)", func() {
 		ns = nsObj.Name
 	})
 
+	// The suite shares one control plane, and the federation specs count Models
+	// and InferenceServices cluster-wide, so this suite removes its own before
+	// the next spec runs. The namespace itself is left to the suite, because a
+	// Deployment it holds can keep the namespace terminating.
+	AfterEach(func() {
+		for _, obj := range []client.Object{
+			&inferencev1alpha1.InferenceService{},
+			&inferencev1alpha1.Model{},
+		} {
+			Expect(client.IgnoreNotFound(k8sClient.DeleteAllOf(ctx, obj, client.InNamespace(ns)))).To(Succeed())
+		}
+		Eventually(func() int {
+			svcs := &inferencev1alpha1.InferenceServiceList{}
+			if err := k8sClient.List(ctx, svcs, client.InNamespace(ns)); err != nil {
+				return -1
+			}
+			models := &inferencev1alpha1.ModelList{}
+			if err := k8sClient.List(ctx, models, client.InNamespace(ns)); err != nil {
+				return -1
+			}
+			return len(svcs.Items) + len(models.Items)
+		}, "10s", "100ms").Should(BeZero(), "a later spec counts Models and InferenceServices cluster-wide")
+	})
+
 	createCachePVC := func(name string) {
 		pvc := &corev1.PersistentVolumeClaim{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
