@@ -148,8 +148,9 @@ func runRealVerifier(t *testing.T, mn *inferencev1alpha1.MetalNode, pin, cert st
 }
 
 // TestMetalNodeVerifierWithRealCurl runs the verifier pod's exact command
-// line with real curl (OpenSSL in the operator's curl image) against the
-// agent's real ingress, serving certificates from the agent's identity code.
+// line with the host's curl (the operator's image ships curl on OpenSSL; the
+// same cases pass with macOS curl on LibreSSL) against the agent's real
+// ingress, serving certificates from the agent's identity code.
 // Only the agent bound to this MetalNode passes; a server the agent can name
 // by address and key, but whose certificate does not name the MetalNode, does
 // not, and neither does an agent whose certificate does not name it.
@@ -189,6 +190,39 @@ func TestMetalNodeVerifierWithRealCurl(t *testing.T) {
 			t.Errorf("result = %s, want CertificateMismatch", got)
 		}
 	})
+
+	// What an attacker can actually report: a certificate carrying the other
+	// server's public key and this MetalNode's name, signed by a key the
+	// attacker holds (the Mac's own, say). The controller refuses it before
+	// dialing (not signed by its own key); dialed anyway, the server still
+	// presents its own certificate. With the server's issuer as the subject,
+	// OpenSSL tries it as that issuer and fails the name (exit 60), LibreSSL
+	// fails the handshake (exit 35): either way not Reachable.
+	for name, subject := range map[string]string{"agent subject": "llmkube-metal-agent", "server's issuer as subject": "kube-apiserver"} {
+		t.Run("another server's key signed by the attacker, "+name, func(t *testing.T) {
+			attacker, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tmpl := &x509.Certificate{
+				SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: subject},
+				NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+				KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+				BasicConstraintsValid: true, DNSNames: []string{metalnode.IngressHostname(string(mn.UID))},
+			}
+			der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, apiKey.Public(), attacker)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cert := base64.StdEncoding.EncodeToString(der)
+			if err := checkIngressClaims(metalnode.Report{IngressSPKI: apiPin, IngressPort: int32(apiPort), IngressCert: cert}); err == nil { //nolint:gosec // G115: a listener port
+				t.Error("the controller accepted a report certificate its own key did not sign")
+			}
+			if got := runRealVerifier(t, mn, apiPin, cert, apiPort, "127.0.0.1"); got == inferencev1alpha1.CandidateReachable {
+				t.Error("result = Reachable for another server's address and key")
+			}
+		})
+	}
 
 	// A certificate that does not name this MetalNode never passes, even when
 	// it is exactly what the server presents and the pin matches: an older

@@ -57,7 +57,8 @@ const (
 
 	// metalNodeVerifierWorkDir is the verifier's only writable directory
 	// (an emptyDir; the root filesystem is read-only). The script writes the
-	// agent's certificate there for curl --cacert.
+	// agent's certificate there for curl --cacert, beside an empty directory
+	// for --capath.
 	metalNodeVerifierWorkDir    = "/verify"
 	metalNodeVerifierWorkVolume = "verify"
 )
@@ -70,13 +71,18 @@ const (
 //
 // A probe passes only against this Mac's ingress. curl trusts nothing but
 // the certificate the agent reported (--cacert, which OpenSSL accepts as its
-// own trust anchor), checks the hostname, which --resolve sends to the
+// own trust anchor; --capath names an empty directory, so a CA directory
+// compiled into the image's curl adds no anchors), checks the hostname,
+// which --resolve sends to the
 // candidate address, against the certificate (the name is
 // metalnode.IngressHostname of the MetalNode's UID), and checks the server's
 // key against the pin. A server that is not this Mac's ingress (the API
 // server, say, whose address and key the agent can report) presents a
 // certificate that does not name the MetalNode: curl exits 60. -k would skip
-// both certificate checks, which let such a server pass on the pin alone.
+// both certificate checks, which let such a server pass on the pin alone. A
+// server that self-signs a certificate for whatever name it is asked, with
+// one stable key, would still pass; closing that needs a challenge the
+// ingress answers with its key.
 //
 // -q (first) ignores any .curlrc in the image and --noproxy '*' keeps a
 // cluster-wide proxy setting from testing the proxy path instead of the
@@ -90,11 +96,13 @@ const (
 // Response bodies go to /dev/null and curl's stderr stays in the pod log;
 // neither reaches the MetalNode.
 const metalNodeVerifierScript = `pin="$1"; port="$2"; name="$3"; cert="$4"; shift 4
+w=` + metalNodeVerifierWorkDir + `
 : > /dev/termination-log
-printf '%s\n' "$cert" > /verify/ingress.pem
+mkdir -p "$w/capath"
+printf '%s\n' "$cert" > "$w/ingress.pem"
 for a in "$@"; do
   case "$a" in *:*) h="[$a]" ;; *) h="$a" ;; esac
-  curl -q -sS --noproxy '*' -o /dev/null --max-time 3 --connect-timeout 3 --cacert /verify/ingress.pem --resolve "$name:$port:$h" --pinnedpubkey "sha256//$pin" "https://$name:$port/health"
+  curl -q -sS --noproxy '*' -o /dev/null --max-time 3 --connect-timeout 3 --cacert "$w/ingress.pem" --capath "$w/capath" --resolve "$name:$port:$h" --pinnedpubkey "sha256//$pin" "https://$name:$port/health"
   rc=$?
   printf '%s %s\n' "$a" "$rc" >> /dev/termination-log
 done

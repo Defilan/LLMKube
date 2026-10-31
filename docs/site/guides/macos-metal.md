@@ -625,8 +625,10 @@ MetalNode's namespace, owned by the MetalNode, placed by
 - For each candidate it runs curl against
   `https://<uid>.metal-node.llmkube.invalid:<ingressPort>/health`,
   with `--resolve` sending that name to the candidate address,
-  `--cacert` set to the certificate the agent reported (its only
-  trust anchor) and `--pinnedpubkey sha256//<pin>`, ignoring any
+  `--cacert` set to the certificate the agent reported, `--capath` set
+  to an empty directory (so that certificate is the only trust anchor,
+  even with a curl built with a CA directory) and
+  `--pinnedpubkey sha256//<pin>`, ignoring any
   `.curlrc` and any proxy settings, so it tests the direct path. The
   ingress answers 400 to a request without its relay headers, which is
   enough: curl completes the handshake only with a server whose
@@ -651,6 +653,17 @@ MetalNode's namespace, owned by the MetalNode, placed by
   within 5 minutes of the clock being fixed. Deleting
   `ingress-cert.pem` (keeping `ingress-key.pem`) makes the agent issue
   a fresh one at its next start, with the same pin.
+- The image's curl must be 7.57 or later and accept a self-signed
+  certificate as its own trust anchor (OpenSSL and LibreSSL do; see the
+  [air-gapped guide](./air-gapped) for a custom image). Any other curl
+  fails closed: `Reachable` stays False.
+- What the check does not cover: a server that answers any requested
+  name with a certificate it self-signs on the spot with one stable
+  key (some TLS-intercepting proxies and development servers do) would
+  pass. The agent could ask that server for the MetalNode's name and
+  report the certificate it gets back, with its key. A challenge the
+  ingress has to answer with its key would close this; the check does
+  not have one yet.
 - Per-candidate results are `Reachable`, `Timeout`, `Refused`,
   `PinMismatch`, `CertificateMismatch`, `NotAllowed` or `Error`. The
   first `Reachable` address in order becomes `status.hostIP`, which is

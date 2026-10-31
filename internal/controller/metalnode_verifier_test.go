@@ -290,7 +290,8 @@ func TestBuildMetalNodeVerifierPod(t *testing.T) {
 	}
 	// -q first (no .curlrc), and no proxy: the check must test the direct path.
 	for _, want := range []string{"curl -q ", `--noproxy '*'`, `--pinnedpubkey "sha256//$pin"`, "--max-time 3", "--connect-timeout 3", "-o /dev/null",
-		"/dev/termination-log", "/health", "--cacert /verify/ingress.pem", `--resolve "$name:$port:$h"`, `"https://$name:$port/health"`} {
+		"/dev/termination-log", "/health", "w=/verify\n", `--cacert "$w/ingress.pem"`, `--capath "$w/capath"`,
+		`--resolve "$name:$port:$h"`, `"https://$name:$port/health"`} {
 		if !strings.Contains(metalNodeVerifierScript, want) {
 			t.Errorf("verifier script lacks %q", want)
 		}
@@ -387,7 +388,11 @@ func execVerifierScript(t *testing.T, pathPrefix, script string, args []string) 
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "termination-log")
 	script = strings.ReplaceAll(script, "/dev/termination-log", logPath)
-	script = strings.ReplaceAll(script, metalNodeVerifierWorkDir+"/", dir+"/")
+	workLine := "\nw=" + metalNodeVerifierWorkDir + "\n"
+	if !strings.Contains(script, workLine) {
+		t.Fatalf("verifier script does not set its work directory with %q", workLine)
+	}
+	script = strings.ReplaceAll(script, workLine, "\nw="+dir+"\n")
 	cmd := exec.Command("sh", append([]string{"-c", script}, args...)...)
 	cmd.Env = os.Environ()
 	if pathPrefix != "" {
