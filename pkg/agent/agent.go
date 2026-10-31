@@ -1243,7 +1243,7 @@ func (a *MetalAgent) fetchModelThenStopStale(
 ) (*inferencev1alpha1.Model, error) {
 	model, modelErr := a.fetchModelForReconcile(ctx, isvc)
 	if modelErr != nil && !apierrors.IsNotFound(modelErr) {
-		return nil, modelErr
+		return nil, a.retryIfTransient(isvc, modelErr)
 	}
 	if existing != nil {
 		a.logger.Infow("spec changed; restarting process to pick up new flags",
@@ -1364,7 +1364,7 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 		if errors.As(err, &conflict) {
 			return a.refuseStart(ctx, isvc, EventReasonEndpointNameConflict, conflict.Error())
 		}
-		return fmt.Errorf("failed to check endpoint name: %w", err)
+		return a.retryIfTransient(isvc, fmt.Errorf("failed to check endpoint name: %w", err))
 	}
 
 	// Refuse a Model the controller marked Failed, any local model source or
@@ -2584,7 +2584,7 @@ func (a *MetalAgent) estimateModelMemory(
 		err := fmt.Errorf("cannot determine model size: %s", strings.Join(reasons, "; "))
 		// The probe was the only input still missing, so a probe that may
 		// succeed next time makes the whole estimate retryable.
-		if isTransientProbeError(probeErr) {
+		if isTransientError(probeErr) {
 			return MemoryEstimate{}, &transientSizeProbeError{err: err}
 		}
 		return MemoryEstimate{}, err

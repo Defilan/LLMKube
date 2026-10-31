@@ -361,7 +361,7 @@ func TestCheckMemoryAdmission_WarnModeProceedsOnTransientProbeFailure(t *testing
 	}
 }
 
-// isTransientProbeError against errors the real producers return wherever a
+// isTransientError against errors the real producers return wherever a
 // test can provoke them: remoteModelSize through the guarded client, and the
 // API server error a sourceSecretRef read sees.
 func TestIsTransientProbeError(t *testing.T) {
@@ -467,6 +467,9 @@ func TestIsTransientProbeError(t *testing.T) {
 		{"API server unavailable reading the Secret", func(*testing.T) error {
 			return fmt.Errorf("read sourceSecretRef: %w", apierrors.NewServiceUnavailable("etcd leader changed"))
 		}, true},
+		{"API server unreachable reading the Secret", func(*testing.T) error {
+			return &sourceSecretReadError{Namespace: "default", Name: "creds", Err: errors.New("http2: client connection lost")}
+		}, true},
 		{"Secret not found", func(*testing.T) error {
 			return apierrors.NewNotFound(schema.GroupResource{Resource: "secrets"}, "creds")
 		}, false},
@@ -478,8 +481,8 @@ func TestIsTransientProbeError(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			err := tc.err(t)
-			if got := isTransientProbeError(err); got != tc.want {
-				t.Errorf("isTransientProbeError(%v) = %v, want %v", err, got, tc.want)
+			if got := isTransientError(err); got != tc.want {
+				t.Errorf("isTransientError(%v) = %v, want %v", err, got, tc.want)
 			}
 		})
 	}

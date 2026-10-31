@@ -67,6 +67,23 @@ func (e *SourceSecretNotAllowedError) Error() string {
 	return fmt.Sprintf("spec.sourceSecretRef names Secret %q in namespace %q: %s", e.Name, e.Namespace, e.Why)
 }
 
+// sourceSecretReadError is a sourceSecretRef read that failed for a reason
+// other than a refusal (a timeout, a 5xx, throttling, an unreachable API
+// server). readSourceSecret returns it so a start that hit it, in the
+// pre-flight check, the memory check's s3 size probe or the download, is
+// retried on the next poll instead of refused.
+type sourceSecretReadError struct {
+	Namespace string
+	Name      string
+	Err       error
+}
+
+func (e *sourceSecretReadError) Error() string {
+	return fmt.Sprintf("read sourceSecretRef %q in namespace %q: %v", e.Name, e.Namespace, e.Err)
+}
+
+func (e *sourceSecretReadError) Unwrap() error { return e.Err }
+
 // labelCommand is the exact command that marks key's Secret, quoted in the
 // refusal message so the operator does not have to look the label up.
 func labelCommand(key types.NamespacedName) string {
@@ -135,7 +152,7 @@ func readSourceSecret(
 				Why: "the agent's RBAC does not allow reading it; if the agent's secrets get rule is pinned to " +
 					"named Secrets (metalAgent.rbac.secretNames, or resourceNames in metal-agent-rbac.yaml), add it there"}
 		}
-		return false, fmt.Errorf("read sourceSecretRef %q in namespace %q: %w", key.Name, key.Namespace, err)
+		return false, &sourceSecretReadError{Namespace: key.Namespace, Name: key.Name, Err: err}
 	}
 	return checkSourceSecretLabels(key, obj.GetLabels(), allowUnlabeled)
 }
@@ -173,7 +190,8 @@ func WithAllowUnlabeledSourceSecrets(allow bool) Option {
 // is read. It runs before admission because admission's s3 size probe reads
 // the Secret and admission's success path clears SchedulingStatus, which
 // would flap a refusal placed after it. A transient read error is returned
-// without a refusal, so the next reconcile retries it.
+// without a refusal, and the InferenceService is queued for the next poll,
+// which retries it: with no status write nothing else would deliver it again.
 //
 // With --allow-unlabeled-source-secrets an unmarked Secret is allowed, and
 // every start that relies on it is logged at Warn and gets a
@@ -194,7 +212,7 @@ func (a *MetalAgent) checkSourceSecret(
 	case errors.As(err, &notAllowed):
 		return a.refuseStart(ctx, isvc, EventReasonSourceSecretNotAllowed, notAllowed.Error())
 	case err != nil:
-		return err
+		return a.retryIfTransient(isvc, err)
 	case unlabeled:
 		msg := fmt.Sprintf("spec.sourceSecretRef names Secret %q in namespace %q, which is not marked for "+
 			"model-source credentials; it is read only because %s is set, which is deprecated and will be removed. "+

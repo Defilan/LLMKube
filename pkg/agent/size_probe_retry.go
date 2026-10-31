@@ -59,7 +59,7 @@ const sizeProbeRetryWindow = 3 * time.Minute
 
 // transientSizeProbeError wraps the "cannot determine model size" error of an
 // estimate whose only missing input is a remote size probe that failed for a
-// reason that may clear on its own (isTransientProbeError).
+// reason that may clear on its own (isTransientError).
 type transientSizeProbeError struct {
 	err error
 }
@@ -82,15 +82,15 @@ var transientErrnos = []syscall.Errno{
 	syscall.EPIPE,
 }
 
-// isTransientProbeError reports whether a size probe error may clear on its
-// own. It is an allowlist: only the causes named here are retried, and every
-// other error (a 401, 403 or 404, any other 4xx, a response without a usable
-// size, an invalid URL or endpoint, a host the SSRF guard or
-// --allowed-download-hosts refuses, a TLS verification failure, a host that
-// does not exist, a refused or incomplete sourceSecretRef Secret) stays a
-// refusal, because retrying it would only hide a configuration the operator
-// has to fix.
-func isTransientProbeError(err error) bool {
+// isTransientError reports whether an error from a remote size probe or from
+// an API call in the start path may clear on its own. It is an allowlist:
+// only the causes named here are retried, and every other error (a 401, 403
+// or 404, any other 4xx, a response without a usable size, an invalid URL or
+// endpoint, a host the SSRF guard or --allowed-download-hosts refuses, a TLS
+// verification failure, a host that does not exist, a refused or incomplete
+// sourceSecretRef Secret) stays a refusal, because retrying it would only
+// hide a configuration the operator has to fix.
+func isTransientError(err error) bool {
 	if err == nil {
 		return false
 	}
@@ -121,8 +121,13 @@ func isTransientProbeError(err error) bool {
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}
-	// The s3 probe reads its sourceSecretRef Secret first: an API server
-	// that is briefly unavailable is retried, as checkSourceSecret does.
+	// A sourceSecretRef read that was not refused (the s3 probe reads the
+	// Secret first) is retried, as checkSourceSecret retries it.
+	var readErr *sourceSecretReadError
+	if errors.As(err, &readErr) {
+		return true
+	}
+	// An API server that is briefly unavailable.
 	return apierrors.IsServerTimeout(err) || apierrors.IsTimeout(err) || apierrors.IsTooManyRequests(err) ||
 		apierrors.IsServiceUnavailable(err) || apierrors.IsInternalError(err) || apierrors.IsUnexpectedServerError(err)
 }
@@ -203,6 +208,17 @@ func (a *MetalAgent) failModelEstimate(
 		"refuseAfter", sizeProbeRetryWindow.String())
 	a.requeue(key)
 	return fmt.Errorf("memory admission deferred until the model size is known: %s", reason)
+}
+
+// retryIfTransient queues isvc for the next poll when err may clear on its own
+// (isTransientError) and returns err unchanged. It is for a start that fails
+// before anything is written to the InferenceService or started, so a retry
+// costs only the API reads that failed.
+func (a *MetalAgent) retryIfTransient(isvc *inferencev1alpha1.InferenceService, err error) error {
+	if isTransientError(err) {
+		a.requeue(types.NamespacedName{Namespace: isvc.Namespace, Name: isvc.Name}.String())
+	}
+	return err
 }
 
 // requeue asks the watcher to deliver key again on its next poll even though
