@@ -168,6 +168,9 @@ var metalAgentPerMacCalls = []rbacCall{
 	// with --metal-node set.
 	{"get own MetalNode Lease", "coordination.k8s.io", "leases", "get"},
 	{"update own MetalNode Lease", "coordination.k8s.io", "leases", "update"},
+	// metalnode_reporter.go bindIngress: Get of its own MetalNode for the UID
+	// its ingress certificate must name, only with --metal-node set.
+	{"get own MetalNode", "inference.llmkube.dev", "metalnodes", "get"},
 	// tokenrenew.go renew: TokenRequest for its own ServiceAccount, only
 	// with --renew-service-account-token set.
 	{"renew own ServiceAccount token", "", "serviceaccounts/token", "create"},

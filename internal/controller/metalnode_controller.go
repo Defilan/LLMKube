@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"net/netip"
 	"slices"
@@ -281,9 +283,15 @@ func advanceHeartbeat(st *inferencev1alpha1.MetalNodeStatus, renewed time.Time, 
 
 // checkIngressClaims applies the relay's own pin rule, so the dial-back
 // never pins a key the relay would refuse. The port floor is enforced by
-// metalnode.Decode.
+// metalnode.Decode. An ingress certificate must be a certificate for the
+// pinned key, signed by that key: the agent's key put the MetalNode's name
+// in it, which a report pairing another server's key with the name cannot
+// show. Which MetalNode it names is the dial-back's to check.
 func checkIngressClaims(report metalnode.Report) error {
 	if report.IngressSPKI == "" {
+		if report.IngressCert != "" {
+			return fmt.Errorf("ingressCert is set but ingressSPKI is not")
+		}
 		return nil
 	}
 	if !validIngressPin(report.IngressSPKI) {
@@ -291,6 +299,19 @@ func checkIngressClaims(report metalnode.Report) error {
 	}
 	if report.IngressPort == 0 {
 		return fmt.Errorf("ingressSPKI is set but ingressPort is not")
+	}
+	if report.IngressCert == "" {
+		return nil
+	}
+	cert, err := parseIngressCert(report.IngressCert)
+	if err != nil {
+		return fmt.Errorf("ingressCert is not a DER certificate")
+	}
+	if sum := sha256.Sum256(cert.RawSubjectPublicKeyInfo); base64.StdEncoding.EncodeToString(sum[:]) != report.IngressSPKI {
+		return fmt.Errorf("ingressCert is not for the key ingressSPKI pins")
+	}
+	if err := cert.CheckSignature(cert.SignatureAlgorithm, cert.RawTBSCertificate, cert.Signature); err != nil {
+		return fmt.Errorf("ingressCert is not signed by its own key")
 	}
 	return nil
 }
@@ -354,7 +375,8 @@ func (r *MetalNodeReconciler) reconcileDialBack(ctx context.Context, mn *inferen
 	var hash string
 	if report != nil {
 		desired := metalNodeDesiredCandidates(hostIP, *report, r.AllowedCIDRs)
-		hash = metalNodeInputHash(report.IngressSPKI, report.IngressPort, dialableAddresses(desired), mn.Spec.Verifier)
+		hash = metalNodeInputHash(report.IngressSPKI, report.IngressCert, report.IngressPort,
+			dialableAddresses(desired), mn.Spec.Verifier)
 		keep := st.Verification != nil && st.Verification.InputHash == hash
 		st.Candidates = mergeCandidates(st.Candidates, desired, keep)
 		if !keep && verifiedResultStale(st, report, prevPin, prevPort) {
@@ -385,6 +407,16 @@ func (r *MetalNodeReconciler) reconcileDialBack(ctx context.Context, mn *inferen
 		r.setReachable(mn, metav1.ConditionFalse, inferencev1alpha1.MetalNodeReasonPinMissing,
 			"the agent reports no ingress SPKI pin (is it running with --legacy-direct-endpoints?); nothing to verify against")
 		return metalNodeResyncInterval, toDelete, nil
+	case report.IngressCert == "":
+		r.setReachable(mn, metav1.ConditionFalse, inferencev1alpha1.MetalNodeReasonAgentUpgradeRequired,
+			"the agent reports an ingress pin but no ingress certificate, so the dial-back cannot tell its ingress "+
+				"from another server at the same address; upgrade the metal-agent to this controller's version")
+		return metalNodeResyncInterval, toDelete, nil
+	case !ingressCertNames(report.IngressCert, mn.UID):
+		r.setReachable(mn, metav1.ConditionFalse, inferencev1alpha1.MetalNodeReasonCertificateUnbound,
+			fmt.Sprintf("the agent's ingress certificate does not name this MetalNode (%s); the agent re-issues it "+
+				"once it reads its MetalNode, so see the agent log for why it cannot", metalnode.IngressHostname(string(mn.UID))))
+		return metalNodeResyncInterval, toDelete, nil
 	case len(addrs) == 0:
 		r.setReachable(mn, metav1.ConditionFalse, inferencev1alpha1.MetalNodeReasonNoCandidates,
 			fmt.Sprintf("no candidate address is inside the allowed CIDRs (%d reported); set spec.hostIP or widen --metal-node-allowed-cidrs",
@@ -402,7 +434,11 @@ func (r *MetalNodeReconciler) reconcileDialBack(ctx context.Context, mn *inferen
 	started := metav1.NewTime(now)
 	v.LastStartTime = &started
 	v.PodUID = ""
-	pod := buildMetalNodeVerifierPod(mn, r.verifierImage(), report.IngressSPKI, report.IngressPort, addrs, hash)
+	pod, err := buildMetalNodeVerifierPod(mn, r.verifierImage(), report.IngressSPKI, report.IngressCert,
+		report.IngressPort, addrs, hash)
+	if err != nil {
+		return 0, toDelete, err
+	}
 	if err := controllerutil.SetControllerReference(mn, pod, r.Scheme); err != nil {
 		return 0, toDelete, fmt.Errorf("own verifier pod: %w", err)
 	}
@@ -649,12 +685,13 @@ func (r *MetalNodeReconciler) applyVerifierResult(mn *inferencev1alpha1.MetalNod
 	if st.HostIP != "" {
 		v.ConsecutiveFailures = 0
 		r.setReachable(mn, metav1.ConditionTrue, inferencev1alpha1.MetalNodeReasonDialBackSucceeded,
-			fmt.Sprintf("a verifier pod completed TLS with %s:%d against the agent's SPKI pin", st.HostIP, st.IngressPort))
+			fmt.Sprintf("a verifier pod completed TLS with %s:%d against the agent's SPKI pin and its certificate for this MetalNode",
+				st.HostIP, st.IngressPort))
 		return
 	}
 	v.ConsecutiveFailures++
 	r.setReachable(mn, metav1.ConditionFalse, inferencev1alpha1.MetalNodeReasonNoneReachable,
-		"no candidate completed TLS against the agent's SPKI pin: "+summarizeResults(counts))
+		"no candidate completed TLS against the agent's SPKI pin and its certificate for this MetalNode: "+summarizeResults(counts))
 }
 
 func (r *MetalNodeReconciler) recordVerifierFailure(mn *inferencev1alpha1.MetalNode, hash string, at time.Time, msg string) {

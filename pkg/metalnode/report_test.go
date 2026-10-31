@@ -32,6 +32,7 @@ func sampleReport() Report {
 		MetalVersion: "Metal 4",
 		IngressPort:  9443,
 		IngressSPKI:  "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80=",
+		IngressCert:  "MIIBY2VydA==",
 		Candidates: []Candidate{
 			{Address: "100.64.0.2", Source: SourceTailnet},
 			{Address: "192.168.1.47", Source: SourceLAN},
@@ -60,7 +61,7 @@ func TestReportRoundTrip(t *testing.T) {
 func TestDecodeWireFormat(t *testing.T) {
 	raw := `{"version":"0.11.0","chip":"Apple M5 Max","memoryBytes":137438953472,` +
 		`"gpuCores":40,"metalVersion":"Metal 4","ingressPort":9443,` +
-		`"ingressSPKI":"q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80=",` +
+		`"ingressSPKI":"q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80=","ingressCert":"MIIBY2VydA==",` +
 		`"candidates":[{"address":"100.64.0.2","source":"tailnet"},{"address":"192.168.1.47","source":"lan"}]}`
 	got, err := Decode(raw)
 	if err != nil {
@@ -112,6 +113,9 @@ func TestDecodeRejectsInvalidReports(t *testing.T) {
 		{"zoned candidate", `{"candidates":[{"address":"fe80::1%en0","source":"lan"}]}`, "address"},
 		{"empty source", `{"candidates":[{"address":"10.0.0.1","source":""}]}`, "source"},
 		{"source with shell metacharacters", `{"candidates":[{"address":"10.0.0.1","source":"lan;rm"}]}`, "source"},
+		{"certificate not base64", `{"ingressCert":"-----BEGIN CERTIFICATE-----"}`, "ingressCert"},
+		{"certificate URL-safe base64", `{"ingressCert":"MIIB_2Vy-A=="}`, "ingressCert"},
+		{"oversized certificate", `{"ingressCert":"` + strings.Repeat("A", MaxIngressCertLength+4) + `"}`, "ingressCert"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -154,5 +158,36 @@ func TestDecodeErrorsDoNotQuoteValues(t *testing.T) {
 		if strings.Contains(err.Error(), "evil-marker") {
 			t.Errorf("Decode error %q quotes the agent's value", err)
 		}
+	}
+}
+
+// TestIngressHostname pins the name the agent's certificate carries and the
+// verifier checks: the MetalNode UID under a reserved, never-resolving suffix.
+func TestIngressHostname(t *testing.T) {
+	const uid = "6f1c2e3d-4a5b-4c6d-8e7f-90a1b2c3d4e5"
+	if got := IngressHostname(uid); got != uid+".metal-node.llmkube.invalid" {
+		t.Errorf("IngressHostname = %q", got)
+	}
+}
+
+// TestMaxAnnotationHoldsFullReport: a report with every field at its limit
+// fits in the annotation the controller decodes.
+func TestMaxAnnotationHoldsFullReport(t *testing.T) {
+	r := Report{
+		Version: strings.Repeat("v", maxShortString), Chip: strings.Repeat("c", maxShortString),
+		MetalVersion: strings.Repeat("m", maxShortString), MemoryBytes: 1 << 40, GPUCores: 80,
+		IngressPort: 65535, IngressSPKI: "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80=",
+		IngressCert: strings.Repeat("A", MaxIngressCertLength),
+	}
+	for i := range MaxCandidates {
+		r.Candidates = append(r.Candidates, Candidate{
+			Address: fmt.Sprintf("fd7a:115c:a1e0:ab12:4843:cd96:6258:%04x", i), Source: strings.Repeat("s", maxSource)})
+	}
+	raw, err := Encode(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decode(raw); err != nil {
+		t.Errorf("a report at every limit (%d bytes) does not decode: %v", len(raw), err)
 	}
 }

@@ -24,6 +24,7 @@ limitations under the License.
 package metalnode
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/netip"
@@ -44,7 +45,8 @@ const (
 
 const (
 	// MaxAnnotationBytes bounds the annotation the controller will decode.
-	// A full report with MaxCandidates addresses is well under 2 KiB.
+	// A full report with MaxCandidates addresses and an ingress certificate
+	// is about 3 KiB.
 	MaxAnnotationBytes = 8 * 1024
 	// MaxCandidates bounds the addresses one report may carry, which also
 	// bounds the verifier pod's run time (one short probe per address).
@@ -55,9 +57,28 @@ const (
 	// privileged port (22, 443, ...) is refused outright.
 	MinIngressPort = 1024
 
+	// MaxIngressCertLength bounds the report's ingressCert (base64). The
+	// agent's P-256 certificate is under 800 characters.
+	MaxIngressCertLength = 3072
+
+	// IngressHostnameSuffix follows the MetalNode UID in the DNS name the
+	// agent's ingress certificate carries (see IngressHostname). .invalid is
+	// reserved (RFC 6761), so no public CA issues a name under it and the
+	// name never resolves: the verifier pins it to each candidate address.
+	IngressHostnameSuffix = ".metal-node.llmkube.invalid"
+
 	maxShortString = 128
 	maxSource      = 32
 )
+
+// IngressHostname is the DNS name that binds the agent's ingress certificate
+// to one MetalNode: the MetalNode's UID under IngressHostnameSuffix. The
+// dial-back verifier completes TLS only with a server whose certificate names
+// it, so a server other than this Mac's ingress cannot pass for it even when
+// the agent reports that server's address and key.
+func IngressHostname(metalNodeUID string) string {
+	return metalNodeUID + IngressHostnameSuffix
+}
 
 // Report is what the agent tells the cluster about itself. Every field is a
 // claim made by the Mac.
@@ -70,6 +91,11 @@ type Report struct {
 	IngressPort  int32       `json:"ingressPort,omitempty"`
 	IngressSPKI  string      `json:"ingressSPKI,omitempty"`
 	Candidates   []Candidate `json:"candidates,omitempty"`
+	// IngressCert is the certificate the ingress serves, DER in standard
+	// base64. Its public key is the one IngressSPKI pins, and it names
+	// IngressHostname of the MetalNode the agent reports to. Agents before
+	// this field reported only the pin.
+	IngressCert string `json:"ingressCert,omitempty"`
 }
 
 // Candidate is one address the agent believes the cluster can reach it at,
@@ -93,7 +119,7 @@ func Encode(r Report) (string, error) {
 // ignored, so an older controller still reads a newer agent's report.
 // Candidate addresses come back in canonical form (IPv4 never as 4-in-6).
 // The SPKI pin's format is the consumer's to check, against the same rule
-// the relay applies.
+// the relay applies, and so is the ingress certificate's content.
 func Decode(raw string) (Report, error) {
 	if len(raw) > MaxAnnotationBytes {
 		return Report{}, fmt.Errorf("report is %d bytes, over the %d bytes allowed", len(raw), MaxAnnotationBytes)
@@ -129,6 +155,12 @@ func (r *Report) validate() error {
 		if err := checkPrintable(f.name, f.value, maxShortString); err != nil {
 			return err
 		}
+	}
+	if len(r.IngressCert) > MaxIngressCertLength {
+		return fmt.Errorf("ingressCert is %d characters, over the %d allowed", len(r.IngressCert), MaxIngressCertLength)
+	}
+	if _, err := base64.StdEncoding.Strict().DecodeString(r.IngressCert); err != nil {
+		return fmt.Errorf("ingressCert is not standard base64")
 	}
 	if len(r.Candidates) > MaxCandidates {
 		return fmt.Errorf("candidates has %d entries, over the %d allowed", len(r.Candidates), MaxCandidates)
