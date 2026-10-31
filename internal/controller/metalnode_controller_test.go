@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"crypto"
 	"slices"
 	"strings"
 	"testing"
@@ -97,9 +98,27 @@ func encodeReport(t *testing.T, r metalnode.Report) string {
 	return raw
 }
 
-// putLease creates or updates the Lease the way the agent leaves it: renewed
-// at renew, holder the MetalNode, the report in the annotation.
+// putLease creates or updates the Lease the way a current agent leaves it:
+// renewed at renew, holder the MetalNode, the report in the annotation. A
+// report that pins one of the test ingress keys and carries no certificate
+// gets that key's certificate bound to MetalNode name, as the agent binds its
+// certificate before it reports (see putLeaseAsIs for any other report).
 func (f *metalNodeFixture) putLease(name string, renew time.Time, annotation string) {
+	f.t.Helper()
+	if report, err := metalnode.Decode(annotation); err == nil && report.IngressCert == "" {
+		key := map[string]crypto.Signer{testIngressPin: testIngressKey, testIngressPin2: testIngressKey2}[report.IngressSPKI]
+		mn := &inferencev1alpha1.MetalNode{}
+		if key != nil && f.c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: name}, mn) == nil {
+			report.IngressCert = testIngressCert(f.t, key, mn.UID)
+			annotation = encodeReport(f.t, report)
+		}
+	}
+	f.putLeaseAsIs(name, renew, annotation)
+}
+
+// putLeaseAsIs writes annotation unchanged: an older agent's report, or one
+// whose certificate the test chose.
+func (f *metalNodeFixture) putLeaseAsIs(name string, renew time.Time, annotation string) {
 	f.t.Helper()
 	ctx := context.Background()
 	lease := &coordinationv1.Lease{}
@@ -122,6 +141,30 @@ func (f *metalNodeFixture) putLease(name string, renew time.Time, annotation str
 	if err != nil {
 		f.t.Fatalf("write Lease: %v", err)
 	}
+}
+
+// wantVerifierIdentityArgs are the verifier's arguments before the addresses
+// for MetalNode name: the script's $0, the pin, the port, the hostname from
+// the MetalNode's UID and the certificate on its Lease as PEM.
+func (f *metalNodeFixture) wantVerifierIdentityArgs(name string) []string {
+	f.t.Helper()
+	report := f.leaseReport(name)
+	return []string{"metalnode-verify", report.IngressSPKI, "9443",
+		metalnode.IngressHostname(string(f.get(name).UID)), certPEM(f.t, report.IngressCert)}
+}
+
+// leaseReport is the report on Lease name, as putLease left it.
+func (f *metalNodeFixture) leaseReport(name string) metalnode.Report {
+	f.t.Helper()
+	lease := &coordinationv1.Lease{}
+	if err := f.c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: name}, lease); err != nil {
+		f.t.Fatalf("get Lease %s: %v", name, err)
+	}
+	report, err := metalnode.Decode(lease.Annotations[metalnode.ReportAnnotation])
+	if err != nil {
+		f.t.Fatalf("decode the report on Lease %s: %v", name, err)
+	}
+	return report
 }
 
 func (f *metalNodeFixture) reconcile(name string) ctrl.Result {
@@ -243,7 +286,7 @@ func TestMetalNodeReconcileCopiesReportAndVerifies(t *testing.T) {
 		inferencev1alpha1.MetalNodeReasonNotVerified)
 
 	pod := f.onlyVerifierPod("mac-a")
-	assertVerifierPod(t, mn, pod)
+	assertVerifierPod(t, mn, pod, f.wantVerifierIdentityArgs("mac-a"))
 
 	// A reconcile while the verifier runs starts no second pod.
 	f.reconcile("mac-a")
@@ -273,7 +316,7 @@ func TestMetalNodeReconcileCopiesReportAndVerifies(t *testing.T) {
 	if next.Name == pod.Name {
 		t.Errorf("the new verifier reuses the old name %s; the name must follow the inputs", pod.Name)
 	}
-	wantArgs := []string{"metalnode-verify", testIngressPin, "9443", "10.1.2.3", "192.168.1.47"}
+	wantArgs := append(f.wantVerifierIdentityArgs("mac-a"), "10.1.2.3", "192.168.1.47")
 	if args := next.Spec.Containers[0].Command[3:]; !slices.Equal(args, wantArgs) {
 		t.Errorf("new verifier args = %q, want %q", args, wantArgs)
 	}
@@ -320,7 +363,7 @@ func assertReportCopied(t *testing.T, mn *inferencev1alpha1.MetalNode, renewed t
 
 // assertVerifierPod checks the created verifier pod as the API server
 // stored it: owner, deadline, image, token, placement and arguments.
-func assertVerifierPod(t *testing.T, mn *inferencev1alpha1.MetalNode, pod corev1.Pod) {
+func assertVerifierPod(t *testing.T, mn *inferencev1alpha1.MetalNode, pod corev1.Pod, identityArgs []string) {
 	t.Helper()
 	owner := metav1.GetControllerOf(&pod)
 	if owner == nil || owner.Kind != "MetalNode" || owner.Name != mn.Name || owner.UID != mn.UID {
@@ -342,9 +385,10 @@ func assertVerifierPod(t *testing.T, mn *inferencev1alpha1.MetalNode, pod corev1
 			pod.Spec.NodeSelector, pod.Spec.Tolerations)
 	}
 	cmd := pod.Spec.Containers[0].Command
-	wantArgs := []string{"metalnode-verify", testIngressPin, "9443", "10.1.2.3", "192.168.65.254", "100.64.0.2"}
+	wantArgs := append(identityArgs, "10.1.2.3", "192.168.65.254", "100.64.0.2")
 	if len(cmd) < 3 || !slices.Equal(cmd[3:], wantArgs) {
-		t.Errorf("verifier args = %q, want %q (the pin and only the allowed candidates)", cmd, wantArgs)
+		t.Errorf("verifier args = %q, want %q (the pin, the certificate for this MetalNode and only the allowed candidates)",
+			cmd, wantArgs)
 	}
 	if strings.Contains(strings.Join(cmd, " "), "203.0.113.7") {
 		t.Error("the verifier pod dials a candidate outside the allowed CIDRs")

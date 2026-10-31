@@ -20,6 +20,7 @@ limitations under the License.
 package ingress
 
 import (
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -35,7 +36,15 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
+
+	"k8s.io/apimachinery/pkg/util/validation"
+
+	"github.com/defilantech/llmkube/pkg/metalnode"
 )
 
 const (
@@ -44,49 +53,133 @@ const (
 
 	identityCommonName = "llmkube-metal-agent"
 	identityValidity   = 10 * 365 * 24 * time.Hour
-	identityBackdate   = time.Hour
+	// identityBackdate is how far before issuance a certificate becomes
+	// valid. The dial-back verifier checks validity, so a cluster node whose
+	// clock runs behind the Mac's must not see a just re-issued certificate
+	// as not yet valid.
+	identityBackdate = 24 * time.Hour
 )
 
-// LoadOrCreateIdentity returns the agent's ingress TLS identity and its SPKI
-// pin (base64-std SHA-256 of the certificate's RawSubjectPublicKeyInfo, the
+// Identity is the agent's ingress TLS identity. Its key, and so its SPKI pin,
+// never changes once created. Its certificate is re-issued for that same key
+// by BindMetalNode, and new TLS connections get the current one.
+type Identity struct {
+	dir string
+	key crypto.Signer
+	pin string
+	now func() time.Time // the Mac's clock; time.Now outside tests
+
+	mu   sync.Mutex // serializes BindMetalNode
+	cert atomic.Pointer[tls.Certificate]
+}
+
+// LoadOrCreateIdentity returns the agent's ingress TLS identity; its pin is
+// the base64-std SHA-256 of the certificate's RawSubjectPublicKeyInfo (the
 // same encoding as relay.PinFromCert).
 //
 // dir is created with mode 0700 when missing. When both ingress-key.pem and
 // ingress-cert.pem exist they are loaded; the key file must not be readable
 // or writable by group or other. When neither exists a fresh ECDSA P-256
-// self-signed identity is generated and written with mode 0600. Any other
-// state (only one file present, unreadable or corrupt PEM, key/cert mismatch)
-// is an error: regenerating silently would change the pin that the operator
-// has recorded and break every relay pinned to this agent.
-func LoadOrCreateIdentity(dir string) (tls.Certificate, string, error) {
+// self-signed identity is generated and written with mode 0600. When only the
+// key exists, a certificate is issued for it again: the pin is the key's, so
+// nothing pinned to the agent changes, and deleting ingress-cert.pem is how
+// an operator gets a fresh certificate. Any other state (a certificate
+// without its key, unreadable or corrupt PEM, key/cert mismatch) is an error:
+// regenerating the key silently would change the pin that the operator has
+// recorded and break every relay pinned to this agent.
+func LoadOrCreateIdentity(dir string) (*Identity, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return tls.Certificate{}, "", fmt.Errorf("create ingress identity dir %s: %w", dir, err)
+		return nil, fmt.Errorf("create ingress identity dir %s: %w", dir, err)
 	}
 	keyPath := filepath.Join(dir, keyFileName)
 	certPath := filepath.Join(dir, certFileName)
 
 	keyExists, err := fileExists(keyPath)
 	if err != nil {
-		return tls.Certificate{}, "", err
+		return nil, err
 	}
 	certExists, err := fileExists(certPath)
 	if err != nil {
-		return tls.Certificate{}, "", err
+		return nil, err
 	}
 
 	switch {
 	case keyExists && certExists:
-		return loadIdentity(keyPath, certPath)
 	case !keyExists && !certExists:
 		if err := generateIdentity(keyPath, certPath); err != nil {
-			return tls.Certificate{}, "", err
+			return nil, err
 		}
-		return loadIdentity(keyPath, certPath)
+	case keyExists:
+		if err := reissueFromKey(keyPath, certPath); err != nil {
+			return nil, err
+		}
 	default:
-		return tls.Certificate{}, "", fmt.Errorf(
+		return nil, fmt.Errorf(
 			"ingress identity in %s is incomplete (key present: %t, cert present: %t); "+
 				"refusing to regenerate because the SPKI pin would change", dir, keyExists, certExists)
 	}
+	cert, err := loadIdentity(keyPath, certPath)
+	if err != nil {
+		return nil, err
+	}
+	key, ok := cert.PrivateKey.(crypto.Signer)
+	if !ok {
+		return nil, fmt.Errorf("ingress key %s cannot sign", keyPath)
+	}
+	id := &Identity{dir: dir, key: key, pin: spkiPin(cert.Leaf), now: time.Now}
+	id.cert.Store(&cert)
+	return id, nil
+}
+
+// Pin is the identity's SPKI pin.
+func (id *Identity) Pin() string { return id.pin }
+
+// Certificate is the certificate the ingress serves now.
+func (id *Identity) Certificate() *tls.Certificate { return id.cert.Load() }
+
+// GetCertificate is the tls.Config hook that serves the current certificate.
+func (id *Identity) GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+	return id.cert.Load(), nil
+}
+
+// BindMetalNode makes the ingress certificate name the MetalNode with UID
+// uid (metalnode.IngressHostname), and nothing else, which is what the
+// controller's dial-back requires besides the pin. A certificate that already
+// does, and is valid now on the Mac's clock, is left alone. Otherwise a new
+// certificate is issued for the same key, so the pin the relay and the
+// EndpointSlices carry does not change; it replaces ingress-cert.pem and is
+// served to new connections. It reports whether it re-issued. On error the
+// current certificate stays in use.
+//
+// The validity check matters because the verifier checks the certificate's
+// dates: one issued while the Mac's clock ran more than identityBackdate fast
+// is not yet valid for the cluster, and is replaced once the clock is right.
+func (id *Identity) BindMetalNode(uid string) (bool, error) {
+	if errs := validation.IsDNS1123Label(uid); len(errs) > 0 {
+		return false, fmt.Errorf("MetalNode UID %q cannot name the ingress certificate: %s", uid, strings.Join(errs, "; "))
+	}
+	name := metalnode.IngressHostname(uid)
+	id.mu.Lock()
+	defer id.mu.Unlock()
+	now := id.now()
+	if leaf := id.cert.Load().Leaf; slices.Equal(leaf.DNSNames, []string{name}) &&
+		!now.Before(leaf.NotBefore) && !now.After(leaf.NotAfter) {
+		return false, nil
+	}
+	der, err := IssueCertificate(id.key, now, name)
+	if err != nil {
+		return false, err
+	}
+	leaf, err := x509.ParseCertificate(der)
+	if err != nil {
+		return false, fmt.Errorf("parse re-issued ingress certificate: %w", err)
+	}
+	certPath := filepath.Join(id.dir, certFileName)
+	if err := writeFileAtomic(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})); err != nil {
+		return false, err
+	}
+	id.cert.Store(&tls.Certificate{Certificate: [][]byte{der}, PrivateKey: id.key, Leaf: leaf})
+	return true, nil
 }
 
 func fileExists(p string) (bool, error) {
@@ -101,36 +194,71 @@ func fileExists(p string) (bool, error) {
 	}
 }
 
-func loadIdentity(keyPath, certPath string) (tls.Certificate, string, error) {
+// readKeyFile reads the key file, refusing one readable or writable by group
+// or other.
+func readKeyFile(keyPath string) ([]byte, error) {
 	st, err := os.Stat(keyPath)
 	if err != nil {
-		return tls.Certificate{}, "", fmt.Errorf("stat %s: %w", keyPath, err)
+		return nil, fmt.Errorf("stat %s: %w", keyPath, err)
 	}
 	if perm := st.Mode().Perm(); perm&0o077 != 0 {
-		return tls.Certificate{}, "", fmt.Errorf(
+		return nil, fmt.Errorf(
 			"ingress key %s has mode %04o; it must be 0600 (no group or other access)", keyPath, perm)
 	}
 	keyPEM, err := os.ReadFile(keyPath)
 	if err != nil {
-		return tls.Certificate{}, "", fmt.Errorf("read %s: %w", keyPath, err)
+		return nil, fmt.Errorf("read %s: %w", keyPath, err)
+	}
+	return keyPEM, nil
+}
+
+// reissueFromKey writes a certificate, naming nothing yet, for the key in
+// keyPath. The agent binds it to its MetalNode once it reads the UID.
+func reissueFromKey(keyPath, certPath string) error {
+	keyPEM, err := readKeyFile(keyPath)
+	if err != nil {
+		return err
+	}
+	block, _ := pem.Decode(keyPEM)
+	if block == nil || block.Type != "PRIVATE KEY" {
+		return fmt.Errorf("ingress key %s is not a PEM PRIVATE KEY", keyPath)
+	}
+	parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("parse ingress key %s: %w", keyPath, err)
+	}
+	key, ok := parsed.(crypto.Signer)
+	if !ok {
+		return fmt.Errorf("ingress key %s cannot sign", keyPath)
+	}
+	der, err := IssueCertificate(key, time.Now())
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+}
+
+func loadIdentity(keyPath, certPath string) (tls.Certificate, error) {
+	keyPEM, err := readKeyFile(keyPath)
+	if err != nil {
+		return tls.Certificate{}, err
 	}
 	certPEM, err := os.ReadFile(certPath)
 	if err != nil {
-		return tls.Certificate{}, "", fmt.Errorf("read %s: %w", certPath, err)
+		return tls.Certificate{}, fmt.Errorf("read %s: %w", certPath, err)
 	}
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
-		return tls.Certificate{}, "", fmt.Errorf("load ingress identity from %s and %s: %w", certPath, keyPath, err)
+		return tls.Certificate{}, fmt.Errorf("load ingress identity from %s and %s: %w", certPath, keyPath, err)
 	}
-	leaf := cert.Leaf
-	if leaf == nil {
-		leaf, err = x509.ParseCertificate(cert.Certificate[0])
+	if cert.Leaf == nil {
+		leaf, err := x509.ParseCertificate(cert.Certificate[0])
 		if err != nil {
-			return tls.Certificate{}, "", fmt.Errorf("parse ingress certificate %s: %w", certPath, err)
+			return tls.Certificate{}, fmt.Errorf("parse ingress certificate %s: %w", certPath, err)
 		}
 		cert.Leaf = leaf
 	}
-	return cert, spkiPin(leaf), nil
+	return cert, nil
 }
 
 // spkiPin mirrors relay.PinFromCert; the identity test asserts equality.
@@ -139,16 +267,16 @@ func spkiPin(cert *x509.Certificate) string {
 	return base64.StdEncoding.EncodeToString(sum[:])
 }
 
-func generateIdentity(keyPath, certPath string) error {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return fmt.Errorf("generate ingress key: %w", err)
-	}
+// IssueCertificate self-signs the ingress certificate for key, valid from
+// identityBackdate before now for ten years, naming dnsNames. It is not a CA:
+// the dial-back verifier trusts exactly this certificate (curl --cacert with
+// the certificate the agent reports), which OpenSSL accepts for a leaf that
+// is its own trust anchor.
+func IssueCertificate(key crypto.Signer, now time.Time, dnsNames ...string) ([]byte, error) {
 	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	if err != nil {
-		return fmt.Errorf("generate ingress certificate serial: %w", err)
+		return nil, fmt.Errorf("generate ingress certificate serial: %w", err)
 	}
-	now := time.Now()
 	tmpl := &x509.Certificate{
 		SerialNumber:          serial,
 		Subject:               pkix.Name{CommonName: identityCommonName},
@@ -157,10 +285,25 @@ func generateIdentity(keyPath, certPath string) error {
 		KeyUsage:              x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
+		DNSNames:              dnsNames,
 	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, key.Public(), key)
 	if err != nil {
-		return fmt.Errorf("create ingress certificate: %w", err)
+		return nil, fmt.Errorf("create ingress certificate: %w", err)
+	}
+	return der, nil
+}
+
+func generateIdentity(keyPath, certPath string) error {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return fmt.Errorf("generate ingress key: %w", err)
+	}
+	// No name yet: the agent binds the certificate to its MetalNode
+	// (BindMetalNode) once it has read the MetalNode's UID.
+	der, err := IssueCertificate(key, time.Now())
+	if err != nil {
+		return err
 	}
 	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
 	if err != nil {

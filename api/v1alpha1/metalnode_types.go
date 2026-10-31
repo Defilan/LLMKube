@@ -27,8 +27,9 @@ const (
 	// its Lease and the report on it is valid.
 	MetalNodeConditionAgentConnected = "AgentConnected"
 	// MetalNodeConditionReachable is True when a verifier pod in the cluster
-	// completed a TLS handshake with the agent's ingress at status.hostIP
-	// against the SPKI pin the agent reported.
+	// completed a TLS handshake with the agent's ingress at status.hostIP,
+	// with a server whose certificate is the one the agent reported, names
+	// this MetalNode's UID and carries the reported SPKI pin.
 	MetalNodeConditionReachable = "Reachable"
 )
 
@@ -47,8 +48,16 @@ const (
 	MetalNodeReasonAgentNotConnected = "AgentNotConnected"
 	MetalNodeReasonInvalidSpec       = "InvalidSpec"
 	// MetalNodeReasonVerificationPending: the pin, port or verified address
-	// changed, so the last result no longer applies; a new check is due.
+	// changed, or the last success is too old to stand for the current
+	// address, so a new check is due.
 	MetalNodeReasonVerificationPending = "VerificationPending"
+	// MetalNodeReasonAgentUpgradeRequired: the agent reports an ingress pin
+	// but no ingress certificate. A pin alone does not prove the address is
+	// this Mac, so nothing is verified until the agent is upgraded.
+	MetalNodeReasonAgentUpgradeRequired = "AgentUpgradeRequired"
+	// MetalNodeReasonCertificateUnbound: the agent's ingress certificate does
+	// not name this MetalNode's UID (yet), so no server can pass the check.
+	MetalNodeReasonCertificateUnbound = "CertificateUnbound"
 )
 
 // LabelMetalNode names the MetalNode an object belongs to. The controller
@@ -128,14 +137,15 @@ type MetalNodeCapacity struct {
 }
 
 // MetalNodeCandidateResult is the dial-back outcome for one address.
-// +kubebuilder:validation:Enum=Pending;Reachable;Timeout;Refused;PinMismatch;NotAllowed;Error
+// +kubebuilder:validation:Enum=Pending;Reachable;Timeout;Refused;PinMismatch;CertificateMismatch;NotAllowed;Error
 type MetalNodeCandidateResult string
 
 const (
 	// CandidatePending has not been checked against the current pin and
 	// candidate list yet.
 	CandidatePending MetalNodeCandidateResult = "Pending"
-	// CandidateReachable completed a TLS handshake against the pinned key.
+	// CandidateReachable completed a TLS handshake with the agent's reported
+	// certificate, which names this MetalNode, against the pinned key.
 	CandidateReachable MetalNodeCandidateResult = "Reachable"
 	// CandidateTimeout did not answer within the probe timeout.
 	CandidateTimeout MetalNodeCandidateResult = "Timeout"
@@ -143,6 +153,11 @@ const (
 	CandidateRefused MetalNodeCandidateResult = "Refused"
 	// CandidatePinMismatch answered TLS with a key other than the pinned one.
 	CandidatePinMismatch MetalNodeCandidateResult = "PinMismatch"
+	// CandidateCertificateMismatch answered TLS with a certificate that is
+	// not the agent's reported one or does not name this MetalNode: another
+	// server at that address, or one whose certificate is outside its
+	// validity period on the verifier's clock.
+	CandidateCertificateMismatch MetalNodeCandidateResult = "CertificateMismatch"
 	// CandidateNotAllowed is outside the controller's allowed CIDRs and was
 	// never dialed.
 	CandidateNotAllowed MetalNodeCandidateResult = "NotAllowed"
@@ -170,9 +185,9 @@ type MetalNodeCandidate struct {
 
 // MetalNodeVerification is the controller's bookkeeping for the dial-back.
 type MetalNodeVerification struct {
-	// InputHash identifies the pin, port, candidate list and verifier
-	// placement the last completed check ran against. A change starts a new
-	// check.
+	// InputHash identifies the pin, ingress certificate, port, candidate
+	// list and verifier placement the last completed check ran against. A
+	// change starts a new check.
 	// +optional
 	InputHash string `json:"inputHash,omitempty"`
 
@@ -212,7 +227,9 @@ type MetalNodeStatus struct {
 
 	// IngressSPKI is the base64 SHA-256 digest of the agent ingress
 	// certificate's public key, as the agent reports it. The dial-back and
-	// the relay complete TLS only against this key.
+	// the relay complete TLS only against this key; the dial-back also
+	// requires the certificate the agent reports, which must name this
+	// MetalNode's UID.
 	// +optional
 	IngressSPKI string `json:"ingressSPKI,omitempty"`
 

@@ -537,8 +537,10 @@ Three parties each write only what they know:
   `--metal-node <name>`, it renews the Lease every 15 seconds and
   puts what it knows in the Lease's `llmkube.ai/metal-node-report`
   annotation: version, chip, memory, GPU cores, Metal version, the
-  ingress port, the ingress SPKI pin, and the addresses it thinks the
-  cluster can reach it at, in order of preference.
+  ingress port, the ingress SPKI pin, the ingress certificate, and the
+  addresses it thinks the cluster can reach it at, in order of
+  preference. Before it reports, it reads its MetalNode's UID and makes
+  its ingress certificate name it (see [The dial-back](#the-dial-back)).
 - **The controller** is the only writer of MetalNode status. It
   copies the report into status, sets `AgentConnected` from the
   Lease's `renewTime`, and proves reachability with a dial-back
@@ -555,7 +557,8 @@ Add the flag to the agent's launchd plist (or command line):
 
 The agent renews the Lease with the same name as the MetalNode;
 `--metal-node-lease <name>` picks a different one. It only ever gets
-and updates that Lease. If the Lease does not exist, the agent logs
+and updates that Lease, and gets the MetalNode (for its UID, at start
+and every 5 minutes after). If the Lease does not exist, the agent logs
 `Lease <namespace>/<name> not found; run llmkube metal token create`
 at most once a minute and keeps serving. Without `--metal-node` the
 agent makes no Lease call at all.
@@ -606,40 +609,83 @@ spec:
   leaseDurationSeconds: 45
 ```
 
-The per-Mac Role grants `get` and `update` on the Mac's own Lease
-only, by `resourceNames`; the full set of objects is in
+The per-Mac Role grants `get` and `update` on the Mac's own Lease and
+`get` on its own MetalNode, by `resourceNames`; the full set of
+objects is in
 [`deployment/macos/README.md`](https://github.com/defilantech/LLMKube/blob/main/deployment/macos/README.md).
 
 ### The dial-back
 
 `Reachable` means a pod inside the cluster completed a TLS handshake
-with the agent's ingress and the ingress presented the key the agent
-reported. The controller runs it as a short-lived verifier pod in the
+with this Mac's ingress: a server presenting the certificate the agent
+reported, which names this MetalNode, with the key the agent reported.
+The controller runs it as a short-lived verifier pod in the
 MetalNode's namespace, owned by the MetalNode, placed by
 `spec.verifier`:
 
 - It uses the operator's `--init-container-image` (curl), runs as a
-  non-root user with a read-only root filesystem, no capabilities and
-  no service account token, is killed after 60 seconds, and stops at
-  once when deleted (no termination grace period).
-- For each candidate it runs `curl --pinnedpubkey sha256//<pin>`
-  against `https://<address>:<ingressPort>/health`, ignoring any
-  `.curlrc` and any proxy settings, so it tests the direct path. The ingress
-  answers 401 without a relay token, which is enough: the handshake
-  only completes against the pinned key, so the result proves that
-  the address serves the key the agent reported. It does not prove
-  the server is the Mac: the agent reports the pin itself, so it could
-  report another server's public key and address (an API server's
-  key is visible to any client) and read as `Reachable`. Treat
-  `status.hostIP` as the agent's claim, checked for a path, not as an
-  authenticated identity; nothing in LLMKube routes to it yet.
+  non-root user with a read-only root filesystem (its only writable
+  path is a 64 KiB in-memory `emptyDir` for the certificate), no
+  capabilities and no service account token, is killed after 60
+  seconds, and stops at once when deleted (no termination grace
+  period).
+- The agent's ingress certificate names the MetalNode:
+  `<metadata.uid>.metal-node.llmkube.invalid` (`.invalid` never
+  resolves and no public CA issues for it). The agent reads the UID
+  from its MetalNode and re-issues the certificate for the same key,
+  so the SPKI pin, which the relay and the EndpointSlices carry, does
+  not change. The certificate is saved beside the key in the agent's
+  state directory.
+- For each candidate it runs curl against
+  `https://<uid>.metal-node.llmkube.invalid:<ingressPort>/health`,
+  with `--resolve` sending that name to the candidate address,
+  `--cacert` set to the certificate the agent reported, `--capath` set
+  to an empty directory (so that certificate is the only trust anchor,
+  even with a curl built with a CA directory) and
+  `--pinnedpubkey sha256//<pin>`, ignoring any
+  `.curlrc` and any proxy settings, so it tests the direct path. The
+  ingress answers 400 to a request without its relay headers, which is
+  enough: curl completes the handshake only with a server whose
+  certificate is the reported one, names this MetalNode and carries
+  the pinned key. Another server at a reported address (an API server,
+  whose address and public key any client sees) presents its own
+  certificate, which does not name the MetalNode, so it fails
+  (`CertificateMismatch`) whatever key and address the agent reports.
+- The controller checks the reported certificate before it dials: it
+  must be for the pinned key and signed by that key (otherwise the
+  report is invalid), and it must name this MetalNode (otherwise
+  `Reachable=False`, reason `CertificateUnbound`, until the agent binds
+  it). An agent that reports a pin but no certificate (any agent from
+  before this check) is never dialed: `Reachable=False`, reason
+  `AgentUpgradeRequired`. Upgrade the agent; until then the MetalNode
+  is not Reachable.
+- The certificate is checked for its validity period on the verifier
+  node's clock. The agent backdates it by a day, so only a node clock
+  more than a day behind the Mac's fails a freshly re-issued one. The
+  agent also re-issues it (same key) whenever it is not valid on the
+  Mac's own clock, so one issued while that clock ran fast is replaced
+  within 5 minutes of the clock being fixed. Deleting
+  `ingress-cert.pem` (keeping `ingress-key.pem`) makes the agent issue
+  a fresh one at its next start, with the same pin.
+- The image's curl must be 7.57 or later and accept a self-signed
+  certificate as its own trust anchor (OpenSSL and LibreSSL do; see the
+  [air-gapped guide](./air-gapped) for a custom image). Any other curl
+  fails closed: `Reachable` stays False.
+- What the check does not cover: a server that answers any requested
+  name with a certificate it self-signs on the spot with one stable
+  key (some TLS-intercepting proxies and development servers do) would
+  pass. The agent could ask that server for the MetalNode's name and
+  report the certificate it gets back, with its key. A challenge the
+  ingress has to answer with its key would close this; the check does
+  not have one yet.
 - Per-candidate results are `Reachable`, `Timeout`, `Refused`,
-  `PinMismatch`, `NotAllowed` or `Error`. The first `Reachable`
-  address in order becomes `status.hostIP`, which is set only while
-  `Reachable` is True.
+  `PinMismatch`, `CertificateMismatch`, `NotAllowed` or `Error`. The
+  first `Reachable` address in order becomes `status.hostIP`, which is
+  set only while `Reachable` is True.
 
-The check reruns when the pin, the port, the addresses it dials or
-the placement change, every 10 minutes, and after a failure with a
+The check reruns when the pin, the certificate, the port, the
+addresses it dials or the placement change, every 10 minutes, and
+after a failure with a
 backoff of 30 seconds growing to 5 minutes. Two rules hold whatever
 the Mac reports: at most one verifier pod exists per MetalNode at a
 time (a pod being deleted still counts), and two verifier starts are
@@ -651,7 +697,17 @@ port changes, or the verified address drops out of the list, the old
 `Reachable=True` and `hostIP` are withdrawn at once (`Reachable` is
 `Unknown`, reason `VerificationPending`) until the new check lands; a
 new address offered beside the verified one leaves the result
-standing. Put the verifier
+standing, but no success stands for more than 13 minutes (the
+10-minute recheck, the 2-minute verifier timeout and a minute of
+slack) without a newer check finishing. A Mac whose report keeps
+changing restarts the check each time, so without that bound an old
+success, and its `hostIP`, would outlive the address it proved; past
+it `Reachable` is `Unknown`, reason `VerificationPending`, and the
+message names a verifier pod stuck terminating if one is what keeps
+the check from starting. Times a verifier's node reports are kept
+between the verifier's start and the moment the controller reads it,
+so a node clock that is off does not change when a result expires or
+when the next check runs. Put the verifier
 where the relay pods for this Mac run, so it tests the path the relay
 will use.
 
@@ -676,9 +732,12 @@ on schedule does not wake the controller; its 60 s resync does.
   is `AgentConnected=False`, reason `ReportInvalid`), and verified
   where it can be. A `renewTime` more than 30 seconds in the future
   counts as stale.
-- **The dial-back is no looser than the relay.** It completes TLS
-  only against the SPKI pin the agent reported, checked with the
-  same rule the relay uses, copies no response body or curl error
+- **The dial-back is bound to the Mac.** It completes TLS only with a
+  server whose certificate names this MetalNode's UID and carries the
+  SPKI pin the agent reported (checked with the same rule the relay
+  uses), so the agent cannot get `Reachable=True` for another
+  server's address by reporting that server's key. It copies no
+  response body or curl error
   into status, and never passes an agent value through a shell:
   addresses must be IP literals and reach the pod as arguments.
 - **Allowed CIDRs.** The verifier only dials candidates inside the
@@ -694,8 +753,8 @@ on schedule does not wake the controller; its 60 s resync does.
 - **The dial-back results are visible to the Mac.** The Mac can read
   its own MetalNode, including the per-candidate results. They stay
   coarse on purpose (`Reachable`, `Timeout`, `Refused`, `PinMismatch`,
-  `NotAllowed`, `Error`), with no response bodies, curl errors or
-  timings.
+  `CertificateMismatch`, `NotAllowed`, `Error`), with no response
+  bodies, curl errors or timings.
 - **No Kubernetes version floor.** The MetalNode CRD uses no CEL
   rule that needs a newer Kubernetes than the rest of LLMKube;
   `spec.hostIP` is checked by the controller (`Reachable=False`,
@@ -708,13 +767,15 @@ on schedule does not wake the controller; its 60 s resync does.
 | `AgentConnected` | `HeartbeatFresh` | The Lease was renewed within three lease durations. |
 | `AgentConnected` | `HeartbeatStale` | The agent stopped renewing (or never started), or `renewTime` is more than 30 s in the future. |
 | `AgentConnected` | `LeaseNotFound` | The Lease in `spec.leaseName` does not exist. |
-| `AgentConnected` | `ReportInvalid` | The report annotation is missing, malformed, or carries an invalid pin, a port below 1024, or non-printable text. |
-| `Reachable` | `DialBackSucceeded` | A verifier reached `status.hostIP` with the pinned key. |
-| `Reachable` | `NoneReachable` | No candidate answered with the pinned key; see `status.candidates`. |
+| `AgentConnected` | `ReportInvalid` | The report annotation is missing, malformed, or carries an invalid pin, a port below 1024, non-printable text, or an ingress certificate that is not for the pinned key or not signed by it. |
+| `Reachable` | `DialBackSucceeded` | A verifier reached `status.hostIP` and the server presented the agent's certificate for this MetalNode with the pinned key. |
+| `Reachable` | `NoneReachable` | No candidate answered with the agent's certificate and pinned key; see `status.candidates`. |
 | `Reachable` | `NoCandidates` | No reported address is inside the allowed CIDRs. |
 | `Reachable` | `PinMissing` | The agent reports no ingress pin (legacy mode). |
+| `Reachable` | `AgentUpgradeRequired` | The agent reports a pin but no ingress certificate, as agents from before the certificate check do; nothing is dialed until the agent is upgraded. |
+| `Reachable` | `CertificateUnbound` | The agent's ingress certificate does not name this MetalNode's UID; the agent binds it once it can read its MetalNode (see the agent log). |
 | `Reachable` | `VerifierFailed` | The verifier pod could not be created, failed, or never finished (check the controller log, `spec.verifier` placement and the image pull), or a pod this MetalNode does not own holds the verifier's name. |
-| `Reachable` | `VerificationPending` | `Unknown`: the pin or port changed, or the verified address is no longer offered, so the last result no longer applies; `hostIP` is empty until the new check lands. |
+| `Reachable` | `VerificationPending` | `Unknown`: the pin or port changed, the verified address is no longer offered, or the last success is more than 13 minutes old with no newer check finished, so the last result no longer applies; `hostIP` is empty until the new check lands. |
 | `Reachable` | `AgentNotConnected` | `Unknown`: the agent is not connected, so nothing is dialed and `hostIP` is empty. |
 | `Reachable` | `InvalidSpec` | `spec.hostIP` is not an IP address; nothing is dialed until it is fixed. |
 

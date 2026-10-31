@@ -183,16 +183,17 @@ func TestMetalNodeRewordedReportKeepsResult(t *testing.T) {
 // TestMetalNodeInputHashIgnoresUndialedInputs: the hash that decides a new
 // check covers only what changes the probe.
 func TestMetalNodeInputHashIgnoresUndialedInputs(t *testing.T) {
-	base := metalNodeInputHash(testIngressPin, 9443, []string{"100.64.0.2", "10.0.0.5"}, nil)
-	if got := metalNodeInputHash(testIngressPin, 9443, []string{"100.64.0.2", "10.0.0.5"}, nil); got != base {
+	base := metalNodeInputHash(testIngressPin, "Y2VydA==", 9443, []string{"100.64.0.2", "10.0.0.5"}, nil)
+	if got := metalNodeInputHash(testIngressPin, "Y2VydA==", 9443, []string{"100.64.0.2", "10.0.0.5"}, nil); got != base {
 		t.Error("the same inputs hash differently")
 	}
 	for name, got := range map[string]string{
-		"pin":       metalNodeInputHash("AAAAEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80=", 9443, []string{"100.64.0.2", "10.0.0.5"}, nil),
-		"port":      metalNodeInputHash(testIngressPin, 9444, []string{"100.64.0.2", "10.0.0.5"}, nil),
-		"addresses": metalNodeInputHash(testIngressPin, 9443, []string{"100.64.0.2", "10.0.0.6"}, nil),
-		"order":     metalNodeInputHash(testIngressPin, 9443, []string{"10.0.0.5", "100.64.0.2"}, nil),
-		"placement": metalNodeInputHash(testIngressPin, 9443, []string{"100.64.0.2", "10.0.0.5"},
+		"pin":       metalNodeInputHash("AAAAEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80=", "Y2VydA==", 9443, []string{"100.64.0.2", "10.0.0.5"}, nil),
+		"cert":      metalNodeInputHash(testIngressPin, "b3RoZXI=", 9443, []string{"100.64.0.2", "10.0.0.5"}, nil),
+		"port":      metalNodeInputHash(testIngressPin, "Y2VydA==", 9444, []string{"100.64.0.2", "10.0.0.5"}, nil),
+		"addresses": metalNodeInputHash(testIngressPin, "Y2VydA==", 9443, []string{"100.64.0.2", "10.0.0.6"}, nil),
+		"order":     metalNodeInputHash(testIngressPin, "Y2VydA==", 9443, []string{"10.0.0.5", "100.64.0.2"}, nil),
+		"placement": metalNodeInputHash(testIngressPin, "Y2VydA==", 9443, []string{"100.64.0.2", "10.0.0.5"},
 			&inferencev1alpha1.MetalNodeVerifier{NodeSelector: map[string]string{"a": "b"}}),
 	} {
 		if got == base {
@@ -205,7 +206,7 @@ func TestMetalNodeInputHashIgnoresUndialedInputs(t *testing.T) {
 	allowed := mustAllowedCIDRs(t, DefaultMetalNodeAllowedCIDRs)
 	hashOf := func(c ...metalnode.Candidate) string {
 		desired := metalNodeDesiredCandidates("", metalnode.Report{Candidates: c}, allowed)
-		return metalNodeInputHash(testIngressPin, 9443, dialableAddresses(desired), nil)
+		return metalNodeInputHash(testIngressPin, "Y2VydA==", 9443, dialableAddresses(desired), nil)
 	}
 	a := hashOf(metalnode.Candidate{Address: "100.64.0.2", Source: "tailnet"}, metalnode.Candidate{Address: "203.0.113.1", Source: "lan"})
 	b := hashOf(metalnode.Candidate{Address: "100.64.0.2", Source: "other"}, metalnode.Candidate{Address: "203.0.113.9", Source: "lan"})
@@ -515,7 +516,7 @@ func TestMetalNodeReachableNotStaleAfterInputChange(t *testing.T) {
 	// Same addresses, new pin: the old result proved the old key.
 	verified("mac-rekey", tailnet)
 	rekeyed := testReport(tailnet)
-	rekeyed.IngressSPKI = "AAAAEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80="
+	rekeyed.IngressSPKI = testIngressPin2
 	f.now = f.now.Add(time.Minute)
 	f.putLease("mac-rekey", f.now, encodeReport(t, rekeyed))
 	f.reconcile("mac-rekey")

@@ -18,6 +18,7 @@ package agent
 
 import (
 	"context"
+	"encoding/base64"
 	"time"
 
 	"go.uber.org/zap"
@@ -27,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 	"github.com/defilantech/llmkube/pkg/metalnode"
 )
 
@@ -39,13 +41,18 @@ const (
 	// metalNodeWarnInterval rate-limits the reporter's warnings, so a missing
 	// Lease or RBAC does not log every 15 seconds.
 	metalNodeWarnInterval = time.Minute
+	// metalNodeBindRecheck is how often the agent re-reads its MetalNode's
+	// UID once its ingress certificate names it, so a MetalNode deleted and
+	// re-created under the same name is picked up without a restart.
+	metalNodeBindRecheck = 5 * time.Minute
 )
 
 // metalNodeReporter is the agent's only presence on its MetalNode: it renews
 // the Lease the admin pre-created (llmkube metal token create) and carries
 // the agent's report in an annotation on it. It only ever gets and updates
 // that one Lease, the two verbs the per-Mac Role grants on it; it never
-// creates it and never writes the MetalNode.
+// creates it and never writes the MetalNode. It reads the MetalNode (the
+// Role's get) for its UID, which the ingress certificate must name.
 type metalNodeReporter struct {
 	client    client.Client
 	namespace string
@@ -54,12 +61,18 @@ type metalNodeReporter struct {
 	report    func(ctx context.Context) metalnode.Report
 	logger    *zap.SugaredLogger
 	now       func() time.Time
-	// timeout bounds one renewal (the address lookup and both API calls);
+	// timeout bounds one renewal (the address lookup and the API calls);
 	// zero means metalNodeRenewInterval. A hung call must not stall the
 	// heartbeat for good.
 	timeout time.Duration
+	// bind makes the ingress certificate name the MetalNode with the given
+	// UID and reports whether it re-issued it; nil without an ingress.
+	bind func(uid string) (bool, error)
 
-	lastWarn time.Time
+	lastWarn     time.Time
+	lastBindWarn time.Time
+	boundUID     types.UID
+	boundAt      time.Time
 }
 
 // run renews at once and then every metalNodeRenewInterval until ctx ends.
@@ -96,6 +109,7 @@ func (r *metalNodeReporter) renew(ctx context.Context) {
 		return
 	}
 
+	r.bindIngress(ctx)
 	report := r.report(ctx)
 	raw, err := metalnode.Encode(report)
 	if err == nil {
@@ -129,6 +143,44 @@ func (r *metalNodeReporter) renew(ctx context.Context) {
 	r.lastWarn = time.Time{}
 }
 
+// bindIngress makes the ingress certificate name this MetalNode's UID before
+// the report carries it: the controller's dial-back accepts only a server
+// whose certificate names it, so no other server can pass for this Mac. The
+// UID is read until the certificate names it, then every
+// metalNodeBindRecheck. A failure is logged and the report goes out anyway;
+// the controller then says the certificate does not name the MetalNode.
+func (r *metalNodeReporter) bindIngress(ctx context.Context) {
+	if r.bind == nil || (r.boundUID != "" && r.now().Sub(r.boundAt) < metalNodeBindRecheck) {
+		return
+	}
+	mn := &inferencev1alpha1.MetalNode{}
+	if err := r.client.Get(ctx, types.NamespacedName{Namespace: r.namespace, Name: r.node}, mn); err != nil {
+		r.warnBind("cannot read the MetalNode to bind the ingress certificate to it; the dial-back fails until it can",
+			"metalNode", r.node, "error", err)
+		return
+	}
+	reissued, err := r.bind(string(mn.UID))
+	if err != nil {
+		r.warnBind("cannot bind the ingress certificate to the MetalNode; the dial-back fails until it can",
+			"metalNode", r.node, "error", err)
+		return
+	}
+	if reissued {
+		r.logger.Infow("re-issued the ingress certificate (same key and pin) to name this MetalNode",
+			"metalNode", r.node, "uid", mn.UID, "hostname", metalnode.IngressHostname(string(mn.UID)))
+	}
+	r.boundUID, r.boundAt, r.lastBindWarn = mn.UID, r.now(), time.Time{}
+}
+
+func (r *metalNodeReporter) warnBind(msg string, kv ...any) {
+	now := r.now()
+	if !r.lastBindWarn.IsZero() && now.Sub(r.lastBindWarn) < metalNodeWarnInterval {
+		return
+	}
+	r.lastBindWarn = now
+	r.logger.Warnw(msg, kv...)
+}
+
 func (r *metalNodeReporter) warn(msg string, kv ...any) {
 	now := r.now()
 	if !r.lastWarn.IsZero() && now.Sub(r.lastWarn) < metalNodeWarnInterval {
@@ -158,6 +210,9 @@ func (a *MetalAgent) startMetalNodeReporter(ctx context.Context) bool {
 		logger:    a.logger.With("subsystem", "metal-node"),
 		now:       time.Now,
 	}
+	if a.ingressIdentity != nil {
+		r.bind = a.ingressIdentity.BindMetalNode
+	}
 	a.logger.Infow("reporting to MetalNode through its Lease",
 		"metalNode", a.config.MetalNode, "lease", a.config.Namespace+"/"+lease, "interval", metalNodeRenewInterval)
 	go r.run(ctx)
@@ -179,6 +234,9 @@ func (a *MetalAgent) metalNodeReport(ctx context.Context) metalnode.Report {
 	if p := a.config.IngressPort; a.ingressPin != "" && a.ingressListening.Load() && p > 0 && p <= 65535 {
 		report.IngressSPKI = a.ingressPin
 		report.IngressPort = int32(p)
+		if a.ingressIdentity != nil {
+			report.IngressCert = base64.StdEncoding.EncodeToString(a.ingressIdentity.Certificate().Certificate[0])
+		}
 	}
 	env := newCandidateGatherer().gather(ctx, a.config.HostIP, a.config.APIServerHost)
 	report.Candidates = buildMetalNodeCandidates(env)

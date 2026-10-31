@@ -18,10 +18,14 @@ package controller
 
 import (
 	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"net/netip"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -29,6 +33,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
@@ -49,27 +54,55 @@ const (
 
 	metalNodeVerifierDeadlineSeconds = int64(60)
 	metalNodeVerifierHashLen         = 10
+
+	// metalNodeVerifierWorkDir is the verifier's only writable directory
+	// (an emptyDir; the root filesystem is read-only). The script writes the
+	// agent's certificate there for curl --cacert, beside an empty directory
+	// for --capath.
+	metalNodeVerifierWorkDir    = "/verify"
+	metalNodeVerifierWorkVolume = "verify"
 )
 
-// metalNodeVerifierScript probes each candidate once with the pinned key and
-// appends "<address> <curl exit code>" to the termination message after each
-// probe, so a verifier the activeDeadlineSeconds kill cuts short (a slow image
-// pull eats into it) still reports every address it checked; the kubelet
-// reads the file however the container ended.
+// metalNodeVerifierScript probes each candidate once and appends
+// "<address> <curl exit code>" to the termination message after each probe,
+// so a verifier the activeDeadlineSeconds kill cuts short (a slow image pull
+// eats into it) still reports every address it checked; the kubelet reads
+// the file however the container ended.
+//
+// A probe passes only against this Mac's ingress. curl trusts nothing but
+// the certificate the agent reported (--cacert, which OpenSSL accepts as its
+// own trust anchor; --capath names an empty directory, so a CA directory
+// compiled into the image's curl adds no anchors), checks the hostname,
+// which --resolve sends to the
+// candidate address, against the certificate (the name is
+// metalnode.IngressHostname of the MetalNode's UID), and checks the server's
+// key against the pin. A server that is not this Mac's ingress (the API
+// server, say, whose address and key the agent can report) presents a
+// certificate that does not name the MetalNode: curl exits 60. -k would skip
+// both certificate checks, which let such a server pass on the pin alone. A
+// server that self-signs a certificate for whatever name it is asked, with
+// one stable key, would still pass; closing that needs a challenge the
+// ingress answers with its key.
+//
 // -q (first) ignores any .curlrc in the image and --noproxy '*' keeps a
 // cluster-wide proxy setting from testing the proxy path instead of the
 // direct one.
-// It is a constant: the pin, port and addresses arrive as positional
-// arguments, so nothing the agent reports is ever parsed as shell. A
-// completed handshake is exit 0 whatever the HTTP status (the ingress answers
-// 401 without a relay token); 90 is a pin mismatch, 7 a refused connection,
-// 28 a timeout. Response bodies go to /dev/null and curl's stderr stays in
-// the pod log; neither reaches the MetalNode.
-const metalNodeVerifierScript = `pin="$1"; port="$2"; shift 2
+// It is a constant: the pin, port, hostname, certificate and addresses arrive
+// as positional arguments, so nothing the agent reports is ever parsed as
+// shell. A completed handshake is exit 0 whatever the HTTP status: the
+// ingress answers 400 to a request without its relay headers, and the
+// certificate and pin checks are the proof, not the status. 90 is a pin
+// mismatch, 60 a certificate mismatch, 7 a refused connection, 28 a timeout.
+// Response bodies go to /dev/null and curl's stderr stays in the pod log;
+// neither reaches the MetalNode.
+const metalNodeVerifierScript = `pin="$1"; port="$2"; name="$3"; cert="$4"; shift 4
+w=` + metalNodeVerifierWorkDir + `
 : > /dev/termination-log
+mkdir -p "$w/capath"
+printf '%s\n' "$cert" > "$w/ingress.pem"
 for a in "$@"; do
   case "$a" in *:*) h="[$a]" ;; *) h="$a" ;; esac
-  curl -q -sS --noproxy '*' -o /dev/null --max-time 3 --connect-timeout 3 -k --pinnedpubkey "sha256//$pin" "https://$h:$port/health"
+  curl -q -sS --noproxy '*' -o /dev/null --max-time 3 --connect-timeout 3 --cacert "$w/ingress.pem" --capath "$w/capath" --resolve "$name:$port:$h" --pinnedpubkey "sha256//$pin" "https://$name:$port/health"
   rc=$?
   printf '%s %s\n' "$a" "$rc" >> /dev/termination-log
 done
@@ -155,17 +188,18 @@ func dialableAddresses(candidates []inferencev1alpha1.MetalNodeCandidate) []stri
 }
 
 // metalNodeInputHash identifies what a dial-back result depends on: the pin,
-// the port, the addresses the verifier dials (in order) and where it runs.
-// Source strings and NotAllowed addresses are left out on purpose: they
-// change no probe, and letting them change the hash would let a Mac start a
-// new verifier just by rewording its report.
-func metalNodeInputHash(pin string, port int32, dialable []string, verifier *inferencev1alpha1.MetalNodeVerifier) string {
+// the ingress certificate, the port, the addresses the verifier dials (in
+// order) and where it runs. Source strings and NotAllowed addresses are left
+// out on purpose: they change no probe, and letting them change the hash
+// would let a Mac start a new verifier just by rewording its report.
+func metalNodeInputHash(pin, cert string, port int32, dialable []string, verifier *inferencev1alpha1.MetalNodeVerifier) string {
 	in := struct {
 		Pin       string                               `json:"pin"`
+		Cert      string                               `json:"cert,omitempty"`
 		Port      int32                                `json:"port"`
 		Addresses []string                             `json:"addresses"`
 		Verifier  *inferencev1alpha1.MetalNodeVerifier `json:"verifier,omitempty"`
-	}{Pin: pin, Port: port, Addresses: dialable, Verifier: verifier}
+	}{Pin: pin, Cert: cert, Port: port, Addresses: dialable, Verifier: verifier}
 	raw, _ := json.Marshal(in) // strings, ints, maps and slices always marshal
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
@@ -178,6 +212,8 @@ func curlExitResult(code int) inferencev1alpha1.MetalNodeCandidateResult {
 		return inferencev1alpha1.CandidateReachable
 	case 90:
 		return inferencev1alpha1.CandidatePinMismatch
+	case 60:
+		return inferencev1alpha1.CandidateCertificateMismatch
 	case 7:
 		return inferencev1alpha1.CandidateRefused
 	case 28:
@@ -247,11 +283,35 @@ func metalNodeVerifierName(mn, hash string) string {
 	return mn + suffix
 }
 
+// parseIngressCert decodes the report's ingressCert (standard base64 DER).
+func parseIngressCert(b64 string) (*x509.Certificate, error) {
+	der, err := base64.StdEncoding.Strict().DecodeString(b64)
+	if err != nil {
+		return nil, err
+	}
+	return x509.ParseCertificate(der)
+}
+
+// ingressCertNames reports whether the agent's ingress certificate names the
+// MetalNode with UID uid, the name the verifier checks it against.
+func ingressCertNames(b64 string, uid types.UID) bool {
+	cert, err := parseIngressCert(b64)
+	return err == nil && slices.Contains(cert.DNSNames, metalnode.IngressHostname(string(uid)))
+}
+
 // buildMetalNodeVerifierPod renders the dial-back pod: the operator's init
 // container image running the fixed probe script, as locked down as a pod
 // can be (non-root, read-only root, no capabilities, no service account
-// token, no service links), placed by the MetalNode's spec.verifier.
-func buildMetalNodeVerifierPod(mn *inferencev1alpha1.MetalNode, image, pin string, port int32, addrs []string, hash string) *corev1.Pod {
+// token, no service links), placed by the MetalNode's spec.verifier. cert is
+// the agent's reported ingress certificate (standard base64 DER); curl gets
+// it as PEM.
+func buildMetalNodeVerifierPod(mn *inferencev1alpha1.MetalNode, image, pin, cert string, port int32, addrs []string,
+	hash string) (*corev1.Pod, error) {
+	der, err := base64.StdEncoding.Strict().DecodeString(cert)
+	if err != nil {
+		return nil, fmt.Errorf("decode the agent's ingress certificate: %w", err)
+	}
+	certPEM := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
 	labels := map[string]string{
 		"app.kubernetes.io/component":  metalNodeVerifierComponent,
 		"app.kubernetes.io/managed-by": inferencev1alpha1.ManagedByController,
@@ -261,13 +321,15 @@ func buildMetalNodeVerifierPod(mn *inferencev1alpha1.MetalNode, image, pin strin
 	if len(validation.IsValidLabelValue(mn.Name)) == 0 {
 		labels[inferencev1alpha1.LabelMetalNode] = mn.Name
 	}
-	command := append([]string{"sh", "-c", metalNodeVerifierScript, "metalnode-verify", pin, strconv.Itoa(int(port))}, addrs...)
+	command := append([]string{"sh", "-c", metalNodeVerifierScript, "metalnode-verify",
+		pin, strconv.Itoa(int(port)), metalnode.IngressHostname(string(mn.UID)), certPEM}, addrs...)
 	var nodeSelector map[string]string
 	var tolerations []corev1.Toleration
 	if v := mn.Spec.Verifier; v != nil {
 		nodeSelector = v.NodeSelector
 		tolerations = v.Tolerations
 	}
+	workLimit := resource.MustParse("64Ki")
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        metalNodeVerifierName(mn.Name, hash),
@@ -288,6 +350,12 @@ func buildMetalNodeVerifierPod(mn *inferencev1alpha1.MetalNode, image, pin strin
 			SecurityContext: &corev1.PodSecurityContext{
 				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 			},
+			Volumes: []corev1.Volume{{
+				Name: metalNodeVerifierWorkVolume,
+				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+					Medium: corev1.StorageMediumMemory, SizeLimit: &workLimit,
+				}},
+			}},
 			Containers: []corev1.Container{{
 				Name:                     metalNodeVerifierContainer,
 				Image:                    image,
@@ -295,6 +363,7 @@ func buildMetalNodeVerifierPod(mn *inferencev1alpha1.MetalNode, image, pin strin
 				Command:                  command,
 				TerminationMessagePath:   corev1.TerminationMessagePathDefault,
 				TerminationMessagePolicy: corev1.TerminationMessageReadFile,
+				VolumeMounts:             []corev1.VolumeMount{{Name: metalNodeVerifierWorkVolume, MountPath: metalNodeVerifierWorkDir}},
 				// Requests equal limits for both CPU and memory, so a namespace
 				// whose ResourceQuota requires limits admits the pod.
 				Resources: corev1.ResourceRequirements{
@@ -316,5 +385,5 @@ func buildMetalNodeVerifierPod(mn *inferencev1alpha1.MetalNode, image, pin strin
 				},
 			}},
 		},
-	}
+	}, nil
 }

@@ -137,7 +137,7 @@ func TestMetalNodeVerifierNameTakenByAnotherPod(t *testing.T) {
 	f := newMetalNodeFixture(t)
 	f.createMetalNode("mac-squat", nil)
 	f.putLease("mac-squat", f.now, tailnetReport(t))
-	hash := metalNodeInputHash(testIngressPin, 9443, []string{"100.64.0.2"}, nil)
+	hash := metalNodeInputHash(testIngressPin, f.leaseReport("mac-squat").IngressCert, 9443, []string{"100.64.0.2"}, nil)
 	squatter := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: metalNodeVerifierName("mac-squat", hash), Namespace: testNS},
 		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "registry.local/curl:1"}}},

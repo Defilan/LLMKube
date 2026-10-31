@@ -141,7 +141,7 @@ func newFixture(t *testing.T, h http.HandlerFunc) *fixture {
 	}
 	ts := NewTokenStore(f, time.Minute, time.Minute, nil)
 	return &fixture{
-		srv:     NewServer(tls.Certificate{}, ts, r, zap.NewNop().Sugar()),
+		srv:     NewServer(nil, ts, r, zap.NewNop().Sugar()),
 		secrets: f,
 		router:  r,
 		engine:  e,
@@ -491,12 +491,13 @@ func TestServer_CountsRequestsByCode(t *testing.T) {
 // relay.PinFromCert to LoadOrCreateIdentity's pin completes the handshake
 // and reaches the engine, and ctx cancellation stops Start cleanly.
 func TestServer_StartServesPinnedTLS(t *testing.T) {
-	cert, pin, err := LoadOrCreateIdentity(t.TempDir())
+	id, err := LoadOrCreateIdentity(t.TempDir())
 	if err != nil {
 		t.Fatalf("LoadOrCreateIdentity: %v", err)
 	}
+	pin := id.Pin()
 	fx := newFixture(t, nil)
-	srv := NewServer(cert, fx.srv.tokens, fx.router, zap.NewNop().Sugar())
+	srv := NewServer(id, fx.srv.tokens, fx.router, zap.NewNop().Sugar())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -547,6 +548,26 @@ func TestServer_StartServesPinnedTLS(t *testing.T) {
 	}
 	if got, _ := seenPin.Load().(string); got != pin {
 		t.Fatalf("handshake pin %q, want %q", got, pin)
+	}
+
+	// Binding to a MetalNode while serving: the next handshake presents the
+	// re-issued certificate, with the same pin, without a restart.
+	if _, err := id.BindMetalNode("6f1c2e3d-4a5b-4c6d-8e7f-90a1b2c3d4e5"); err != nil {
+		t.Fatalf("BindMetalNode: %v", err)
+	}
+	bound, err := tls.Dial("tcp", addr, &tls.Config{
+		InsecureSkipVerify: true, //nolint:gosec // G402: reading the presented certificate
+		MinVersion:         tls.VersionTLS13,
+	})
+	if err != nil {
+		t.Fatalf("TLS after binding: %v", err)
+	}
+	leaf := bound.ConnectionState().PeerCertificates[0]
+	_ = bound.Close()
+	want := "6f1c2e3d-4a5b-4c6d-8e7f-90a1b2c3d4e5.metal-node.llmkube.invalid"
+	if len(leaf.DNSNames) != 1 || leaf.DNSNames[0] != want || relay.PinFromCert(leaf) != pin {
+		t.Errorf("after binding the ingress presents names %v pin %q, want %s and the unchanged pin", leaf.DNSNames,
+			relay.PinFromCert(leaf), want)
 	}
 
 	// A TLS 1.2-only client cannot complete a handshake at all.

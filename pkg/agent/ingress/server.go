@@ -83,19 +83,19 @@ const (
 // (HeaderRelayTarget, "<ns>/<name>"); allowed requests are reverse-proxied
 // to the target's engine on 127.0.0.1. Token values are never logged.
 type Server struct {
-	cert   tls.Certificate
-	tokens *TokenStore
-	routes Router
-	logger *zap.SugaredLogger
+	identity *Identity
+	tokens   *TokenStore
+	routes   Router
+	logger   *zap.SugaredLogger
 
 	mu   sync.Mutex
 	addr net.Addr // set once Start is listening; for tests
 }
 
-// NewServer returns a Server presenting cert, authenticating with tokens and
-// resolving targets through routes.
-func NewServer(cert tls.Certificate, tokens *TokenStore, routes Router, logger *zap.SugaredLogger) *Server {
-	return &Server{cert: cert, tokens: tokens, routes: routes, logger: logger}
+// NewServer returns a Server presenting identity's current certificate,
+// authenticating with tokens and resolving targets through routes.
+func NewServer(identity *Identity, tokens *TokenStore, routes Router, logger *zap.SugaredLogger) *Server {
+	return &Server{identity: identity, tokens: tokens, routes: routes, logger: logger}
 }
 
 // ServeHTTP applies, in order: target parse (400), served-namespace gate and
@@ -287,8 +287,10 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		IdleTimeout:       idleTimeout,
 		ErrorLog:          zap.NewStdLog(s.logger.Desugar()),
 		TLSConfig: &tls.Config{
-			MinVersion:   tls.VersionTLS13,
-			Certificates: []tls.Certificate{s.cert},
+			MinVersion: tls.VersionTLS13,
+			// Read per handshake: BindMetalNode re-issues the certificate
+			// while the ingress serves.
+			GetCertificate: s.identity.GetCertificate,
 		},
 	}
 	stopped := make(chan struct{})

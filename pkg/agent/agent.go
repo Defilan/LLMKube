@@ -44,6 +44,7 @@ import (
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 	"github.com/defilantech/llmkube/internal/safehttp"
+	"github.com/defilantech/llmkube/pkg/agent/ingress"
 	"github.com/defilantech/llmkube/pkg/agent/policy"
 )
 
@@ -310,6 +311,10 @@ type MetalAgent struct {
 	// ingressPin is the SPKI pin of the ingress identity, set by
 	// prepareIngress in relay mode and reported to the MetalNode.
 	ingressPin string
+	// ingressIdentity is the ingress TLS identity, set with ingressPin. The
+	// MetalNode reporter binds its certificate to the MetalNode and reports
+	// it.
+	ingressIdentity *ingress.Identity
 	// ingressListening is set once the ingress port is bound; the MetalNode
 	// report carries the pin and port only from then on.
 	ingressListening atomic.Bool

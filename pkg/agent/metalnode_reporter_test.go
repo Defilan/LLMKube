@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
+	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 	"github.com/defilantech/llmkube/pkg/metalnode"
 )
 
@@ -52,12 +53,19 @@ func (v *verbRecorder) add(verb string, obj runtime.Object) {
 }
 
 func (v *verbRecorder) leaseCalls() []string {
+	return v.callsOn("*v1.Lease", "*v1.LeaseList")
+}
+
+// callsOn are the recorded calls on objects of the given Go types.
+func (v *verbRecorder) callsOn(kinds ...string) []string {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	var out []string
 	for _, c := range v.calls {
-		if strings.HasSuffix(c, "*v1.Lease") || strings.HasSuffix(c, "*v1.LeaseList") {
-			out = append(out, c)
+		for _, typ := range kinds {
+			if strings.HasSuffix(c, " "+typ) {
+				out = append(out, c)
+			}
 		}
 	}
 	return out
@@ -66,7 +74,14 @@ func (v *verbRecorder) leaseCalls() []string {
 func recordingClient(t *testing.T, objs ...client.Object) (client.Client, *verbRecorder) {
 	t.Helper()
 	rec := &verbRecorder{}
-	base := fake.NewClientBuilder().WithScheme(clientgoscheme.Scheme).WithObjects(objs...).Build()
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := inferencev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
 	c := interceptor.NewClient(base, interceptor.Funcs{
 		Get: func(ctx context.Context, w client.WithWatch, key client.ObjectKey, obj client.Object,
 			opts ...client.GetOption) error {

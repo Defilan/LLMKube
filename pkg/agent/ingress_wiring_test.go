@@ -455,6 +455,12 @@ func TestMetalNodeReportAdvertisesIngressOnceBound(t *testing.T) {
 	if pin := base64.StdEncoding.EncodeToString(sum[:]); pin != got.IngressSPKI {
 		t.Errorf("the advertised port presents SPKI %q, want the advertised pin %q", pin, got.IngressSPKI)
 	}
+	// The reported certificate is the one the port presents: the verifier
+	// trusts exactly it.
+	presented := base64.StdEncoding.EncodeToString(conn.ConnectionState().PeerCertificates[0].Raw)
+	if presented != got.IngressCert {
+		t.Errorf("the advertised port presents a certificate other than the reported one")
+	}
 }
 
 // TestListenIngressBindFailureAdvertisesNothing: when the ingress port is

@@ -723,8 +723,16 @@ resource, its conditions and the controller's dial-back). The agent never
 writes the MetalNode. Every 15 seconds it gets and updates one Lease in
 `--namespace` (named like the MetalNode, or `--metal-node-lease <name>`),
 setting `renewTime`, `holderIdentity` and the `llmkube.ai/metal-node-report`
-annotation with its version, hardware, ingress port and SPKI pin, and the
-addresses it believes the cluster can reach it at. It never creates the
+annotation with its version, hardware, ingress port, SPKI pin and ingress
+certificate, and the addresses it believes the cluster can reach it at. It
+also gets the MetalNode, at start and every 5 minutes after, for its UID: the
+ingress certificate must name `<uid>.metal-node.llmkube.invalid`, or the
+controller's dial-back cannot tell this Mac's ingress from another server and
+the MetalNode is not `Reachable`. The agent re-issues the certificate for the
+same key when the name is missing or names another UID, so the SPKI pin does
+not change. If it cannot read the MetalNode it logs why, at most once a minute,
+and keeps reporting. An older agent that reports no certificate is never
+`Reachable` (reason `AgentUpgradeRequired`); upgrade it. It never creates the
 Lease: if the Lease is missing it logs
 `Lease <namespace>/<name> not found; run llmkube metal token create` at most
 once a minute and keeps serving. Without the flag the agent makes no Lease
@@ -796,6 +804,11 @@ rules:
     resources: ["leases"]
     resourceNames: ["mac-studio"]
     verbs: ["get", "update"]
+  # The MetalNode's UID, which the agent's ingress certificate must name.
+  - apiGroups: ["inference.llmkube.dev"]
+    resources: ["metalnodes"]
+    resourceNames: ["mac-studio"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -826,8 +839,8 @@ subjects:
     name: llmkube-metal-mac-studio
 ```
 
-The Role above shows the Lease rule the agent's MetalNode reporting needs;
-the command's per-Mac Role also carries the self-scoped rules joining needs.
+The Role above shows the rules the agent's MetalNode reporting needs; the
+command's per-Mac Role also carries the self-scoped rules joining needs.
 
 `cmd/metal-agent/rbac_test.go` keeps the two apart: the shared Role must grant
 exactly the agent's shared calls and no Lease rule. Deleting the Mac's
@@ -1349,7 +1362,10 @@ client pod ──▶ <isvc> Service ──▶ <isvc>-relay pod ──TLS──�
   is mode 0600, and the agent will not load a key that is readable by group
   or others). It publishes the certificate's SPKI SHA-256 pin as the annotation
   `llmkube.ai/agent-ingress-spki` on the `<isvc>-agent` EndpointSlice. The
-  relay accepts only a certificate matching that pin.
+  relay accepts only a certificate matching that pin. With `--metal-node`, the
+  agent re-issues the certificate for the same key to name its MetalNode's UID
+  and saves it in place of `ingress-cert.pem`; the key, and so the pin, never
+  changes.
 - **The relay, to the agent.** The controller creates a Secret
   `llmkube-metal-relay` (key `token`, label
   `llmkube.ai/managed-by: llmkube-controller`) in each namespace with Metal

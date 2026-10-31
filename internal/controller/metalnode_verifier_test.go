@@ -17,6 +17,14 @@ limitations under the License.
 package controller
 
 import (
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/pem"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -24,6 +32,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -34,10 +43,69 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
+	"github.com/defilantech/llmkube/pkg/agent/ingress"
 	"github.com/defilantech/llmkube/pkg/metalnode"
 )
 
-const testIngressPin = "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80="
+// The test agents' ingress keys. testIngressCert issues their certificates
+// with the agent's own code (ingress.IssueCertificate), so the controller is
+// tested against the bytes the agent produces.
+var (
+	testIngressKey, testIngressPin   = newTestIngressKey()
+	testIngressKey2, testIngressPin2 = newTestIngressKey()
+)
+
+func newTestIngressKey() (crypto.Signer, string) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	der, err := x509.MarshalPKIXPublicKey(key.Public())
+	if err != nil {
+		panic(err)
+	}
+	sum := sha256.Sum256(der)
+	return key, base64.StdEncoding.EncodeToString(sum[:])
+}
+
+// testIngressCerts caches testIngressCert's results: an agent keeps its
+// certificate, and a new one would be a new dial-back input.
+var testIngressCerts sync.Map
+
+// testIngressCert is the ingress certificate an agent holding key reports
+// once bound to the MetalNode with UID uid, base64 as in the report. With no
+// uid it is an unbound certificate. The same key and uid give the same
+// certificate.
+func testIngressCert(t *testing.T, key crypto.Signer, uid types.UID) string {
+	t.Helper()
+	type cacheKey struct {
+		key crypto.Signer
+		uid types.UID
+	}
+	if cached, ok := testIngressCerts.Load(cacheKey{key, uid}); ok {
+		return cached.(string)
+	}
+	var names []string
+	if uid != "" {
+		names = append(names, metalnode.IngressHostname(string(uid)))
+	}
+	der, err := ingress.IssueCertificate(key, time.Now(), names...)
+	if err != nil {
+		t.Fatalf("issue ingress certificate: %v", err)
+	}
+	cert := base64.StdEncoding.EncodeToString(der)
+	testIngressCerts.Store(cacheKey{key, uid}, cert)
+	return cert
+}
+
+func certPEM(t *testing.T, b64 string) string {
+	t.Helper()
+	der, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+}
 
 func mustAllowedCIDRs(t *testing.T, s string) []netip.Prefix {
 	t.Helper()
@@ -110,7 +178,8 @@ func TestCurlExitResult(t *testing.T) {
 		7:  inferencev1alpha1.CandidateRefused,
 		28: inferencev1alpha1.CandidateTimeout,
 		35: inferencev1alpha1.CandidateError,
-		60: inferencev1alpha1.CandidateError,
+		60: inferencev1alpha1.CandidateCertificateMismatch,
+		77: inferencev1alpha1.CandidateError,
 	} {
 		if got := curlExitResult(code); got != want {
 			t.Errorf("curlExitResult(%d) = %s, want %s", code, got, want)
@@ -170,7 +239,11 @@ func TestBuildMetalNodeVerifierPod(t *testing.T) {
 		},
 	}
 	addrs := []string{"192.168.65.254", "100.64.0.2"}
-	pod := buildMetalNodeVerifierPod(mn, "registry.local/curl:1", testIngressPin, 9443, addrs, "abcdef0123456789")
+	cert := testIngressCert(t, testIngressKey, mn.UID)
+	pod, err := buildMetalNodeVerifierPod(mn, "registry.local/curl:1", testIngressPin, cert, 9443, addrs, "abcdef0123456789")
+	if err != nil {
+		t.Fatalf("buildMetalNodeVerifierPod: %v", err)
+	}
 
 	if pod.Name != "mac-a-verify-abcdef0123" || pod.Namespace != "macs" {
 		t.Errorf("pod %s/%s, want macs/mac-a-verify-abcdef0123", pod.Namespace, pod.Name)
@@ -208,17 +281,43 @@ func TestBuildMetalNodeVerifierPod(t *testing.T) {
 	if len(c.Command) < 3 || c.Command[0] != "sh" || c.Command[1] != "-c" || c.Command[2] != metalNodeVerifierScript {
 		t.Fatalf("command = %q, want sh -c <fixed script> ...", c.Command)
 	}
-	wantArgs := []string{"metalnode-verify", testIngressPin, "9443", "192.168.65.254", "100.64.0.2"}
+	// The hostname is the MetalNode's UID, never anything the agent reports;
+	// the certificate is the reported one as PEM.
+	wantArgs := []string{"metalnode-verify", testIngressPin, "9443", "uid-1" + metalnode.IngressHostnameSuffix,
+		certPEM(t, cert), "192.168.65.254", "100.64.0.2"}
 	if got := c.Command[3:]; !slices.Equal(got, wantArgs) {
 		t.Errorf("positional args = %q, want %q", got, wantArgs)
 	}
 	// -q first (no .curlrc), and no proxy: the check must test the direct path.
 	for _, want := range []string{"curl -q ", `--noproxy '*'`, `--pinnedpubkey "sha256//$pin"`, "--max-time 3", "--connect-timeout 3", "-o /dev/null",
-		"/dev/termination-log", "/health"} {
+		"/dev/termination-log", "/health", "w=/verify\n", `--cacert "$w/ingress.pem"`, `--capath "$w/capath"`,
+		`--resolve "$name:$port:$h"`, `"https://$name:$port/health"`} {
 		if !strings.Contains(metalNodeVerifierScript, want) {
 			t.Errorf("verifier script lacks %q", want)
 		}
 	}
+	// -k (--insecure) would skip the certificate and hostname checks.
+	for _, f := range strings.Fields(metalNodeVerifierScript) {
+		if f == "-k" || f == "--insecure" {
+			t.Errorf("verifier script passes %s, which skips the certificate checks", f)
+		}
+	}
+	// The root filesystem is read-only; the certificate goes to a small
+	// memory-backed emptyDir at the path the script writes.
+	wantVolume := corev1.Volume{Name: metalNodeVerifierWorkVolume, VolumeSource: corev1.VolumeSource{
+		EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: ptrQuantity("64Ki")}}}
+	if len(pod.Spec.Volumes) != 1 || !apiequality.Semantic.DeepEqual(pod.Spec.Volumes[0], wantVolume) {
+		t.Errorf("volumes = %+v, want only %+v", pod.Spec.Volumes, wantVolume)
+	}
+	if len(c.VolumeMounts) != 1 || c.VolumeMounts[0].Name != metalNodeVerifierWorkVolume ||
+		c.VolumeMounts[0].MountPath != "/verify" || c.VolumeMounts[0].ReadOnly {
+		t.Errorf("volume mounts = %+v, want the work volume writable at /verify", c.VolumeMounts)
+	}
+}
+
+func ptrQuantity(s string) *resource.Quantity {
+	q := resource.MustParse(s)
+	return &q
 }
 
 func checkVerifierPodSpec(t *testing.T, mn *inferencev1alpha1.MetalNode, spec corev1.PodSpec) {
@@ -271,14 +370,36 @@ func checkVerifierContainerSecurity(t *testing.T, sc *corev1.SecurityContext) {
 // the log holds when the script ends, however it ends.
 func runVerifierScript(t *testing.T, curlStub string, addrs ...string) string {
 	t.Helper()
-	dir := t.TempDir()
-	logPath := filepath.Join(dir, "termination-log")
-	if err := os.WriteFile(filepath.Join(dir, "curl"), []byte("#!/bin/sh\n"+curlStub), 0o755); err != nil {
+	stubDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(stubDir, "curl"), []byte("#!/bin/sh\n"+curlStub), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	script := strings.ReplaceAll(metalNodeVerifierScript, "/dev/termination-log", logPath)
-	cmd := exec.Command("sh", append([]string{"-c", script, "metalnode-verify", testIngressPin, "9443"}, addrs...)...)
-	cmd.Env = append(os.Environ(), "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	args := append([]string{"metalnode-verify", testIngressPin, "9443", metalnode.IngressHostname("uid-1"),
+		certPEM(t, testIngressCert(t, testIngressKey, "uid-1"))}, addrs...)
+	return execVerifierScript(t, stubDir, metalNodeVerifierScript, args)
+}
+
+// execVerifierScript runs script with sh and args (the verifier container's
+// command after "sh -c <script>"), the termination log and the work
+// directory moved to temp paths, and pathPrefix (when set) first on PATH. It
+// returns what the termination log holds when the script ends.
+func execVerifierScript(t *testing.T, pathPrefix, script string, args []string) string {
+	t.Helper()
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "termination-log")
+	script = strings.ReplaceAll(script, "/dev/termination-log", logPath)
+	workLine := "\nw=" + metalNodeVerifierWorkDir + "\n"
+	if !strings.Contains(script, workLine) {
+		t.Fatalf("verifier script does not set its work directory with %q", workLine)
+	}
+	script = strings.ReplaceAll(script, workLine, "\nw="+dir+"\n")
+	cmd := exec.Command("sh", append([]string{"-c", script}, args...)...)
+	cmd.Env = os.Environ()
+	if pathPrefix != "" {
+		cmd.Env = append(cmd.Env, "PATH="+pathPrefix+string(os.PathListSeparator)+os.Getenv("PATH"))
+	}
+	// The script writes the CA file and then each probe, however each ends;
+	// a nonzero exit is expected from the kill test.
 	_ = cmd.Run()
 	raw, err := os.ReadFile(logPath)
 	if err != nil {

@@ -125,20 +125,22 @@ func (a *MetalAgent) prepareIngress() (*ingress.Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	cert, pin, err := ingress.LoadOrCreateIdentity(filepath.Join(stateDir, "ingress"))
+	identity, err := ingress.LoadOrCreateIdentity(filepath.Join(stateDir, "ingress"))
 	if err != nil {
 		return nil, fmt.Errorf("load ingress identity: %w", err)
 	}
+	pin := identity.Pin()
 	if err := a.registry.EnableIngress(a.config.IngressPort, pin); err != nil {
 		return nil, fmt.Errorf("enable ingress registration: %w", err)
 	}
 	a.ingressPin = pin
+	a.ingressIdentity = identity
 	a.logger.Infow("relay mode: engines bind 127.0.0.1, served through the ingress",
 		"ingressPort", a.config.IngressPort, "spkiPin", pin, "stateDir", stateDir,
 		"identityDir", filepath.Join(stateDir, "ingress"))
 	tokens := ingress.NewTokenStore(a.config.K8sClient, ingressTokenTTL, ingressTokenGrace, time.Now,
 		ingress.WithLogger(a.logger.With("subsystem", "ingress-tokens")))
-	return ingress.NewServer(cert, tokens, a, a.logger.With("subsystem", "ingress")), nil
+	return ingress.NewServer(identity, tokens, a, a.logger.With("subsystem", "ingress")), nil
 }
 
 // runIngress serves srv on all interfaces until ctx ends. Any exit before

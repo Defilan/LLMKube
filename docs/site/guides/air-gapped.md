@@ -121,6 +121,14 @@ curl, for example), point it here. The chart consumes these as two
 separate fields, not a single `image` value (see
 [`_helpers.tpl`](https://github.com/defilantech/LLMKube/blob/main/charts/llmkube/templates/_helpers.tpl)).
 
+The same image runs the MetalNode dial-back verifier for Macs (see the
+[macOS Metal guide](./macos-metal#the-dial-back)). For that it needs `sh`,
+`mkdir`, `printf` and a curl of 7.57 or later (bracketed IPv6 addresses in
+`--resolve`) built on a TLS library that accepts a self-signed server
+certificate as its own trust anchor with `--cacert`, as OpenSSL and LibreSSL
+do. `curlimages/curl` meets all of it. A curl that cannot fails closed: the
+Mac shows `Reachable=False`, never a false `True`.
+
 ### Clusters without dynamic provisioning
 
 The chart defaults to `modelCache.mode: shared`. The operator itself

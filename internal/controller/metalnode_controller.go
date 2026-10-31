@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"net/netip"
 	"slices"
@@ -83,6 +85,15 @@ const (
 	// metalNodeRenewGap is a renewal gap that means the agent was away (it
 	// renews every 15 s), so the update reconciles at once.
 	metalNodeRenewGap = 45 * time.Second
+	// metalNodeMaxResultAge is how long a True Reachable stands without a
+	// newer check finishing. An unchanged Mac is re-checked after
+	// metalNodeRecheckInterval and that check ends, one way or the other,
+	// within metalNodeVerifierTimeout; the resync interval is slack for
+	// when the reconcile that reads it runs. Only a check that keeps being
+	// cut short (inputs that keep changing, a verifier pod that never goes
+	// away) reaches the bound, and then the result is too old to stand for
+	// the address.
+	metalNodeMaxResultAge = metalNodeRecheckInterval + metalNodeVerifierTimeout + metalNodeResyncInterval
 )
 
 // metalNodeLeaseUpdateMatters reports whether a Lease update should
@@ -281,9 +292,15 @@ func advanceHeartbeat(st *inferencev1alpha1.MetalNodeStatus, renewed time.Time, 
 
 // checkIngressClaims applies the relay's own pin rule, so the dial-back
 // never pins a key the relay would refuse. The port floor is enforced by
-// metalnode.Decode.
+// metalnode.Decode. An ingress certificate must be a certificate for the
+// pinned key, signed by that key: the agent's key put the MetalNode's name
+// in it, which a report pairing another server's key with the name cannot
+// show. Which MetalNode it names is the dial-back's to check.
 func checkIngressClaims(report metalnode.Report) error {
 	if report.IngressSPKI == "" {
+		if report.IngressCert != "" {
+			return fmt.Errorf("ingressCert is set but ingressSPKI is not")
+		}
 		return nil
 	}
 	if !validIngressPin(report.IngressSPKI) {
@@ -291,6 +308,19 @@ func checkIngressClaims(report metalnode.Report) error {
 	}
 	if report.IngressPort == 0 {
 		return fmt.Errorf("ingressSPKI is set but ingressPort is not")
+	}
+	if report.IngressCert == "" {
+		return nil
+	}
+	cert, err := parseIngressCert(report.IngressCert)
+	if err != nil {
+		return fmt.Errorf("ingressCert is not a DER certificate")
+	}
+	if sum := sha256.Sum256(cert.RawSubjectPublicKeyInfo); base64.StdEncoding.EncodeToString(sum[:]) != report.IngressSPKI {
+		return fmt.Errorf("ingressCert is not for the key ingressSPKI pins")
+	}
+	if err := cert.CheckSignature(cert.SignatureAlgorithm, cert.RawTBSCertificate, cert.Signature); err != nil {
+		return fmt.Errorf("ingressCert is not signed by its own key")
 	}
 	return nil
 }
@@ -354,7 +384,8 @@ func (r *MetalNodeReconciler) reconcileDialBack(ctx context.Context, mn *inferen
 	var hash string
 	if report != nil {
 		desired := metalNodeDesiredCandidates(hostIP, *report, r.AllowedCIDRs)
-		hash = metalNodeInputHash(report.IngressSPKI, report.IngressPort, dialableAddresses(desired), mn.Spec.Verifier)
+		hash = metalNodeInputHash(report.IngressSPKI, report.IngressCert, report.IngressPort,
+			dialableAddresses(desired), mn.Spec.Verifier)
 		keep := st.Verification != nil && st.Verification.InputHash == hash
 		st.Candidates = mergeCandidates(st.Candidates, desired, keep)
 		if !keep && verifiedResultStale(st, report, prevPin, prevPort) {
@@ -366,6 +397,15 @@ func (r *MetalNodeReconciler) reconcileDialBack(ctx context.Context, mn *inferen
 	pods, err := r.ownedVerifiers(ctx, mn)
 	if err != nil {
 		return 0, nil, err
+	}
+	if verifiedResultExpired(mn, now) {
+		msg := fmt.Sprintf("the last check that reached this Mac finished more than %s ago and none has finished since; a new check is due",
+			metalNodeMaxResultAge)
+		if blocking := terminatingVerifier(pods); blocking != nil {
+			msg += fmt.Sprintf("; verifier pod %s has been terminating since %s and no check starts until it is gone",
+				blocking.Name, blocking.DeletionTimestamp.UTC().Format(time.RFC3339))
+		}
+		r.setReachable(mn, metav1.ConditionUnknown, inferencev1alpha1.MetalNodeReasonVerificationPending, msg)
 	}
 	switch {
 	case !hostIPValid:
@@ -385,6 +425,16 @@ func (r *MetalNodeReconciler) reconcileDialBack(ctx context.Context, mn *inferen
 		r.setReachable(mn, metav1.ConditionFalse, inferencev1alpha1.MetalNodeReasonPinMissing,
 			"the agent reports no ingress SPKI pin (is it running with --legacy-direct-endpoints?); nothing to verify against")
 		return metalNodeResyncInterval, toDelete, nil
+	case report.IngressCert == "":
+		r.setReachable(mn, metav1.ConditionFalse, inferencev1alpha1.MetalNodeReasonAgentUpgradeRequired,
+			"the agent reports an ingress pin but no ingress certificate, so the dial-back cannot tell its ingress "+
+				"from another server at the same address; upgrade the metal-agent to this controller's version")
+		return metalNodeResyncInterval, toDelete, nil
+	case !ingressCertNames(report.IngressCert, mn.UID):
+		r.setReachable(mn, metav1.ConditionFalse, inferencev1alpha1.MetalNodeReasonCertificateUnbound,
+			fmt.Sprintf("the agent's ingress certificate does not name this MetalNode (%s); the agent re-issues it "+
+				"once it reads its MetalNode, so see the agent log for why it cannot", metalnode.IngressHostname(string(mn.UID))))
+		return metalNodeResyncInterval, toDelete, nil
 	case len(addrs) == 0:
 		r.setReachable(mn, metav1.ConditionFalse, inferencev1alpha1.MetalNodeReasonNoCandidates,
 			fmt.Sprintf("no candidate address is inside the allowed CIDRs (%d reported); set spec.hostIP or widen --metal-node-allowed-cidrs",
@@ -402,7 +452,11 @@ func (r *MetalNodeReconciler) reconcileDialBack(ctx context.Context, mn *inferen
 	started := metav1.NewTime(now)
 	v.LastStartTime = &started
 	v.PodUID = ""
-	pod := buildMetalNodeVerifierPod(mn, r.verifierImage(), report.IngressSPKI, report.IngressPort, addrs, hash)
+	pod, err := buildMetalNodeVerifierPod(mn, r.verifierImage(), report.IngressSPKI, report.IngressCert,
+		report.IngressPort, addrs, hash)
+	if err != nil {
+		return 0, toDelete, err
+	}
 	if err := controllerutil.SetControllerReference(mn, pod, r.Scheme); err != nil {
 		return 0, toDelete, fmt.Errorf("own verifier pod: %w", err)
 	}
@@ -455,6 +509,20 @@ func verifiedResultStale(st *inferencev1alpha1.MetalNodeStatus, report *metalnod
 		return true
 	}
 	return !slices.Contains(dialableAddresses(st.Candidates), st.HostIP)
+}
+
+// verifiedResultExpired reports whether a True Reachable is older than
+// metalNodeMaxResultAge. A result carried across changed inputs (only grown,
+// see verifiedResultStale) stands until a check for the new inputs lands,
+// and a verifier whose inputs change again is deleted without a result: a
+// Mac that keeps changing its report would otherwise keep an old success,
+// and the hostIP it names, for good.
+func verifiedResultExpired(mn *inferencev1alpha1.MetalNode, now time.Time) bool {
+	if !meta.IsStatusConditionTrue(mn.Status.Conditions, inferencev1alpha1.MetalNodeConditionReachable) {
+		return false
+	}
+	v := mn.Status.Verification
+	return v == nil || v.LastCheckTime == nil || now.Sub(v.LastCheckTime.Time) > metalNodeMaxResultAge
 }
 
 // specHostIP returns spec.hostIP in canonical form and whether it is usable
@@ -521,6 +589,12 @@ func dialBackWait(mn *inferencev1alpha1.MetalNode, hash string, now time.Time) t
 	if v.LastStartTime != nil {
 		wait = max(wait, metalNodeMinStartSpacing-now.Sub(v.LastStartTime.Time))
 	}
+	if v.LastCheckTime != nil {
+		// lastCheckTime is stored to the second; a verifier started in that
+		// second could finish, clamped to its start, no later than it, and
+		// unread would take its result for one already read.
+		wait = max(wait, v.LastCheckTime.Truncate(time.Second).Add(time.Second).Sub(now))
+	}
 	return max(0, wait)
 }
 
@@ -538,6 +612,17 @@ func (r *MetalNodeReconciler) ownedVerifiers(ctx context.Context, mn *inferencev
 		}
 	}
 	return out, nil
+}
+
+// terminatingVerifier is a verifier pod being deleted, which keeps any new
+// check from starting until it is gone, or nil.
+func terminatingVerifier(pods []corev1.Pod) *corev1.Pod {
+	for i := range pods {
+		if pods[i].DeletionTimestamp != nil {
+			return &pods[i]
+		}
+	}
+	return nil
 }
 
 // stopVerifiers is every verifier pod not already being deleted.
@@ -573,6 +658,7 @@ func (r *MetalNodeReconciler) harvestVerifiers(mn *inferencev1alpha1.MetalNode, 
 			if term != nil && !term.FinishedAt.IsZero() {
 				finished = term.FinishedAt.Time
 			}
+			finished = clampFinished(v, finished, now)
 			if current && unread(mn, finished) {
 				r.applyVerifierResult(mn, &pod, term, hash, finished)
 			}
@@ -589,8 +675,32 @@ func (r *MetalNodeReconciler) harvestVerifiers(mn *inferencev1alpha1.MetalNode, 
 	return busy, toDelete
 }
 
-// unread reports whether a verifier that finished at finished has not been
-// recorded yet: lastCheckTime is the finish time of the last result read.
+// clampFinished bounds a verifier's finish time, which the kubelet stamps on
+// its node's clock, to when the controller started it (lastStartTime) and
+// now, both on the controller's clock. lastCheckTime is compared with the
+// controller's clock (the recheck, the backoff, the result's age) and with
+// failures it records at its own now, so an unclamped node clock minutes
+// behind would expire every fresh result at once, and one ahead would delay
+// rechecks or hide later results.
+func clampFinished(v *inferencev1alpha1.MetalNodeVerification, finished, now time.Time) time.Time {
+	if v != nil && v.LastStartTime != nil && finished.Before(v.LastStartTime.Time) {
+		finished = v.LastStartTime.Time
+	}
+	return minTime(finished, now)
+}
+
+func minTime(a, b time.Time) time.Time {
+	if b.Before(a) {
+		return b
+	}
+	return a
+}
+
+// unread reports whether a verifier that finished at finished (clamped) has
+// not been recorded yet: lastCheckTime is the finish time of the last result
+// read, or when the last failure was recorded. dialBackWait starts no
+// verifier in the same second as lastCheckTime, so a newer verifier's clamped
+// finish always lands in a later second.
 func unread(mn *inferencev1alpha1.MetalNode, finished time.Time) bool {
 	v := mn.Status.Verification
 	return v == nil || v.LastCheckTime == nil || finished.Truncate(time.Second).After(v.LastCheckTime.Time)
@@ -649,12 +759,13 @@ func (r *MetalNodeReconciler) applyVerifierResult(mn *inferencev1alpha1.MetalNod
 	if st.HostIP != "" {
 		v.ConsecutiveFailures = 0
 		r.setReachable(mn, metav1.ConditionTrue, inferencev1alpha1.MetalNodeReasonDialBackSucceeded,
-			fmt.Sprintf("a verifier pod completed TLS with %s:%d against the agent's SPKI pin", st.HostIP, st.IngressPort))
+			fmt.Sprintf("a verifier pod completed TLS with %s:%d against the agent's SPKI pin and its certificate for this MetalNode",
+				st.HostIP, st.IngressPort))
 		return
 	}
 	v.ConsecutiveFailures++
 	r.setReachable(mn, metav1.ConditionFalse, inferencev1alpha1.MetalNodeReasonNoneReachable,
-		"no candidate completed TLS against the agent's SPKI pin: "+summarizeResults(counts))
+		"no candidate completed TLS against the agent's SPKI pin and its certificate for this MetalNode: "+summarizeResults(counts))
 }
 
 func (r *MetalNodeReconciler) recordVerifierFailure(mn *inferencev1alpha1.MetalNode, hash string, at time.Time, msg string) {
