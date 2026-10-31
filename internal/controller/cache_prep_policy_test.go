@@ -62,7 +62,7 @@ func TestValidateModelCachePrep(t *testing.T) {
 // The reported acceptance criterion: under never, a cache-backed pod has no
 // model-cache-prep container and no container running as uid 0.
 func TestCachedStorageConfigNever(t *testing.T) {
-	cfg := buildCachedStorageConfig(cachePrepTripwireModel(), cachePrepTripwireIsvc(), "", "", "docker.io/curlimages/curl:8.18.0", 102, ModelCachePrepNever, DefaultInitContainerUser, "")
+	cfg := buildCachedStorageConfig(cachePrepTripwireModel(), cachePrepTripwireIsvc(), resolveEffectiveModelCache(cachePrepTripwireIsvc(), cachePrepTripwireModel()), "", "", "docker.io/curlimages/curl:8.18.0", 102, ModelCachePrepNever, DefaultInitContainerUser, "")
 	if got, want := containerNames(cfg.initContainers), []string{"model-downloader"}; !slices.Equal(got, want) {
 		t.Fatalf("initContainers = %v, want %v", got, want)
 	}
@@ -74,7 +74,7 @@ func TestCachedStorageConfigNever(t *testing.T) {
 func TestCachedStorageConfigMultiFileNever(t *testing.T) {
 	model := cachePrepTripwireModel()
 	model.Spec.Files = []string{"model.gguf", "mmproj.gguf"}
-	cfg := buildCachedStorageConfig(model, cachePrepTripwireIsvc(), "", "", "docker.io/curlimages/curl:8.18.0", 102, ModelCachePrepNever, DefaultInitContainerUser, "")
+	cfg := buildCachedStorageConfig(model, cachePrepTripwireIsvc(), resolveEffectiveModelCache(cachePrepTripwireIsvc(), model), "", "", "docker.io/curlimages/curl:8.18.0", 102, ModelCachePrepNever, DefaultInitContainerUser, "")
 	if slices.Contains(containerNames(cfg.initContainers), "model-cache-prep") {
 		t.Fatalf("multi-file initContainers = %v, want no model-cache-prep", containerNames(cfg.initContainers))
 	}
@@ -85,7 +85,7 @@ func TestCachedStorageConfigMultiFileNever(t *testing.T) {
 }
 
 func TestCachedStorageConfigAlwaysKeepsPrep(t *testing.T) {
-	cfg := buildCachedStorageConfig(cachePrepTripwireModel(), cachePrepTripwireIsvc(), "", "", "docker.io/curlimages/curl:8.18.0", 102, ModelCachePrepAlways, DefaultInitContainerUser, "")
+	cfg := buildCachedStorageConfig(cachePrepTripwireModel(), cachePrepTripwireIsvc(), resolveEffectiveModelCache(cachePrepTripwireIsvc(), cachePrepTripwireModel()), "", "", "docker.io/curlimages/curl:8.18.0", 102, ModelCachePrepAlways, DefaultInitContainerUser, "")
 	if got, want := containerNames(cfg.initContainers), []string{"model-cache-prep", "model-downloader"}; !slices.Equal(got, want) {
 		t.Fatalf("initContainers = %v, want %v", got, want)
 	}
@@ -117,7 +117,7 @@ func TestDraftCachePrepFollowsPolicy(t *testing.T) {
 
 	r := cachePrepTripwireISvcReconciler()
 	r.ModelCachePrep = ModelCachePrepNever
-	dep := r.constructDeployment(isvc, cachePrepTripwireModel(), draft, 1, "", "")
+	dep := r.constructDeploymentForCache(isvc, cachePrepTripwireModel(), resolveEffectiveModelCache(isvc, cachePrepTripwireModel()), draft, 1, "", "")
 
 	names := containerNames(dep.Spec.Template.Spec.InitContainers)
 	if slices.Contains(names, "model-cache-prep") || slices.Contains(names, "draft-model-cache-prep") {
@@ -143,7 +143,7 @@ func TestDraftUncachedKeepsNoPrep(t *testing.T) {
 	}
 	r := cachePrepTripwireISvcReconciler()
 	r.ModelCachePrep = ModelCachePrepNever
-	names := containerNames(r.constructDeployment(isvc, cachePrepTripwireModel(), draft, 1, "", "").Spec.Template.Spec.InitContainers)
+	names := containerNames(r.constructDeploymentForCache(isvc, cachePrepTripwireModel(), resolveEffectiveModelCache(isvc, cachePrepTripwireModel()), draft, 1, "", "").Spec.Template.Spec.InitContainers)
 	if slices.Contains(names, "model-cache-prep") || slices.Contains(names, "draft-model-cache-prep") {
 		t.Fatalf("initContainers = %v, want no prep", names)
 	}
@@ -286,7 +286,7 @@ func TestPrefetchDownloaderMatchesServingDownloaderUID(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			sc := cachePrepTripwireISvcReconciler()
 			sc.ModelCachePrep = ModelCachePrepNever
-			dep := sc.constructDeployment(tc.isvc, m, nil, 1, "", "")
+			dep := sc.constructDeploymentForCache(tc.isvc, m, resolveEffectiveModelCache(tc.isvc, m), nil, 1, "", "")
 			var servingUID *int64
 			for i := range dep.Spec.Template.Spec.InitContainers {
 				if dep.Spec.Template.Spec.InitContainers[i].Name == "model-downloader" {

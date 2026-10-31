@@ -277,7 +277,7 @@ type prefetchTarget struct {
 // modelCache.prefetch mount. ownReason explains why the own target fell back
 // to the shared cache (empty when it did not). services must already have
 // inherited the Model's modelCache (referencingServices does this).
-func (r *ModelReconciler) prefetchTargets(model *inferencev1alpha1.Model, services []*inferencev1alpha1.InferenceService, listErr error, stagedClaim string) (targets []prefetchTarget, ownReason string) {
+func (r *ModelReconciler) prefetchTargets(model *inferencev1alpha1.Model, services []referencedService, listErr error, stagedClaim string) (targets []prefetchTarget, ownReason string) {
 	index := map[string]int{}
 	add := func(claim string, own bool, svc string) {
 		i, ok := index[claim]
@@ -298,17 +298,17 @@ func (r *ModelReconciler) prefetchTargets(model *inferencev1alpha1.Model, servic
 			add(claim, true, "")
 		}
 	}
-	for _, svc := range services {
-		if !servicePrefetchRequested(svc) {
+	for _, ref := range services {
+		if !ref.cache.prefetchRequested() {
 			continue
 		}
 		// The same classification the service applies: a request its pods
 		// cannot consume (Metal, caching disabled, a runtime the operator
 		// does not stage) must not fill a claim nobody mounts.
-		if kind, _ := classifyPrefetchRequest(svc, model, r.ModelCachePath); kind != prefetchApplies {
+		if kind, _ := classifyPrefetchRequest(ref.svc, model, r.ModelCachePath); kind != prefetchApplies {
 			continue
 		}
-		add(modelCachePVCName(svc, r.ModelCacheMode), false, svc.Name)
+		add(ref.cache.pvcName(r.ModelCacheMode), false, ref.svc.Name)
 	}
 	return targets, ownReason
 }
@@ -325,7 +325,7 @@ func (r *ModelReconciler) prefetchTargets(model *inferencev1alpha1.Model, servic
 // distinct modelCache.claimName among the referencing services names the PVC
 // the serving pods mount; none, or several that disagree, means the shared
 // cache, and the caller surfaces that.
-func resolveOwnPrefetchClaim(model *inferencev1alpha1.Model, services []*inferencev1alpha1.InferenceService, listErr error, stagedClaim string) (claim string, reason string) {
+func resolveOwnPrefetchClaim(model *inferencev1alpha1.Model, services []referencedService, listErr error, stagedClaim string) (claim string, reason string) {
 	if c := modelCacheClaimName(model); c != "" {
 		return c, ""
 	}
@@ -347,8 +347,8 @@ func resolveOwnPrefetchClaim(model *inferencev1alpha1.Model, services []*inferen
 		seen     bool
 		conflict bool
 	)
-	for _, svc := range services {
-		claimName := userModelCacheClaimName(svc)
+	for _, ref := range services {
+		claimName := ref.cache.claimName()
 		if claimName == "" {
 			continue // references the model but no claim override to honour
 		}
@@ -371,22 +371,28 @@ func resolveOwnPrefetchClaim(model *inferencev1alpha1.Model, services []*inferen
 	}
 }
 
+// referencedService is a service that references a Model, with the cache its
+// pods get resolved once, so the Model controller targets the claims the
+// InferenceService controller mounts.
+type referencedService struct {
+	svc   *inferencev1alpha1.InferenceService
+	cache effectiveModelCache
+}
+
 // referencingServices lists the InferenceServices whose modelRef names the
-// Model, each with the Model's modelCache inherited so its claim resolves as
-// the InferenceService controller resolves it.
-func (r *ModelReconciler) referencingServices(ctx context.Context, model *inferencev1alpha1.Model) ([]*inferencev1alpha1.InferenceService, error) {
+// Model, each with its effective modelCache resolved.
+func (r *ModelReconciler) referencingServices(ctx context.Context, model *inferencev1alpha1.Model) ([]referencedService, error) {
 	list := &inferencev1alpha1.InferenceServiceList{}
 	if err := r.List(ctx, list, client.InNamespace(model.Namespace)); err != nil {
 		return nil, err
 	}
-	var out []*inferencev1alpha1.InferenceService
+	var out []referencedService
 	for i := range list.Items {
 		svc := &list.Items[i]
 		if svc.Spec.ModelRef != model.Name {
 			continue
 		}
-		inheritModelCache(svc, model)
-		out = append(out, svc)
+		out = append(out, referencedService{svc: svc, cache: resolveEffectiveModelCache(svc, model)})
 	}
 	return out, nil
 }
@@ -527,8 +533,8 @@ func (r *ModelReconciler) reconcilePrefetchState(ctx context.Context, model *inf
 		logger.Info("Listing InferenceServices for prefetch targets failed; service-requested targets are unknown this pass", "error", listErr.Error())
 	}
 	requested := wantsOwn
-	for _, svc := range services {
-		requested = requested || servicePrefetchRequested(svc)
+	for _, ref := range services {
+		requested = requested || ref.cache.prefetchRequested()
 	}
 	if !requested {
 		if listErr != nil {
@@ -721,7 +727,7 @@ func progressingReason(model *inferencev1alpha1.Model) string {
 
 // reconcilePrefetchTarget brings one target's Job and status entry in line
 // with the desired fingerprint.
-func (r *ModelReconciler) reconcilePrefetchTarget(ctx context.Context, model, jobModel *inferencev1alpha1.Model, t prefetchTarget, fingerprint string, entry *inferencev1alpha1.PrefetchStatus, services []*inferencev1alpha1.InferenceService) (prefetchTargetOutcome, error) {
+func (r *ModelReconciler) reconcilePrefetchTarget(ctx context.Context, model, jobModel *inferencev1alpha1.Model, t prefetchTarget, fingerprint string, entry *inferencev1alpha1.PrefetchStatus, services []referencedService) (prefetchTargetOutcome, error) {
 	logger := logf.FromContext(ctx)
 	// Staged earlier for this spec. The Job is read anyway: while it exists
 	// the entry stands; once it is gone (its TTL, or someone deleted it to
@@ -878,12 +884,12 @@ func prefetchSharedCacheClass(model *inferencev1alpha1.Model, operatorClass stri
 
 // restageRequested reports whether a service consuming claim says its pods
 // found the staged files missing, which is a request to stage again.
-func (r *ModelReconciler) restageRequested(services []*inferencev1alpha1.InferenceService, claim string) bool {
-	for _, svc := range services {
-		if !servicePrefetchRequested(svc) || modelCachePVCName(svc, r.ModelCacheMode) != claim {
+func (r *ModelReconciler) restageRequested(services []referencedService, claim string) bool {
+	for _, ref := range services {
+		if !ref.cache.prefetchRequested() || ref.cache.pvcName(r.ModelCacheMode) != claim {
 			continue
 		}
-		if serviceReportsPrefetchedFilesMissing(svc) {
+		if serviceReportsPrefetchedFilesMissing(ref.svc) {
 			return true
 		}
 	}
@@ -1320,7 +1326,7 @@ func (r *ModelReconciler) setPrefetchSkipped(model *inferencev1alpha1.Model) {
 // a claim no prefetch of this Model targets. Only a Model that asked to be
 // prefetched is held to it: without spec.prefetch, downloading at serve time
 // is the documented behaviour.
-func (r *ModelReconciler) setPrefetchTargetMismatch(model *inferencev1alpha1.Model, services []*inferencev1alpha1.InferenceService, targets []prefetchTarget) {
+func (r *ModelReconciler) setPrefetchTargetMismatch(model *inferencev1alpha1.Model, services []referencedService, targets []prefetchTarget) {
 	if !modelWantsPrefetch(model) {
 		meta.RemoveStatusCondition(&model.Status.Conditions, ConditionPrefetchTargetMismatch)
 		return
@@ -1330,13 +1336,13 @@ func (r *ModelReconciler) setPrefetchTargetMismatch(model *inferencev1alpha1.Mod
 		staged[t.claim] = true
 	}
 	var mismatched []string
-	for _, svc := range services {
-		claim, ok := unprefetchedConsumerClaim(svc, model, r.ModelCacheMode, r.ModelCachePath)
+	for _, ref := range services {
+		claim, ok := unprefetchedConsumerClaim(ref.cache, model, r.ModelCacheMode, r.ModelCachePath)
 		if !ok {
 			continue
 		}
 		if !staged[claim] {
-			mismatched = append(mismatched, fmt.Sprintf("%s (claim %q)", svc.Name, claim))
+			mismatched = append(mismatched, fmt.Sprintf("%s (claim %q)", ref.svc.Name, claim))
 		}
 	}
 	if len(mismatched) == 0 {
@@ -1378,11 +1384,10 @@ func (r *ModelReconciler) completePrefetch(ctx context.Context, model *inference
 }
 
 // buildPrefetchJob assembles the download Job for one claim. The pod reuses
-// the serving path's init containers and volumes verbatim (a synthetic
-// InferenceService whose only field is the claim: the other isvc-derived
-// inputs are an optional fsGroup override and the ephemeral budget, both
-// unset) and adds a no-op completion container, since a Job pod must have at
-// least one non-init container.
+// the serving path's init containers and volumes verbatim, built for the claim
+// alone (no InferenceService stands behind the Job, so the other isvc-derived
+// inputs are unset), and adds a no-op completion container, since a Job pod
+// must have at least one non-init container.
 //
 // Under --model-cache-prep=never the Job carries a Pod Security restricted
 // security context instead: the prep is the only root container, so its
@@ -1396,14 +1401,17 @@ func (r *ModelReconciler) buildPrefetchJob(ctx context.Context, model *inference
 	if effectiveModelCacheKey(model) == "" {
 		return nil, fmt.Errorf("prefetch: model has no cache key; refusing to build a Job that would download into an emptyDir")
 	}
-	var target *inferencev1alpha1.InferenceService
+	// The claim is this Job's target, not a default to infer: a named claim
+	// is staged as named, and the shared cache stays the shared cache even
+	// when the Model's own modelCache.claimName would resolve elsewhere.
+	cache := effectiveModelCache{}
 	if claim != "" && claim != ModelCachePVCName {
-		target = &inferencev1alpha1.InferenceService{
-			ObjectMeta: metav1.ObjectMeta{Name: model.Name, Namespace: model.Namespace},
-			Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: model.Name, ModelCache: &inferencev1alpha1.ModelCacheSpec{ClaimName: claim}},
-		}
+		cache.spec = &inferencev1alpha1.ModelCacheSpec{ClaimName: claim}
 	}
-	storage := buildModelStorageConfig(model, target, model.Namespace, true, ModelCacheModeShared,
+	// No InferenceService stands behind this Job, so the storage is built for
+	// the claim alone: the resolved value carries it, and the init container's
+	// security context takes a nil service (no pod-level context to borrow).
+	storage := buildModelStorageConfig(model, nil, cache, model.Namespace, true, ModelCacheModeShared,
 		r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.ModelCachePrep, resolveInitContainerUser(r.InitContainerUser), r.AllowedHostPathRoots, hfEndpointFromSecret(ctx, r.Client, model))
 	if len(storage.initContainers) == 0 {
 		return nil, fmt.Errorf("prefetch: source %q produced no downloader containers", model.Spec.Source)
@@ -1464,7 +1472,7 @@ func (r *ModelReconciler) buildPrefetchJob(ctx context.Context, model *inference
 			},
 			Annotations: map[string]string{
 				annotationPrefetchFingerprint: fingerprint,
-				annotationPrefetchClaim:       prefetchTargetName(target),
+				annotationPrefetchClaim:       prefetchTargetName(cache),
 			},
 		},
 		Spec: batchv1.JobSpec{
@@ -1530,8 +1538,8 @@ func restrictedPrefetchSecurityContext(uid int64) *corev1.SecurityContext {
 
 // prefetchTargetName returns the PVC name prefetch will stage into, for status
 // messages: the resolved per-service claim, or the shared cache PVC.
-func prefetchTargetName(target *inferencev1alpha1.InferenceService) string {
-	if claim := userModelCacheClaimName(target); claim != "" {
+func prefetchTargetName(cache effectiveModelCache) string {
+	if claim := cache.claimName(); claim != "" {
 		return claim
 	}
 	return ModelCachePVCName

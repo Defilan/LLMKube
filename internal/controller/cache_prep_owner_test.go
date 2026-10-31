@@ -84,7 +84,7 @@ func TestCachePrepOwnerIsDownloaderUID(t *testing.T) {
 			"chown 0:102 /models && chmod g+rwX /models"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			single := buildCachedStorageConfig(cachePrepTripwireModel(), tc.isvc, "", "",
+			single := buildCachedStorageConfig(cachePrepTripwireModel(), tc.isvc, resolveEffectiveModelCache(tc.isvc, cachePrepTripwireModel()), "", "",
 				"docker.io/curlimages/curl:8.18.0", tc.defaultFSGroup, ModelCachePrepAlways, tc.initUser, "")
 			if got := prepCommand(t, single.initContainers, "model-cache-prep"); got != tc.want {
 				t.Errorf("single-file prep = %q, want %q", got, tc.want)
@@ -92,7 +92,7 @@ func TestCachePrepOwnerIsDownloaderUID(t *testing.T) {
 
 			multiModel := cachePrepTripwireModel()
 			multiModel.Spec.Files = []string{"model.gguf", "mmproj.gguf"}
-			multi := buildCachedStorageConfig(multiModel, tc.isvc, "", "",
+			multi := buildCachedStorageConfig(multiModel, tc.isvc, resolveEffectiveModelCache(tc.isvc, multiModel), "", "",
 				"docker.io/curlimages/curl:8.18.0", tc.defaultFSGroup, ModelCachePrepAlways, tc.initUser, "")
 			if got := prepCommand(t, multi.initContainers, "model-cache-prep"); got != tc.want {
 				t.Errorf("multi-file prep = %q, want %q", got, tc.want)
@@ -127,7 +127,7 @@ func TestServingPrepUsesReconcilerInitContainerUser(t *testing.T) {
 			r := cachePrepTripwireISvcReconciler()
 			r.DefaultFSGroup = 0
 			r.InitContainerUser = tc.initUser
-			inits := r.constructDeployment(isvc, cachePrepTripwireModel(), draft, 1, "", "").Spec.Template.Spec.InitContainers
+			inits := r.constructDeploymentForCache(isvc, cachePrepTripwireModel(), resolveEffectiveModelCache(isvc, cachePrepTripwireModel()), draft, 1, "", "").Spec.Template.Spec.InitContainers
 			if got := prepCommand(t, inits, "model-cache-prep"); got != tc.want {
 				t.Errorf("target prep = %q, want %q", got, tc.want)
 			}

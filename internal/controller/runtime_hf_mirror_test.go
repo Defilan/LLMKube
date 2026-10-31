@@ -49,7 +49,7 @@ func servingEnv(dep *appsv1.Deployment, name string) []corev1.EnvVar {
 	return out
 }
 
-// TestRuntimeHFMirrorEnv drives constructDeployment and asserts on the serving
+// TestRuntimeHFMirrorEnv drives constructDeploymentForCache and asserts on the serving
 // container's env: the mirror reaches a runtime that downloads the Model
 // itself, and never carries a token to a mirror its Secret does not name.
 func TestRuntimeHFMirrorEnv(t *testing.T) {
@@ -172,7 +172,7 @@ func TestRuntimeHFMirrorEnv(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
-			dep := r.constructDeployment(tc.isvc, tc.model, nil, 1, tc.hfEndpoint, "")
+			dep := r.constructDeploymentForCache(tc.isvc, tc.model, resolveEffectiveModelCache(tc.isvc, tc.model), nil, 1, tc.hfEndpoint, "")
 
 			endpoints := servingEnv(dep, "HF_ENDPOINT")
 			if tc.wantEndpoint {
@@ -216,7 +216,7 @@ func TestRuntimeHFMirrorEnvUserEnvWins(t *testing.T) {
 			Env: []corev1.EnvVar{{Name: "HF_ENDPOINT", Value: "https://user.example"}},
 		},
 	}
-	endpoints := servingEnv(r.constructDeployment(svc, model, nil, 1, testMirror, ""), "HF_ENDPOINT")
+	endpoints := servingEnv(r.constructDeploymentForCache(svc, model, resolveEffectiveModelCache(svc, model), nil, 1, testMirror, ""), "HF_ENDPOINT")
 	if len(endpoints) != 2 || endpoints[len(endpoints)-1].Value != "https://user.example" {
 		t.Fatalf("HF_ENDPOINT entries = %+v, want the operator's first and the user's last", endpoints)
 	}

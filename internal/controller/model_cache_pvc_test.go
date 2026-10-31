@@ -41,7 +41,7 @@ func TestModelNeedsCachePVC(t *testing.T) {
 			// nil isvc: these cases predate spec.modelCache.persistence and
 			// assert the operator-level behaviour, which a nil isvc preserves
 			// (no opt-out). Ephemeral is covered in model_cache_ephemeral_test.go.
-			if got := modelNeedsCachePVC(tc.model, nil, tc.cachePath); got != tc.want {
+			if got := modelNeedsCachePVC(tc.model, resolveEffectiveModelCache(nil, nil), tc.cachePath); got != tc.want {
 				t.Errorf("modelNeedsCachePVC(source=%q, cachePath=%q) = %v, want %v",
 					tc.model.Spec.Source, tc.cachePath, got, tc.want)
 			}

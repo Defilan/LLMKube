@@ -246,8 +246,10 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	// A service with no modelCache block of its own resolves the Model's
-	// (#2136), in memory: never written back to the spec.
-	inheritModelCache(inferenceService, model)
+	// (#2136). Taken once here and passed down: a status write mid-reconcile
+	// replaces this object's spec with the stored one, so nothing may re-read
+	// it later.
+	cache := resolveEffectiveModelCache(inferenceService, model)
 
 	draftModel, draftReady, draftResult, err := r.getDraftModelForInferenceService(ctx, inferenceService)
 	if err != nil {
@@ -283,23 +285,23 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		desiredReplicas = 0
 	}
 
-	if modelNeedsCachePVC(model, inferenceService, r.ModelCachePath) {
-		if err := r.ensureModelCachePVC(ctx, inferenceService); err != nil {
+	if modelNeedsCachePVC(model, cache, r.ModelCachePath) {
+		if err := r.ensureModelCachePVC(ctx, inferenceService, cache); err != nil {
 			log.Error(err, "Failed to ensure model cache PVC exists", "namespace", inferenceService.Namespace)
 			return r.updateStatusWithSchedulingInfo(ctx, inferenceService, PhaseFailed, modelReady, 0, inferenceService.Status.Replicas, desiredReplicas, "",
 				fmt.Sprintf("Failed to ensure model cache PVC: %v", err), nil)
 		}
 	}
 
-	r.warnIgnoredModelCacheClaim(inferenceService, model)
-	r.warnPrefetchTargetMismatch(inferenceService, model)
-	r.warnUnboundedEphemeralCache(inferenceService)
+	r.warnIgnoredModelCacheClaim(inferenceService, model, cache)
+	r.warnPrefetchTargetMismatch(inferenceService, model, cache)
+	r.warnUnboundedEphemeralCache(inferenceService, cache)
 
 	isMetal := isMetalModel(model)
 
 	r.emitSpecAdvisoryEvents(inferenceService, model)
 
-	deployment, counts, metalSnap, result, err := r.reconcileWorkload(ctx, inferenceService, model, draftModel, desiredReplicas, modelReady, isMetal)
+	deployment, counts, metalSnap, result, err := r.reconcileWorkload(ctx, inferenceService, cache, model, draftModel, desiredReplicas, modelReady, isMetal)
 	if err != nil || result != nil {
 		if result != nil {
 			return *result, err
@@ -337,7 +339,7 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		r.reconcileModelTransferCondition(ctx, inferenceService)
 		// A prefetched claim whose files the pods found missing is staged
 		// again by deleting the Model's Job (#2136).
-		r.restagePrefetchOnMissingFiles(ctx, inferenceService, model)
+		r.restagePrefetchOnMissingFiles(ctx, inferenceService, model, cache)
 	}
 
 	endpoint := r.constructEndpoint(inferenceService, service)
@@ -977,7 +979,7 @@ func (r *InferenceServiceReconciler) refuseServiceNameTaken(ctx context.Context,
 // threshold; splitting it further would fragment one linear reconcile step.
 //
 //nolint:gocyclo
-func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, draftModel *inferencev1alpha1.Model, desiredReplicas int32, modelReady bool, isMetal bool) (*appsv1.Deployment, replicaCounts, *metalSnapshot, *ctrl.Result, error) {
+func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, isvc *inferencev1alpha1.InferenceService, cache effectiveModelCache, model *inferencev1alpha1.Model, draftModel *inferencev1alpha1.Model, desiredReplicas int32, modelReady bool, isMetal bool) (*appsv1.Deployment, replicaCounts, *metalSnapshot, *ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
 	// A previous pass may have reported a Deployment name-taken refusal.
@@ -1072,7 +1074,7 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 		r.Recorder.Eventf(isvc, nil, corev1.EventTypeWarning, ReasonHubOfflineRuntimeDownload, "Reconcile",
 			"%s", hubOfflineRuntimeDownloadMessage(isvc, model))
 	}
-	deployment := r.constructDeployment(isvc, model, draftModel, desiredReplicas,
+	deployment := r.constructDeploymentForCache(isvc, model, cache, draftModel, desiredReplicas,
 		hfEndpoint, hfEndpointFromSecret(ctx, r.Client, draftModel))
 	if err := setControllerReferenceUnblocked(isvc, deployment, r.Scheme); err != nil {
 		log.Error(err, "Failed to set controller reference for Deployment")
@@ -1241,9 +1243,6 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 			},
 		}
 		rollResult, err := r.reconcileRolloutPolicy(ctx, isvc, svc)
-		// Its status writes decoded the stored spec back into isvc, which
-		// drops an inherited modelCache (#2136).
-		inheritModelCache(isvc, model)
 		if err != nil {
 			log.Error(err, "Failed to reconcile rollout policy")
 			return nil, replicaCounts{}, nil, nil, err
@@ -1276,7 +1275,6 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 				log.Error(updateErr, "Failed to clear stale RolloutDeferred condition")
 				return nil, replicaCounts{}, nil, nil, updateErr
 			}
-			inheritModelCache(isvc, model)
 		}
 	}
 
@@ -1804,6 +1802,7 @@ func (r *InferenceServiceReconciler) findInferenceServiceForEndpoints(ctx contex
 func (r *InferenceServiceReconciler) reconcileWorkload(
 	ctx context.Context,
 	isvc *inferencev1alpha1.InferenceService,
+	cache effectiveModelCache,
 	model, draftModel *inferencev1alpha1.Model,
 	desiredReplicas int32,
 	modelReady, isMetal bool,
@@ -1825,7 +1824,7 @@ func (r *InferenceServiceReconciler) reconcileWorkload(
 	}
 	// A requested prefetch that has not landed holds whatever serves today
 	// (#2136): no pods before the first one, no new template after it.
-	if held, dep, counts, result, err := r.holdForPrefetch(ctx, isvc, model, desiredReplicas, modelReady); held || err != nil {
+	if held, dep, counts, result, err := r.holdForPrefetch(ctx, isvc, model, cache, desiredReplicas, modelReady); held || err != nil {
 		return dep, counts, nil, result, err
 	}
 	if isvc.Spec.MultiNode != nil {
@@ -1833,12 +1832,12 @@ func (r *InferenceServiceReconciler) reconcileWorkload(
 		// deployment-path pass is stale; drop it before the group's status
 		// writes persist it.
 		clearDeploymentNameTaken(isvc)
-		readyReplicas, result, err := r.reconcileMultiNodeGroup(ctx, isvc, model, draftModel, desiredReplicas, modelReady)
+		readyReplicas, result, err := r.reconcileMultiNodeGroup(ctx, isvc, cache, model, draftModel, desiredReplicas, modelReady)
 		// A multiNode group has no Deployment to read an observed total from,
 		// so the ready member count stands in for both.
 		return nil, replicaCounts{Ready: readyReplicas, Observed: readyReplicas}, nil, result, err
 	}
-	return r.reconcileDeployment(ctx, isvc, model, draftModel, desiredReplicas, modelReady, isMetal)
+	return r.reconcileDeployment(ctx, isvc, cache, model, draftModel, desiredReplicas, modelReady, isMetal)
 }
 
 func (r *InferenceServiceReconciler) findInferenceServiceForPod(ctx context.Context, obj client.Object) []reconcile.Request {

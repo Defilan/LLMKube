@@ -63,7 +63,8 @@ func TestInitContainersCarryTerminationMessagePolicy(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := buildModelStorageConfig(
-				storageConfigModel(tc.source), nil, "default", tc.useCache,
+				storageConfigModel(tc.source), nil, resolveEffectiveModelCache(nil,
+					storageConfigModel(tc.source)), "default", tc.useCache,
 				ModelCacheModeShared, "", "docker.io/curlimages/curl:8.18.0", 102, ModelCachePrepAlways, DefaultInitContainerUser, nil, "")
 			if len(cfg.initContainers) == 0 {
 				t.Fatal("no init containers built; fixture does not exercise the path")
