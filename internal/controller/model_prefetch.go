@@ -275,8 +275,9 @@ type prefetchTarget struct {
 // prefetchTargets resolves the claims to stage into: the Model's own target
 // when it asks for one, plus one per claim the referencing services with
 // modelCache.prefetch mount. ownReason explains why the own target fell back
-// to the shared cache (empty when it did not). services must already have
-// inherited the Model's modelCache (referencingServices does this).
+// to the shared cache (empty when it did not). Each service's claim comes from
+// the cache referencingServices resolved for it, never from a block written
+// into the spec.
 func (r *ModelReconciler) prefetchTargets(model *inferencev1alpha1.Model, services []referencedService, listErr error, stagedClaim string) (targets []prefetchTarget, ownReason string) {
 	index := map[string]int{}
 	add := func(claim string, own bool, svc string) {
