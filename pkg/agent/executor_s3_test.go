@@ -31,6 +31,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
@@ -89,14 +90,14 @@ func TestEnsureModel_S3UsesSigV4(t *testing.T) {
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 
 	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger(),
-		WithKubeClient("default", k8sClient, nil), allowTestServers())
+		WithKubeClient(k8sClient, nil), allowTestServers())
 
 	modelDir := filepath.Join(tmpDir, "s3-model")
 	path, err := executor.ensureModel(
 		t.Context(),
 		"s3://models/org/repo/model-Q4_K_M.gguf",
 		"s3-model",
-		&corev1.LocalObjectReference{Name: "minio-models"},
+		&types.NamespacedName{Namespace: "default", Name: "minio-models"},
 		"",
 	)
 	if err != nil {
@@ -175,10 +176,10 @@ func TestEnsureModel_S3SHA256MatchWritesStamp(t *testing.T) {
 	}
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger(),
-		WithKubeClient("default", k8sClient, nil), allowTestServers())
+		WithKubeClient(k8sClient, nil), allowTestServers())
 
 	path, err := executor.ensureModel(t.Context(), "s3://models/org/repo/model.gguf", "s3-sha-model",
-		&corev1.LocalObjectReference{Name: "minio-models"}, digest)
+		&types.NamespacedName{Namespace: "default", Name: "minio-models"}, digest)
 	if err != nil {
 		t.Fatalf("ensureModel: %v", err)
 	}
@@ -217,10 +218,10 @@ func TestEnsureModel_S3SHA256MismatchDeletesFile(t *testing.T) {
 	}
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger(),
-		WithKubeClient("default", k8sClient, nil), allowTestServers())
+		WithKubeClient(k8sClient, nil), allowTestServers())
 
 	_, err := executor.ensureModel(t.Context(), "s3://models/org/repo/model.gguf", "s3-sha-mismatch-model",
-		&corev1.LocalObjectReference{Name: "minio-models"}, sha256Hex([]byte("not-the-right-bytes")))
+		&types.NamespacedName{Namespace: "default", Name: "minio-models"}, sha256Hex([]byte("not-the-right-bytes")))
 	if err == nil {
 		t.Fatal("ensureModel should fail on SHA256 mismatch for an s3 source")
 	}
@@ -244,7 +245,7 @@ func TestEnsureModel_S3MissingSecretRefFails(t *testing.T) {
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 
 	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger(),
-		WithKubeClient("default", k8sClient, nil), allowTestServers())
+		WithKubeClient(k8sClient, nil), allowTestServers())
 
 	_, err := executor.ensureModel(
 		t.Context(),
@@ -283,13 +284,13 @@ func TestEnsureModel_S3IncompleteSecretFails(t *testing.T) {
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 
 	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger(),
-		WithKubeClient("default", k8sClient, nil), allowTestServers())
+		WithKubeClient(k8sClient, nil), allowTestServers())
 
 	_, err := executor.ensureModel(
 		t.Context(),
 		"s3://models/org/repo/model.gguf",
 		"s3-model",
-		&corev1.LocalObjectReference{Name: "partial-creds"},
+		&types.NamespacedName{Namespace: "default", Name: "partial-creds"},
 		"",
 	)
 	if err == nil {
@@ -447,9 +448,9 @@ func ensureS3ModelVia(t *testing.T, endpoint string) (string, error) {
 	}
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger(),
-		WithKubeClient("default", k8sClient, nil), allowTestServers())
+		WithKubeClient(k8sClient, nil), allowTestServers())
 	path, err := executor.ensureModel(t.Context(), "s3://models/org/repo/model-Q4_K_M.gguf", "s3-model",
-		&corev1.LocalObjectReference{Name: "minio-models"}, "")
+		&types.NamespacedName{Namespace: "default", Name: "minio-models"}, "")
 	if err != nil {
 		return "", err
 	}

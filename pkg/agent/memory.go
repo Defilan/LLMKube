@@ -428,8 +428,8 @@ func remoteModelSize(ctx context.Context, httpClient *http.Client, source string
 // s3ObjectSize returns an s3:// object's byte size from a SigV4-signed HEAD
 // through the same SSRF-guarded client and sourceSecretRef credentials the S3
 // download uses (pkg/agent/s3.go); it never opens a second, unsigned path.
-func s3ObjectSize(ctx context.Context, exec *MetalExecutor, source, secretName string) (uint64, error) {
-	creds, err := exec.resolveS3Credentials(ctx, source, secretName)
+func s3ObjectSize(ctx context.Context, exec *MetalExecutor, source string, key sourceSecretKey) (uint64, error) {
+	creds, err := exec.resolveS3Credentials(ctx, source, key)
 	if err != nil {
 		return 0, err
 	}
@@ -449,14 +449,10 @@ func (a *MetalAgent) s3SizeProbe(ctx context.Context, model *inferencev1alpha1.M
 	exec, _ := a.executors[runtimeLlamaServer].(*MetalExecutor)
 	if exec == nil {
 		exec = NewMetalExecutor(a.config.LlamaServerBin, a.config.ModelStorePath, a.logger,
-			WithKubeClient(a.config.Namespace, a.config.K8sClient, nil),
+			WithKubeClient(a.config.K8sClient, nil),
 			WithAllowedDownloadHosts(a.config.AllowedDownloadHosts))
 	}
-	secretName := ""
-	if model.Spec.SourceSecretRef != nil {
-		secretName = model.Spec.SourceSecretRef.Name
-	}
-	return s3ObjectSize(ctx, exec, model.Spec.Source, secretName)
+	return s3ObjectSize(ctx, exec, model.Spec.Source, sourceSecretKeyFor(model.Namespace, model.Spec.SourceSecretRef))
 }
 
 // parseSize parses a human-readable size string (as produced by model_controller's

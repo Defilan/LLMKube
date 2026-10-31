@@ -11,6 +11,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
@@ -234,10 +235,10 @@ func TestEnsureModel_HFSchemeSendsToken(t *testing.T) {
 
 	tests := []struct {
 		name      string
-		secretRef *corev1.LocalObjectReference
+		secretRef sourceSecretKey
 		wantAuth  string
 	}{
-		{"with source secret", &corev1.LocalObjectReference{Name: "hf-token"}, "Bearer hf_secret"},
+		{"with source secret", &types.NamespacedName{Namespace: "default", Name: "hf-token"}, "Bearer hf_secret"},
 		{"without source secret", nil, ""},
 	}
 	for _, tc := range tests {
@@ -245,7 +246,7 @@ func TestEnsureModel_HFSchemeSendsToken(t *testing.T) {
 			gotPath, gotAuth = "", ""
 			k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 			executor := NewMetalExecutor("/bin/llama-server", t.TempDir(), newNopLogger(),
-				WithKubeClient("default", k8sClient, nil), allowTestServers())
+				WithKubeClient(k8sClient, nil), allowTestServers())
 
 			dst, err := executor.ensureModel(t.Context(), "hf://org/repo", "hf-model", tc.secretRef, "")
 			if err != nil {
@@ -301,10 +302,10 @@ func TestEnsureModel_MirrorHostSendsToken(t *testing.T) {
 
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 	executor := NewMetalExecutor("/bin/llama-server", t.TempDir(), newNopLogger(),
-		WithKubeClient("default", k8sClient, nil), allowTestServers())
+		WithKubeClient(k8sClient, nil), allowTestServers())
 
 	dst, err := executor.ensureModel(t.Context(), source, "mirror-model",
-		&corev1.LocalObjectReference{Name: "hf-token"}, "")
+		&types.NamespacedName{Namespace: "default", Name: "hf-token"}, "")
 	if err != nil {
 		t.Fatalf("ensureModel(%q): %v", source, err)
 	}
@@ -345,10 +346,10 @@ func TestEnsureModel_OtherHostSendsNoToken(t *testing.T) {
 
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 	executor := NewMetalExecutor("/bin/llama-server", t.TempDir(), newNopLogger(),
-		WithKubeClient("default", k8sClient, nil), allowTestServers())
+		WithKubeClient(k8sClient, nil), allowTestServers())
 
 	dst, err := executor.ensureModel(t.Context(), srv.URL+"/m.gguf", "other-model",
-		&corev1.LocalObjectReference{Name: "hf-token"}, "")
+		&types.NamespacedName{Namespace: "default", Name: "hf-token"}, "")
 	if err != nil {
 		t.Fatalf("ensureModel: %v", err)
 	}
@@ -366,7 +367,8 @@ func TestEnsureModel_OtherHostSendsNoToken(t *testing.T) {
 // Secret routinely carries a trailing newline, which would send a malformed
 // token or close the mirror gate silently.
 func TestResolveHFAuth(t *testing.T) {
-	if got, ep := (&MetalExecutor{}).resolveHFAuth(t.Context(), "hf-token"); got != "" || ep != "" {
+	key := &types.NamespacedName{Namespace: "default", Name: "hf-token"}
+	if got, ep := (&MetalExecutor{}).resolveHFAuth(t.Context(), key); got != "" || ep != "" {
 		t.Errorf("nil client resolved (%q, %q), want empty values", got, ep)
 	}
 
@@ -383,22 +385,22 @@ func TestResolveHFAuth(t *testing.T) {
 	}
 	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 	executor := NewMetalExecutor("/bin/llama-server", t.TempDir(), newNopLogger(),
-		WithKubeClient("default", client, nil))
+		WithKubeClient(client, nil))
 
 	t.Run("both keys are trimmed", func(t *testing.T) {
-		got, ep := executor.resolveHFAuth(t.Context(), "hf-token")
+		got, ep := executor.resolveHFAuth(t.Context(), &types.NamespacedName{Namespace: "default", Name: "hf-token"})
 		if got != "hf_secret" || ep != "https://mirror.corp.example/repo" {
 			t.Errorf("resolveHFAuth() = (%q, %q), want trimmed values", got, ep)
 		}
 	})
-	t.Run("empty secret name reads nothing", func(t *testing.T) {
-		got, ep := executor.resolveHFAuth(t.Context(), "")
+	t.Run("no secret reference reads nothing", func(t *testing.T) {
+		got, ep := executor.resolveHFAuth(t.Context(), nil)
 		if got != "" || ep != "" {
 			t.Errorf("resolveHFAuth(empty) = (%q, %q), want empty values", got, ep)
 		}
 	})
 	t.Run("absent secret continues unauthenticated", func(t *testing.T) {
-		got, ep := executor.resolveHFAuth(t.Context(), "missing")
+		got, ep := executor.resolveHFAuth(t.Context(), &types.NamespacedName{Namespace: "default", Name: "missing"})
 		if got != "" || ep != "" {
 			t.Errorf("resolveHFAuth(missing) = (%q, %q), want empty values", got, ep)
 		}

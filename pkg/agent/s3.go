@@ -53,10 +53,24 @@ type s3Credentials struct {
 	Endpoint        string
 }
 
-// s3SecretRef is the Model's spec.sourceSecretRef, used to resolve credentials
-// for s3:// fetches on the metal path. It is a plain alias so the executor
-// signatures stay within the line limit.
-type s3SecretRef = *corev1.LocalObjectReference
+// sourceSecretKey locates the Secret a Model's spec.sourceSecretRef names: the
+// reference's name in the Model's own namespace, since a LocalObjectReference
+// resolves in the namespace of the object that holds it. Nil means the Model
+// names no Secret. It is a plain alias so the executor signatures stay within
+// the line limit.
+type sourceSecretKey = *types.NamespacedName
+
+// sourceSecretKeyFor returns the key of the Secret ref names for a Model in
+// namespace, or nil when ref is nil or names nothing. The namespace is the
+// Model's, never the agent's --namespace flag: that flag is empty when the
+// agent watches every namespace, and a Model in another namespace would
+// otherwise have its credentials looked up in the wrong place.
+func sourceSecretKeyFor(namespace string, ref *corev1.LocalObjectReference) sourceSecretKey {
+	if ref == nil || ref.Name == "" {
+		return nil
+	}
+	return &types.NamespacedName{Namespace: namespace, Name: ref.Name}
+}
 
 // isS3Source reports whether source is an s3:// URL. Case-folded to agree with
 // the controller's isS3Source (internal/controller/source.go): url.Parse
@@ -123,40 +137,42 @@ func isHFAuthHostForEndpoint(source, hfEndpoint string) bool {
 // ungated repositories are the common case and must keep working with no
 // secret at all, so a missing secret or a missing key simply yields an empty
 // value and the request goes out unauthenticated.
-func (e *MetalExecutor) resolveHFAuth(ctx context.Context, secretName string) (token, endpoint string) {
-	if e.k8sClient == nil || secretName == "" {
+func (e *MetalExecutor) resolveHFAuth(ctx context.Context, key sourceSecretKey) (token, endpoint string) {
+	if e.k8sClient == nil || key == nil {
 		return "", ""
 	}
 	secret := &corev1.Secret{}
-	if err := e.k8sClient.Get(ctx, types.NamespacedName{Name: secretName, Namespace: e.namespace}, secret); err != nil {
+	if err := e.k8sClient.Get(ctx, *key, secret); err != nil {
 		e.logger.Debugw("sourceSecretRef unreadable; continuing unauthenticated",
-			"secret", secretName, "namespace", e.namespace, "err", err)
+			"secret", key.Name, "namespace", key.Namespace, "err", err)
 		return "", ""
 	}
 	return strings.TrimSpace(string(secret.Data["HF_TOKEN"])), strings.TrimSpace(string(secret.Data["HF_ENDPOINT"]))
 }
 
-// resolveS3Credentials reads the AWS_* keys out of the Model's sourceSecretRef.
-// The secret lives in the Model's namespace (the namespace the executor was
-// constructed with). This mirrors the controller's s3Credentials
+// resolveS3Credentials reads the AWS_* keys out of the Model's sourceSecretRef,
+// which key locates in the Model's own namespace. This mirrors the
+// controller's s3Credentials
 // (internal/controller/model_controller.go), but reads through the agent's
 // controller-runtime client instead of a rest.Config. A missing secret or a
 // secret without both access keys is a hard error: it is better to fail here
 // with a clear message than to hand the raw source to an anonymous GET that
 // 403s confusingly (the bug this file exists to fix).
-func (e *MetalExecutor) resolveS3Credentials(ctx context.Context, source, secretName string) (s3Credentials, error) {
+func (e *MetalExecutor) resolveS3Credentials(
+	ctx context.Context, source string, key sourceSecretKey,
+) (s3Credentials, error) {
 	if e.k8sClient == nil {
 		return s3Credentials{}, fmt.Errorf("s3 source %q requires a Kubernetes client to resolve sourceSecretRef; "+
 			"the metal-agent could not resolve credentials", source)
 	}
-	if secretName == "" {
+	if key == nil {
 		return s3Credentials{}, fmt.Errorf("s3 source %q requires spec.sourceSecretRef; "+
 			"no secret was provided to the agent", source)
 	}
 
 	secret := &corev1.Secret{}
-	if err := e.k8sClient.Get(ctx, types.NamespacedName{Name: secretName, Namespace: e.namespace}, secret); err != nil {
-		return s3Credentials{}, fmt.Errorf("read sourceSecretRef %q in namespace %q: %w", secretName, e.namespace, err)
+	if err := e.k8sClient.Get(ctx, *key, secret); err != nil {
+		return s3Credentials{}, fmt.Errorf("read sourceSecretRef %q in namespace %q: %w", key.Name, key.Namespace, err)
 	}
 
 	creds := s3Credentials{
@@ -168,7 +184,7 @@ func (e *MetalExecutor) resolveS3Credentials(ctx context.Context, source, secret
 	if creds.AccessKeyID == "" || creds.SecretAccessKey == "" {
 		return s3Credentials{}, fmt.Errorf("s3 source %q: secret %q is missing AWS_ACCESS_KEY_ID and/or "+
 			"AWS_SECRET_ACCESS_KEY; a signed request cannot be produced, so refusing to fall back to an "+
-			"anonymous GET", source, secretName)
+			"anonymous GET", source, key.Name)
 	}
 	return creds, nil
 }

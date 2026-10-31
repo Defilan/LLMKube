@@ -612,7 +612,7 @@ func (a *MetalAgent) buildExecutors() {
 		a.config.LlamaServerBin,
 		a.config.ModelStorePath,
 		a.logger.With("subsystem", "executor"),
-		WithKubeClient(a.config.Namespace, a.config.K8sClient, nil),
+		WithKubeClient(a.config.K8sClient, nil),
 		WithAllowedDownloadHosts(a.config.AllowedDownloadHosts),
 		WithMaxDownloadBytes(a.config.MaxDownloadBytes),
 	)
@@ -938,7 +938,7 @@ func buildExecutorConfig(
 		ModelSource:            model.Spec.Source,
 		ModelName:              model.Name,
 		ServedModelName:        servedModelName(isvc, model),
-		SourceSecretRef:        model.Spec.SourceSecretRef,
+		SourceSecret:           sourceSecretKeyFor(model.Namespace, model.Spec.SourceSecretRef),
 		SHA256:                 model.Spec.SHA256,
 		GPULayers:              base.GPULayers,
 		ContextSize:            base.ContextSize,
