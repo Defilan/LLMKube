@@ -50,9 +50,11 @@ const (
 
 // refuseStart records why the agent will not serve an InferenceService: it
 // writes the agent-owned scheduling status fields (the same surface memory
-// admission uses, cleared by the next admitted start) and emits a Warning
-// Event, then returns an error so ensureProcess withdraws any endpoint. It
-// must not be called while holding a.mu (emitInferenceEvent does I/O).
+// admission uses, cleared by the next admitted start), emits a Warning Event
+// unless this repeats the refusal already recorded for the service, and
+// schedules a re-check (publishRefusal), then returns an error so
+// ensureProcess withdraws any endpoint. It must not be called while holding
+// a.mu (emitInferenceEvent does I/O).
 func (a *MetalAgent) refuseStart(
 	ctx context.Context,
 	isvc *inferencev1alpha1.InferenceService,
@@ -60,13 +62,13 @@ func (a *MetalAgent) refuseStart(
 ) error {
 	a.logger.Warnw("refusing to serve inference service",
 		"namespace", isvc.Namespace, "name", isvc.Name, "reason", reason, "message", message)
+	prev := statusBeforeRefusal(isvc)
 	isvc.Status.SchedulingStatus = reason
 	isvc.Status.SchedulingMessage = message
-	if err := a.config.K8sClient.Status().Update(ctx, isvc); err != nil {
-		a.logger.Warnw("failed to update InferenceService status", "error", err)
+	if a.publishRefusal(ctx, isvc, prev) {
+		a.emitInferenceEvent(ctx, &ManagedProcess{Namespace: isvc.Namespace, Name: isvc.Name},
+			corev1.EventTypeWarning, reason, "%s", message)
 	}
-	a.emitInferenceEvent(ctx, &ManagedProcess{Namespace: isvc.Namespace, Name: isvc.Name},
-		corev1.EventTypeWarning, reason, "%s", message)
 	return fmt.Errorf("%s: %s", reason, message)
 }
 

@@ -431,7 +431,7 @@ kubectl label secret <name> -n <namespace> inference.llmkube.dev/model-source-cr
 - A Model whose `sourceSecretRef` names a Secret without the label (the value must be `true`), a Secret that does not exist, or one the agent's RBAC does not let it read (outside a pinned `secretNames`/`resourceNames` list), is refused with reason `SourceSecretNotAllowed` (a Warning Event, plus `status.schedulingStatus`/`status.schedulingMessage`). The message gives the `kubectl label` command for that Secret. Nothing is downloaded and nothing is sent to the object store or Hugging Face. The check reads only the Secret's metadata.
 - The relay token Secret, `llmkube-metal-relay`, is never read as model-source credentials, labeled or not, and even with `--allow-unlabeled-source-secrets`. Keep model credentials in their own Secret.
 - The check runs for every runtime and whether or not the model is already in the model store, so a later cache eviction cannot turn a running service into a refused one. It runs again when the agent reads the Secret for a download or the memory check's `s3` size probe, so a Secret that loses its label in between is refused too.
-- A refusal is re-checked on every poll: label the Secret (or create it) and the InferenceService starts within a few seconds. A transient error reading the Secret (a timeout, an API server restart) is not a refusal; the start is retried.
+- A refusal is re-checked on its own, without any change to the InferenceService: label the Secret (or create it) and the InferenceService starts within about a minute. A transient error reading the Secret (a timeout, an API server restart) is not a refusal; the start is retried on the next poll.
 - A Model with no `sourceSecretRef` is unaffected, and so is the in-cluster download Job, which reads the Secret with the controller's own credentials.
 
 The Secret is read from the Model's own namespace (the InferenceService's namespace). Before this release the agent read it from its `--namespace`, so with `--namespace ""` (the chart's `scope: cluster`) an `s3` source failed with a NotFound for a Secret that exists, and a Hugging Face download went out without its token.
@@ -1682,6 +1682,10 @@ To resolve:
 - **Stop or scale down another service on the same Mac** when the message says the budget is already committed: the budget is shared by every model the agent runs
 - **Increase the memory fraction** with `--memory-fraction 0.9` if this is a dedicated inference machine
 - **Close other applications** to free unified memory
+
+### How a refused InferenceService is re-checked
+
+Every refusal (`InsufficientMemory`, `MemoryCheckFailed`, `SourceSecretNotAllowed`, `ModelSourceNotAllowed`, `EndpointNameConflict`, `ModelDigestMismatch` and the rest) is re-checked on a backoff, whether or not anything changes the InferenceService: after 5 seconds, then 10, 20, 40, and every minute from then on. Fixing the cause elsewhere (labeling a Secret, freeing memory, correcting the Model) therefore starts the service within about a minute. A re-check that refuses again for the same reason and message writes nothing and emits no new Warning Event, so a refusal that holds shows one Event, not one per re-check. A different reason or message emits a new Event and starts the backoff over, as does a change to the InferenceService's spec.
 
 ### Model refused with MemoryCheckFailed
 

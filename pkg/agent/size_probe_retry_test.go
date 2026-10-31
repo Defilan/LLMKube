@@ -130,6 +130,7 @@ func sizeProbeFixture(
 	a.watcher = NewInferenceServiceWatcher(a.config.K8sClient, "default", newNopLogger())
 	clk := &fakeClock{t: time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)}
 	a.now = clk.now
+	a.watcher.now = clk.now
 	return a, ex, rec, clk
 }
 
@@ -238,7 +239,7 @@ func TestEnsureProcess_SizeProbeDefinitiveFailureRefused(t *testing.T) {
 					t.Errorf("engine started %d times, want 0", ex.starts)
 				}
 				if a.watcher.takeRequeue("default/svc") {
-					t.Error("a definitive refusal was queued for a quiet retry")
+					t.Error("a definitive refusal was queued for an immediate retry, want only the refusal re-check")
 				}
 			})
 		}
@@ -273,7 +274,7 @@ func TestEnsureProcess_SizeProbeSustainedTransientFailureRefused(t *testing.T) {
 			}
 			reason, msg := isvcStatus(t, a)
 			if reason != EventReasonMemoryCheckFailed || !strings.Contains(msg, "connection refused") ||
-				!strings.Contains(msg, "has failed for 3m0s, 5 attempts") {
+				!strings.Contains(msg, "has kept failing for 3m0s") {
 				t.Errorf("status = %q %q, want %s naming the cause and how long it failed",
 					reason, msg, EventReasonMemoryCheckFailed)
 			}

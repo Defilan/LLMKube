@@ -96,11 +96,15 @@ type InferenceServiceWatcher struct {
 	// seeded holds keys the first poll treats as already seen (engines
 	// adopted at startup, #2079); see SeedSeen.
 	seeded map[string]bool
-	// requeued holds keys the next poll delivers again even though their
-	// resourceVersion has not changed; see Requeue. requeueMu guards it:
-	// the agent's event loop sets keys while the poll loop takes them.
+	// requeued holds keys a poll delivers again even though their
+	// resourceVersion has not changed, each with the time from which it is
+	// due; see Requeue and RequeueAt. requeueMu guards it: the agent's event
+	// loop sets keys while the poll loop takes them.
 	requeueMu sync.Mutex
-	requeued  map[string]bool
+	requeued  map[string]time.Time
+	// now returns the current time for RequeueAt; time.Now unless a test
+	// sets a fake clock.
+	now func() time.Time
 }
 
 // NewInferenceServiceWatcher creates a new watcher with the default failure
@@ -117,6 +121,7 @@ func NewInferenceServiceWatcher(
 		logger:                 logger,
 		maxConsecutiveFailures: DefaultMaxConsecutiveFailures,
 		pollInterval:           defaultPollInterval,
+		now:                    time.Now,
 	}
 }
 
@@ -520,24 +525,44 @@ func (w *InferenceServiceWatcher) forgetVanishedLookupFailures(current map[strin
 // probe that failed transiently, #2326): with no write the resourceVersion
 // stays put, and the poll alone would never deliver the service again.
 func (w *InferenceServiceWatcher) Requeue(key string) {
+	w.RequeueAt(key, time.Time{})
+}
+
+// RequeueAt is Requeue for the first poll at or after at. The agent uses it
+// to re-check a refused service on a backoff (#2329). A key already queued
+// keeps the earlier of the two times.
+func (w *InferenceServiceWatcher) RequeueAt(key string, at time.Time) {
 	w.requeueMu.Lock()
 	defer w.requeueMu.Unlock()
 	if w.requeued == nil {
-		w.requeued = make(map[string]bool)
+		w.requeued = make(map[string]time.Time)
 	}
-	w.requeued[key] = true
+	if cur, ok := w.requeued[key]; ok && cur.Before(at) {
+		return
+	}
+	w.requeued[key] = at
 }
 
-// takeRequeue reports whether key was requeued and clears the request, so a
-// requeue delivers the service once.
+// takeRequeue reports whether key is queued and due, and clears a due
+// request, so a requeue delivers the service once.
 func (w *InferenceServiceWatcher) takeRequeue(key string) bool {
 	w.requeueMu.Lock()
 	defer w.requeueMu.Unlock()
-	if !w.requeued[key] {
+	at, ok := w.requeued[key]
+	if !ok || w.clock().Before(at) {
 		return false
 	}
 	delete(w.requeued, key)
 	return true
+}
+
+// clock returns w.now(), or the wall clock for a watcher built as a struct
+// literal.
+func (w *InferenceServiceWatcher) clock() time.Time {
+	if w.now == nil {
+		return time.Now()
+	}
+	return w.now()
 }
 
 // forgetVanishedRequeues drops the requeue requests of services this poll did

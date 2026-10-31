@@ -425,6 +425,10 @@ type MetalAgent struct {
 	// size probe failures, which memory admission retries quietly until it
 	// lasts sizeProbeRetryWindow (#2326).
 	sizeProbes sizeProbeRetries
+
+	// refusals remembers each refused InferenceService's last refusal, for
+	// its re-check backoff and Event deduplication (#2329).
+	refusals refusalRechecks
 }
 
 // ManagedProcess represents a running inference process (llama-server, oMLX, or Ollama model).
@@ -1152,8 +1156,12 @@ func (a *MetalAgent) ensureProcess(ctx context.Context, isvc *inferencev1alpha1.
 	err := a.reconcileProcess(ctx, isvc)
 	if err != nil {
 		a.withdrawAfterStartFailure(ctx, isvc)
+		return err
 	}
-	return err
+	// Started, already running, stopped or eviction-blocked: not refused,
+	// so a later refusal is a new one and gets its Event.
+	a.refusals.forget(types.NamespacedName{Namespace: isvc.Namespace, Name: isvc.Name}.String())
+	return nil
 }
 
 // withdrawAfterStartFailure withdraws the endpoint of an InferenceService this
@@ -1567,6 +1575,7 @@ func (a *MetalAgent) deleteProcess(ctx context.Context, key string) error {
 	// is ever stored there.
 	a.digestMismatches.forgetISVC(key)
 	a.sizeProbes.forget(key)
+	a.refusals.forget(key)
 
 	a.mu.Lock()
 	// Whatever tears the service down (a delete, eviction, a spec change)
@@ -2411,13 +2420,13 @@ func (a *MetalAgent) refuseInsufficientMemory(
 ) error {
 	a.logger.Warnw("model does not fit in memory budget",
 		append([]interface{}{"namespace", isvc.Namespace, "name", isvc.Name, "reason", msg}, logKV...)...)
+	prev := statusBeforeRefusal(isvc)
 	isvc.Status.SchedulingStatus = EventReasonInsufficientMemory
 	isvc.Status.SchedulingMessage = msg
-	if updateErr := a.config.K8sClient.Status().Update(ctx, isvc); updateErr != nil {
-		a.logger.Warnw("failed to update InferenceService status", "error", updateErr)
+	if a.publishRefusal(ctx, isvc, prev) {
+		a.emitInferenceEvent(ctx, &ManagedProcess{Namespace: isvc.Namespace, Name: isvc.Name},
+			corev1.EventTypeWarning, EventReasonInsufficientMemory, "Refusing to start: %s", msg)
 	}
-	a.emitInferenceEvent(ctx, &ManagedProcess{Namespace: isvc.Namespace, Name: isvc.Name},
-		corev1.EventTypeWarning, EventReasonInsufficientMemory, "Refusing to start: %s", msg)
 	return fmt.Errorf("insufficient memory: %s", msg)
 }
 
@@ -2495,15 +2504,15 @@ func (a *MetalAgent) failMemoryCheck(
 	// condition already surfaced via status and a Kubernetes event.
 	a.logger.Warnw("memory check incomplete, refusing to start process",
 		"reason", reason, "namespace", isvc.Namespace, "name", isvc.Name)
+	prev := statusBeforeRefusal(isvc)
 	isvc.Status.SchedulingStatus = EventReasonMemoryCheckFailed
 	isvc.Status.SchedulingMessage = reason
-	if updateErr := a.config.K8sClient.Status().Update(ctx, isvc); updateErr != nil {
-		a.logger.Warnw("failed to update InferenceService status", "error", updateErr)
+	if a.publishRefusal(ctx, isvc, prev) {
+		a.emitInferenceEvent(ctx, &ManagedProcess{Namespace: isvc.Namespace, Name: isvc.Name},
+			corev1.EventTypeWarning, EventReasonMemoryCheckFailed,
+			"Memory admission check could not be completed and failed closed: %s", reason,
+		)
 	}
-	a.emitInferenceEvent(ctx, &ManagedProcess{Namespace: isvc.Namespace, Name: isvc.Name},
-		corev1.EventTypeWarning, EventReasonMemoryCheckFailed,
-		"Memory admission check could not be completed and failed closed: %s", reason,
-	)
 	return fmt.Errorf("memory admission check failed: %s", reason)
 }
 
